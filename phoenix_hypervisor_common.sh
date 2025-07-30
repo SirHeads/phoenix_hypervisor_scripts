@@ -1,12 +1,15 @@
 #!/bin/bash
 
 # Phoenix Hypervisor Common Functions
+# Provides reusable functions for logging, error handling, script execution, and LXC management.
 
 #######################################################
 # Function: check_root
 # Description: Checks if the script is running as root.
 # Parameters: None
-# Returns: Exits with status code 1 if not root, continues otherwise.
+# Inputs: None
+# Outputs: Exits with status code 1 if not root, continues otherwise.
+# Example: check_root
 #######################################################
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -16,16 +19,44 @@ check_root() {
 }
 
 #######################################################
+# Function: sanitize_cmd
+# Description: Escapes special characters in a command string to prevent injection.
+# Parameters:
+#   cmd - The command string to sanitize.
+# Inputs: Command string (e.g., "apt-get update")
+# Outputs: Sanitized command string
+# Returns: None (prints sanitized command)
+# Example: sanitized=$(sanitize_cmd "apt-get update; rm -rf /")
+#######################################################
+sanitize_cmd() {
+    local cmd="$1"
+    printf '%q' "$cmd"
+}
+
+#######################################################
 # Function: setup_logging
-# Description: Sets up logging for scripts.
+# Description: Sets up logging for scripts with rotation to prevent log file growth.
 # Parameters:
 #   LOGFILE - The log file path (must be exported before calling this function)
-# Returns: Exits with status code 1 if LOGFILE is not set, continues otherwise.
+# Inputs: LOGFILE environment variable
+# Outputs: Creates or rotates log file, logs initialization message
+# Returns: Exits with status code 1 if LOGFILE is not set or cannot be created
+# Example: export LOGFILE=/var/log/hypervisor_prep.log; setup_logging
 #######################################################
 setup_logging() {
     if [[ -z "$LOGFILE" ]]; then
         echo "Error: LOGFILE variable not set before calling setup_logging"
         exit 1
+    fi
+
+    # Rotate log file if it exceeds 10MB (10485760 bytes)
+    if [[ -f "$LOGFILE" ]]; then
+        # Use `find` with `-size` for a more robust size check
+        local file_size
+        file_size=$(find "$LOGFILE" -maxdepth 0 -printf "%s" 2>/dev/null || stat -c %s "$LOGFILE" 2>/dev/null)
+        if [[ -n "$file_size" && "$file_size" -gt 10485760 ]]; then
+            mv "$LOGFILE" "$LOGFILE.1" || { echo "Error: Failed to rotate log file $LOGFILE"; exit 1; }
+        fi
     fi
 
     touch "$LOGFILE" || { echo "Error: Cannot create log file $LOGFILE"; exit 1; }
@@ -36,20 +67,25 @@ setup_logging() {
 
 #######################################################
 # Function: retry_command
-# Description: Retries a command up to a specified number of times.
+# Description: Retries a command up to a specified number of times with a timeout.
 # Parameters:
 #   cmd - The command to execute.
 #   max_attempts (optional) - Maximum number of attempts. Default is 3.
-# Returns: Exit code of the last attempt.
+# Inputs: Command string, optional max_attempts integer
+# Outputs: Logs success/failure, executes command
+# Returns: Exit code of the last attempt
+# Example: retry_command "apt-get update" 3
 #######################################################
 retry_command() {
     local cmd="$1"
     local max_attempts="${2:-3}"
     local attempt=1
+    local exit_code
+    local timeout_duration="${COMMAND_TIMEOUT:-300}" # Default timeout: 300 seconds
 
     while [ $attempt -le $max_attempts ]; do
         log "INFO" "Attempt $attempt/$max_attempts: $cmd"
-        eval $cmd
+        timeout "$timeout_duration" bash -c "$cmd"
         exit_code=$?
         if [ $exit_code -eq 0 ]; then
             log "INFO" "Command succeeded: $cmd"
@@ -59,26 +95,32 @@ retry_command() {
         sleep 5
         ((attempt++))
     done
-
     log "ERROR" "Command failed after $max_attempts attempts: $cmd (Final exit code: $exit_code)"
     return $exit_code
 }
 
 #######################################################
 # Function: execute_in_lxc
-# Description: Executes a command inside an LXC container.
+# Description: Executes a command inside an LXC container with a timeout.
 # Parameters:
 #   lxc_id - The ID of the LXC container.
 #   cmd - The command to execute in the container.
-# Returns: Exit code from the executed command.
+# Inputs: LXC ID (integer), command string
+# Outputs: Logs execution, runs command in LXC
+# Returns: Exit code from the executed command
+# Example: execute_in_lxc 901 "apt-get update"
 #######################################################
 execute_in_lxc() {
     local lxc_id="$1"
     shift
     local cmd="$@"
+    local timeout_duration="${COMMAND_TIMEOUT:-300}" # Default timeout: 300 seconds
+
+    # Sanitize the command
+    cmd=$(sanitize_cmd "$cmd")
 
     log "INFO" "Executing in LXC $lxc_id: $cmd"
-    pct exec "$lxc_id" -- bash -c "$cmd"
+    timeout "$timeout_duration" pct exec "$lxc_id" -- bash -c "$cmd"
     exit_code=$?
     if [[ $exit_code -ne 0 ]]; then
         log "ERROR" "Command failed in LXC $lxc_id (Exit code: $exit_code): $cmd"
@@ -91,7 +133,10 @@ execute_in_lxc() {
 # Description: Checks if a script has been completed based on the presence of a marker file.
 # Parameters:
 #   marker_file - The path to the marker file.
-# Returns: 0 (true) if marker file exists, 1 (false) otherwise.
+# Inputs: Marker file path (string)
+# Outputs: None
+# Returns: 0 (true) if marker file exists, 1 (false) otherwise
+# Example: is_script_completed "/var/log/hypervisor_prep_markers/initial_setup.marker"
 #######################################################
 is_script_completed() {
     local marker_file="$1"
@@ -107,7 +152,10 @@ is_script_completed() {
 # Description: Marks a script as completed by creating a marker file.
 # Parameters:
 #   marker_file - The path to the marker file to create.
+# Inputs: Marker file path (string)
+# Outputs: Creates marker file, logs completion
 # Returns: None
+# Example: mark_script_completed "/var/log/hypervisor_prep_markers/initial_setup.marker"
 #######################################################
 mark_script_completed() {
     local marker_file="$1"
@@ -117,9 +165,12 @@ mark_script_completed() {
 
 #######################################################
 # Function: load_hypervisor_config
-# Description: Source the hypervisor configuration file.
+# Description: Sources the hypervisor configuration file.
 # Parameters: None
-# Returns: Exits with status code 1 if sourcing fails, continues otherwise.
+# Inputs: None
+# Outputs: Sources config file, logs error on failure
+# Returns: Exits with status code 1 if sourcing fails, continues otherwise
+# Example: load_hypervisor_config
 #######################################################
 load_hypervisor_config() {
     source /usr/local/bin/phoenix_hypervisor_config.sh || { echo "Error: Failed to source phoenix_hypervisor_config.sh" >&2; exit 1; }
@@ -131,7 +182,10 @@ load_hypervisor_config() {
 # Parameters:
 #   level - The log level (INFO, WARN, ERROR).
 #   message - The message to log.
-# Returns: None
+# Inputs: Log level (string), message (string)
+# Outputs: Writes to LOGFILE and console
+# Returns: Exits with status code 1 if LOGFILE is not set
+# Example: log "INFO" "Starting script"
 #######################################################
 log() {
     local level="$1"

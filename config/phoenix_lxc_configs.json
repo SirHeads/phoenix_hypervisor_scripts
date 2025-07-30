@@ -1,0 +1,15 @@
+{
+    "lxc_configs": {
+        "901": {
+            "name": "DrDevstral",
+            "memory_mb": 32768,
+            "balloon_min_mb": 1024,
+            "cores": 6,
+            "template": "debian-12-standard_12.7-1_amd64.tar.zst",
+            "storage_pool": "lxc-disks",
+            "storage_size_gb": 64,
+            "nvidia_pci_ids": "",
+            "network_config": "10.0.0.100/24,10.0.0.1,8.8.8.8"
+        }
+    }
+}
