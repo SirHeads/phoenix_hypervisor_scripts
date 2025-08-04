@@ -1,153 +1,135 @@
 #!/bin/bash
-# phoenix_hypervisor_create_lxc.sh
+# Phoenix Hypervisor Create LXC Script
 # Creates LXC containers based on the configuration in phoenix_lxc_configs.json.
-# Handles template location, basic configuration.
-# Usage: ./phoenix_hypervisor_create_lxc.sh
+# Prerequisites:
+# - Proxmox host configured
+# - JSON config file available at $PHOENIX_LXC_CONFIG_FILE
+# - jq installed (checked by config script)
+# - Root privileges
+# Usage: ./phoenix_hypervisor_create_lxc.sh <lxc_id>
+# Example: ./phoenix_hypervisor_create_lxc.sh 901
 
-# Source common functions and configuration
+set -euo pipefail # Exit on error, undefined vars, pipe failures
+
+# --- Source common functions ---
 source /usr/local/bin/phoenix_hypervisor_common.sh || { echo "Error: Failed to source phoenix_hypervisor_common.sh" >&2; exit 1; }
-source /usr/local/bin/phoenix_hypervisor_config.sh || { echo "Error: Failed to source phoenix_hypervisor_config.sh" >&2; exit 1; }
 
-# Check if running as root
+# Check root early
 check_root
 
-# Set up logging
-load_hypervisor_config # This loads LXC_CONFIGS and other variables
+# --- Source configuration ---
+source /usr/local/bin/phoenix_hypervisor_config.sh || { echo "Error: Failed to source phoenix_hypervisor_config.sh" >&2; exit 1; }
+
+# --- Script Initialization ---
+# Load config AFTER sourcing common and config scripts to ensure LXC_CONFIGS is populated
+load_hypervisor_config
 export LOGFILE="$HYPERVISOR_LOGFILE"
 setup_logging
 
-log "INFO" "Starting phoenix_hypervisor_create_lxc.sh"
-
-# --- Main Script Logic ---
-
-# Check if LXC_CONFIGS is populated
-if [[ ${#LXC_CONFIGS[@]} -eq 0 ]]; then
-    log "ERROR" "No LXC configurations found. Ensure phoenix_lxc_configs.json is correctly loaded."
+# Get LXC ID from command-line argument
+LXC_ID="$1"
+if [[ -z "$LXC_ID" ]]; then
+    log "ERROR" "LXC ID not provided. Usage: $0 <lxc_id>"
     exit 1
 fi
 
-echo "Found LXC configurations to process:"
-configured_lxcs=()
-for id in "${!LXC_CONFIGS[@]}"; do
-    lxc_name=$(echo "${LXC_CONFIGS[$id]}" | cut -d',' -f1)
-    echo "  - ID: $id, Name: $lxc_name"
-    configured_lxcs+=("$id")
-done
+log "INFO" "Starting phoenix_hypervisor_create_lxc.sh for LXC $LXC_ID"
 
-# Single confirmation prompt with option to skip specific LXCs
-declare -A skip_lxcs
-read -p "Enter LXC IDs to skip (comma-separated, e.g., 901,902) or press Enter to create all: " skip_ids
-if [[ -n "$skip_ids" ]]; then
-    IFS=',' read -ra skip_array <<< "$skip_ids"
-    for id in "${skip_array[@]}"; do
-        # Basic validation: check if ID was in the config
-        if [[ " ${configured_lxcs[*]} " =~ " $id " ]]; then
-            skip_lxcs["$id"]=1
-            log "INFO" "User requested to skip LXC $id."
-        else
-            log "WARN" "User entered invalid LXC ID to skip: $id. Ignoring."
-        fi
-    done
+# Define the marker file path for this script's completion status
+marker_file="${HYPERVISOR_MARKER_DIR}/lxc_${LXC_ID}_created.marker"
+
+# Skip if the creation has already been completed (marker file exists)
+if is_script_completed "$marker_file"; then
+    log "INFO" "LXC $LXC_ID already created (marker found). Skipping creation."
+    exit 0
 fi
 
-# Process each LXC configuration and create the container
-for lxc_id in "${!LXC_CONFIGS[@]}"; do
-    if [[ -n "${skip_lxcs[$lxc_id]}" ]]; then
-        log "INFO" "Skipping creation of LXC $lxc_id as requested."
-        echo "Skipping LXC $lxc_id."
-        continue
-    fi
+# --- Load LXC Configuration from Associative Array ---
+# Access the configuration string for the specific LXC ID
+config_string="${LXC_CONFIGS[$LXC_ID]}"
 
-    marker_file="${HYPERVISOR_MARKER_DIR}/lxc_${lxc_id}_created.marker"
-    if is_script_completed "$marker_file"; then
-        log "INFO" "Skipping completed LXC creation for $lxc_id."
-        continue
-    fi
+if [[ -z "$config_string" ]]; then
+    log "ERROR" "Configuration for LXC ID $LXC_ID not found in LXC_CONFIGS array. Ensure it exists in $PHOENIX_LXC_CONFIG_FILE."
+    exit 1
+fi
 
-    # Parse configuration values for this LXC
-    IFS=',' read -r lxc_name memory_mb balloon_min_mb cores template storage_pool storage_size_gb nvidia_pci_ids network_config <<< "${LXC_CONFIGS[$lxc_id]}"
+# --- Parse the configuration string using IFS ---
+# The order of fields in the string (from jq in phoenix_hypervisor_config.sh):
+# name|memory_mb|cores|template|storage_pool|storage_size_gb|nvidia_pci_ids|network_config|features|gpu_assignment|vllm_model|vllm_tensor_parallel_size|vllm_max_model_len|vllm_kv_cache_dtype|vllm_shm_size|vllm_gpu_count
+IFS='|' read -r \
+    LXC_NAME \
+    LXC_MEMORY_MB \
+    LXC_CORES \
+    LXC_TEMPLATE \
+    LXC_STORAGE_POOL \
+    LXC_STORAGE_SIZE_GB \
+    LXC_NVIDIA_PCI_IDS \
+    LXC_NETWORK_CONFIG \
+    LXC_FEATURES \
+    LXC_GPU_ASSIGNMENT \
+    VLLM_MODEL \
+    VLLM_TENSOR_PARALLEL_SIZE \
+    VLLM_MAX_MODEL_LEN \
+    VLLM_KV_CACHE_DTYPE \
+    VLLM_SHM_SIZE \
+    VLLM_GPU_COUNT \
+    <<< "$config_string"
 
-    # --- Modified Template Validation (Use the specific path found) ---
-    CUSTOM_TEMPLATE_DIR="/fastData/shared-iso/template/cache"
-    TEMPLATE_PATH="$CUSTOM_TEMPLATE_DIR/$template"
-    # Validate template existence in the custom directory
-    if [[ ! -f "$TEMPLATE_PATH" ]]; then
-        log "ERROR" "Template $template not found in $CUSTOM_TEMPLATE_DIR/"
-        exit 1
-    fi
-    # --- End of Template Validation ---
+# --- Parse Network Configuration ---
+# Expected format in LXC_NETWORK_CONFIG: "IP/CIDR,GATEWAY,DNS"
+# e.g., "10.0.0.100/24,10.0.0.1,8.8.8.8"
+IFS=',' read -r LXC_IP_CIDR LXC_GATEWAY LXC_DNS <<< "$LXC_NETWORK_CONFIG"
 
-    # Parse network configuration
-    network_bridge="vmbr0" # Default bridge
-    if [[ "$network_config" == "dhcp" ]]; then
-        ip_config="dhcp"
-        gateway_config=""
-        dns_config=""
-        network_description="DHCP"
-    else
-        IFS=',' read -r ip_cidr gateway_config dns_config <<< "$network_config"
-        ip_config="$ip_cidr"
-        network_description="$network_config"
-    fi
+# Use defaults if values are empty from config
+LXC_NAME="${LXC_NAME:-lxc-$LXC_ID}"
+LXC_MEMORY_MB="${LXC_MEMORY_MB:-$DEFAULT_LXC_MEMORY_MB}"
+LXC_CORES="${LXC_CORES:-$DEFAULT_LXC_CORES}"
+LXC_TEMPLATE="${LXC_TEMPLATE:-$DEFAULT_LXC_TEMPLATE}"
+LXC_STORAGE_POOL="${LXC_STORAGE_POOL:-$DEFAULT_LXC_STORAGE_POOL}"
+LXC_STORAGE_SIZE_GB="${LXC_STORAGE_SIZE_GB:-$DEFAULT_LXC_STORAGE_SIZE_GB}"
+LXC_NETWORK_CONFIG="${LXC_NETWORK_CONFIG:-$DEFAULT_LXC_NETWORK_CONFIG}"
+LXC_FEATURES="${LXC_FEATURES:-$DEFAULT_LXC_FEATURES}"
+LXC_IP_CIDR="${LXC_IP_CIDR:-$(echo "$DEFAULT_LXC_NETWORK_CONFIG" | cut -d',' -f1)}"
+LXC_GATEWAY="${LXC_GATEWAY:-$(echo "$DEFAULT_LXC_NETWORK_CONFIG" | cut -d',' -f2)}"
 
-    echo "About to create LXC $lxc_id ($lxc_name) with the following configuration:"
-    echo "  - Name: $lxc_name"
-    echo "  - Memory: ${memory_mb}MB"
-    echo "  - Balloon Min: ${balloon_min_mb}MB"
-    echo "  - Cores: $cores"
-    echo "  - Template: $template"
-    echo "  - Storage Pool: $storage_pool"
-    echo "  - Storage Size: ${storage_size_gb}GB"
-    echo "  - Network: $network_description"
+# Log the parsed configuration for debugging
+log "INFO" "Parsed configuration for LXC $LXC_ID: name=$LXC_NAME, memory_mb=$LXC_MEMORY_MB, cores=$LXC_CORES, template=$LXC_TEMPLATE, storage_pool=$LXC_STORAGE_POOL, storage_size_gb=$LXC_STORAGE_SIZE_GB, network_config=$LXC_NETWORK_CONFIG, features=$LXC_FEATURES, gpu_assignment=$LXC_GPU_ASSIGNMENT"
 
-    log "INFO" "Creating LXC $lxc_id: $lxc_name"
+# --- Validate critical parameters ---
+if [[ -z "$LXC_IP_CIDR" ]] || [[ -z "$LXC_GATEWAY" ]]; then
+    log "ERROR" "Invalid network configuration for LXC $LXC_ID: IP/CIDR or Gateway missing."
+    exit 1
+fi
 
-    # --- Create LXC Container ---
-    # Build the pct create command with initial options
-    create_cmd="pct create $lxc_id $TEMPLATE_PATH -storage $storage_pool -memory $memory_mb -swap 0 -cores $cores -hostname $lxc_name -rootfs $storage_pool:${storage_size_gb}"
+if [[ ! -f "$LXC_TEMPLATE" ]]; then
+    log "ERROR" "LXC template file not found: $LXC_TEMPLATE"
+    exit 1
+fi
 
-    # Handle network configuration in create command
-    if [[ "$network_config" == "dhcp" ]]; then
-        create_cmd="$create_cmd -net0 name=eth0,bridge=$network_bridge,ip=dhcp"
-        log "INFO" "Network config set to DHCP for LXC $lxc_id."
-    else
-        # Add IP and Gateway to create command for static IP
-        if [[ -n "$gateway_config" ]]; then
-            create_cmd="$create_cmd -net0 name=eth0,bridge=$network_bridge,ip=$ip_config,gw=$gateway_config"
-        else
-            create_cmd="$create_cmd -net0 name=eth0,bridge=$network_bridge,ip=$ip_config"
-        fi
-        log "INFO" "Network config set for LXC $lxc_id: Static IP $ip_config, GW $gateway_config"
-    fi
+# --- Create the LXC Container ---
+log "INFO" "Creating LXC container $LXC_ID ($LXC_NAME)..."
 
-    log "INFO" "Running pct create for LXC $lxc_id (this may take a while)..."
-    log "INFO" "Executing: $create_cmd"
-    # Use retry_command for better reliability
-    if ! retry_command "$create_cmd"; then
-        log "ERROR" "Failed to create LXC $lxc_id: $create_cmd"
-        exit 1
-    fi
-    log "INFO" "LXC $lxc_id created successfully."
+# Construct the pct create command
+create_cmd="pct create $LXC_ID '$LXC_TEMPLATE' \
+  --storage '$LXC_STORAGE_POOL' \
+  --memory $LXC_MEMORY_MB \
+  --cores $LXC_CORES \
+  --hostname '$LXC_NAME' \
+  --net0 name=eth0,bridge=vmbr0,ip=$LXC_IP_CIDR,gw=$LXC_GATEWAY \
+  --features '$LXC_FEATURES' \
+  --rootfs $LXC_STORAGE_POOL:$LXC_STORAGE_SIZE_GB \
+  --password \$(echo \$LXC_DEFAULT_ROOT_PASSWORD | base64 -d) \
+  --start 1"
 
-    # --- Post-Creation Configuration ---
-    # Configure DNS if static IP and DNS provided (using pct set)
-    if [[ "$network_config" != "dhcp" && -n "$dns_config" ]]; then
-        dns_set_cmd="pct set $lxc_id -nameserver $dns_config"
-        log "INFO" "Configuring DNS for LXC $lxc_id..."
-        log "INFO" "Executing: $dns_set_cmd"
-        if ! retry_command "$dns_set_cmd"; then
-            log "ERROR" "Failed to configure DNS for LXC $lxc_id: $dns_set_cmd"
-            log "WARN" "DNS configuration for LXC $lxc_id might be incomplete."
-        else
-            log "INFO" "DNS configured for LXC $lxc_id: $dns_config"
-        fi
-    fi
-    # --- End of Post-Creation Configuration ---
-
-    # Mark the script as completed for this container
+log "DEBUG" "Executing: $create_cmd"
+# Execute the command
+if eval "$create_cmd"; then
+    log "INFO" "LXC container $LXC_ID created successfully."
     mark_script_completed "$marker_file"
-    log "INFO" "Marked LXC $lxc_id creation as completed."
-done
+else
+    log "ERROR" "Failed to create LXC container $LXC_ID."
+    exit 1
+fi
 
-log "INFO" "Completed phoenix_hypervisor_create_lxc.sh successfully."
+log "INFO" "Completed phoenix_hypervisor_create_lxc.sh for LXC $LXC_ID."
 exit 0
