@@ -1,135 +1,160 @@
 #!/bin/bash
-# Phoenix Hypervisor Create LXC Script
-# Creates LXC containers based on the configuration in phoenix_lxc_configs.json.
+# Phoenix Hypervisor LXC Creation Script
+# Creates LXC containers (e.g., drdevstral) based on configurations in /usr/local/etc/phoenix_lxc_configs.json.
+# Ensures each LXC has a corresponding setup script in LXC_SETUP_SCRIPTS.
+# Configures GPU passthrough, networking, and storage.
 # Prerequisites:
-# - Proxmox host configured
-# - JSON config file available at $PHOENIX_LXC_CONFIG_FILE
-# - jq installed (checked by config script)
-# - Root privileges
-# Usage: ./phoenix_hypervisor_create_lxc.sh <lxc_id>
-# Example: ./phoenix_hypervisor_create_lxc.sh 901
+# - Proxmox VE 8.x (tested with 8.4.6)
+# - phoenix_hypervisor_common.sh and phoenix_hypervisor_config.sh sourced
+# - /usr/local/etc/phoenix_lxc_configs.json configured with required fields
+# Usage: ./phoenix_hypervisor_create_lxc.sh
+# Version: 1.6.9 (Removed defaults, added password support)
 
-set -euo pipefail # Exit on error, undefined vars, pipe failures
+set -euo pipefail
 
-# --- Source common functions ---
+# Source common functions and configuration
 source /usr/local/bin/phoenix_hypervisor_common.sh || { echo "Error: Failed to source phoenix_hypervisor_common.sh" >&2; exit 1; }
-
-# Check root early
-check_root
-
-# --- Source configuration ---
 source /usr/local/bin/phoenix_hypervisor_config.sh || { echo "Error: Failed to source phoenix_hypervisor_config.sh" >&2; exit 1; }
 
-# --- Script Initialization ---
-# Load config AFTER sourcing common and config scripts to ensure LXC_CONFIGS is populated
+# Check root privileges
+check_root
+
+# Set up logging
 load_hypervisor_config
 export LOGFILE="$HYPERVISOR_LOGFILE"
 setup_logging
 
-# Get LXC ID from command-line argument
-LXC_ID="$1"
-if [[ -z "$LXC_ID" ]]; then
-    log "ERROR" "LXC ID not provided. Usage: $0 <lxc_id>"
-    exit 1
-fi
+log "INFO" "$0: Starting phoenix_hypervisor_create_lxc.sh"
 
-log "INFO" "Starting phoenix_hypervisor_create_lxc.sh for LXC $LXC_ID"
+# --- Function: create_lxc_container ---
+# Description: Creates a single LXC container based on provided configuration.
+# Parameters: lxc_id, config (delimited string from LXC_CONFIGS)
+# Returns: Exits with status 1 on failure
+create_lxc_container() {
+    local lxc_id="$1"
+    local config="$2"
+    local marker_file="${HYPERVISOR_MARKER_DIR}/lxc_${lxc_id}_created.marker"
 
-# Define the marker file path for this script's completion status
-marker_file="${HYPERVISOR_MARKER_DIR}/lxc_${LXC_ID}_created.marker"
+    if is_script_completed "$marker_file"; then
+        log "INFO" "$0: LXC $lxc_id already created. Skipping."
+        return 0
+    fi
 
-# Skip if the creation has already been completed (marker file exists)
-if is_script_completed "$marker_file"; then
-    log "INFO" "LXC $LXC_ID already created (marker found). Skipping creation."
-    exit 0
-fi
+    # Validate setup script existence
+    if [[ -z "${LXC_SETUP_SCRIPTS[$lxc_id]}" ]]; then
+        log "ERROR" "$0: No setup script defined for LXC $lxc_id in LXC_SETUP_SCRIPTS"
+        return 1
+    fi
+    local setup_script="${LXC_SETUP_SCRIPTS[$lxc_id]}"
+    if [[ ! -x "$setup_script" ]]; then
+        log "ERROR" "$0: Setup script for LXC $lxc_id is not executable: $setup_script"
+        return 1
+    fi
+    log "DEBUG" "$0: Valid setup script for LXC $lxc_id: $setup_script"
 
-# --- Load LXC Configuration from Associative Array ---
-# Access the configuration string for the specific LXC ID
-config_string="${LXC_CONFIGS[$LXC_ID]}"
+    # Parse config
+    IFS='|' read -r name memory_mb cores template storage_pool storage_size_gb nvidia_pci_ids network_config features gpu_assignment vllm_model vllm_tensor_parallel_size vllm_max_model_len vllm_kv_cache_dtype vllm_shm_size vllm_gpu_count vllm_quantization vllm_quantization_config_type <<< "$config"
 
-if [[ -z "$config_string" ]]; then
-    log "ERROR" "Configuration for LXC ID $LXC_ID not found in LXC_CONFIGS array. Ensure it exists in $PHOENIX_LXC_CONFIG_FILE."
-    exit 1
-fi
+    log "DEBUG" "$0: Creating LXC $lxc_id with config: name=$name, memory_mb=$memory_mb, cores=$cores, storage_pool=$storage_pool, gpu_assignment=$gpu_assignment"
 
-# --- Parse the configuration string using IFS ---
-# The order of fields in the string (from jq in phoenix_hypervisor_config.sh):
-# name|memory_mb|cores|template|storage_pool|storage_size_gb|nvidia_pci_ids|network_config|features|gpu_assignment|vllm_model|vllm_tensor_parallel_size|vllm_max_model_len|vllm_kv_cache_dtype|vllm_shm_size|vllm_gpu_count
-IFS='|' read -r \
-    LXC_NAME \
-    LXC_MEMORY_MB \
-    LXC_CORES \
-    LXC_TEMPLATE \
-    LXC_STORAGE_POOL \
-    LXC_STORAGE_SIZE_GB \
-    LXC_NVIDIA_PCI_IDS \
-    LXC_NETWORK_CONFIG \
-    LXC_FEATURES \
-    LXC_GPU_ASSIGNMENT \
-    VLLM_MODEL \
-    VLLM_TENSOR_PARALLEL_SIZE \
-    VLLM_MAX_MODEL_LEN \
-    VLLM_KV_CACHE_DTYPE \
-    VLLM_SHM_SIZE \
-    VLLM_GPU_COUNT \
-    <<< "$config_string"
+    # Validate required fields
+    local required_fields=("name" "memory_mb" "cores" "template" "storage_pool" "storage_size_gb" "network_config" "features")
+    for field in "${required_fields[@]}"; do
+        if [[ -z "${!field}" ]]; then
+            log "ERROR" "$0: Missing required field '$field' for LXC $lxc_id"
+            return 1
+        fi
+    done
 
-# --- Parse Network Configuration ---
-# Expected format in LXC_NETWORK_CONFIG: "IP/CIDR,GATEWAY,DNS"
-# e.g., "10.0.0.100/24,10.0.0.1,8.8.8.8"
-IFS=',' read -r LXC_IP_CIDR LXC_GATEWAY LXC_DNS <<< "$LXC_NETWORK_CONFIG"
+    # Validate storage pool
+    if ! pvesm status | grep -q "^$storage_pool.*active.*1"; then
+        log "ERROR" "$0: Storage pool $storage_pool is not active for LXC $lxc_id"
+        pvesm status | while read -r line; do log "DEBUG" "$0: pvesm: $line"; done
+        return 1
+    fi
 
-# Use defaults if values are empty from config
-LXC_NAME="${LXC_NAME:-lxc-$LXC_ID}"
-LXC_MEMORY_MB="${LXC_MEMORY_MB:-$DEFAULT_LXC_MEMORY_MB}"
-LXC_CORES="${LXC_CORES:-$DEFAULT_LXC_CORES}"
-LXC_TEMPLATE="${LXC_TEMPLATE:-$DEFAULT_LXC_TEMPLATE}"
-LXC_STORAGE_POOL="${LXC_STORAGE_POOL:-$DEFAULT_LXC_STORAGE_POOL}"
-LXC_STORAGE_SIZE_GB="${LXC_STORAGE_SIZE_GB:-$DEFAULT_LXC_STORAGE_SIZE_GB}"
-LXC_NETWORK_CONFIG="${LXC_NETWORK_CONFIG:-$DEFAULT_LXC_NETWORK_CONFIG}"
-LXC_FEATURES="${LXC_FEATURES:-$DEFAULT_LXC_FEATURES}"
-LXC_IP_CIDR="${LXC_IP_CIDR:-$(echo "$DEFAULT_LXC_NETWORK_CONFIG" | cut -d',' -f1)}"
-LXC_GATEWAY="${LXC_GATEWAY:-$(echo "$DEFAULT_LXC_NETWORK_CONFIG" | cut -d',' -f2)}"
+    if [[ "$storage_pool" == "lxc-disks" ]]; then
+        if ! validate_zfs_pool "quickOS/lxc-disks"; then
+            log "ERROR" "$0: ZFS pool validation failed for quickOS/lxc-disks for LXC $lxc_id"
+            return 1
+        fi
+    fi
 
-# Log the parsed configuration for debugging
-log "INFO" "Parsed configuration for LXC $LXC_ID: name=$LXC_NAME, memory_mb=$LXC_MEMORY_MB, cores=$LXC_CORES, template=$LXC_TEMPLATE, storage_pool=$LXC_STORAGE_POOL, storage_size_gb=$LXC_STORAGE_SIZE_GB, network_config=$LXC_NETWORK_CONFIG, features=$LXC_FEATURES, gpu_assignment=$LXC_GPU_ASSIGNMENT"
+    # Parse network configuration
+    IFS=',' read -r ip_cidr gateway dns <<< "$network_config"
+    if [[ -z "$ip_cidr" ]] || [[ -z "$gateway" ]]; then
+        log "ERROR" "$0: Invalid network configuration for LXC $lxc_id: $network_config"
+        return 1
+    fi
 
-# --- Validate critical parameters ---
-if [[ -z "$LXC_IP_CIDR" ]] || [[ -z "$LXC_GATEWAY" ]]; then
-    log "ERROR" "Invalid network configuration for LXC $LXC_ID: IP/CIDR or Gateway missing."
-    exit 1
-fi
+    # Construct pct create command
+    local pct_cmd="pct create $lxc_id \"$template\" \
+        -cores $cores \
+        -memory $memory_mb \
+        -hostname \"$name\" \
+        -storage $storage_pool \
+        -rootfs $storage_pool:$storage_size_gb \
+        -net0 name=eth0,bridge=vmbr0,ip=$ip_cidr,gw=$gateway \
+        -features $features"
+    
+    if [[ -n "${LXC_ROOT_PASSWORD:-}" ]]; then
+        pct_cmd="$pct_cmd -password \"$LXC_ROOT_PASSWORD\""
+    fi
 
-if [[ ! -f "$LXC_TEMPLATE" ]]; then
-    log "ERROR" "LXC template file not found: $LXC_TEMPLATE"
-    exit 1
-fi
+    log "DEBUG" "$0: Executing pct create command: $pct_cmd"
 
-# --- Create the LXC Container ---
-log "INFO" "Creating LXC container $LXC_ID ($LXC_NAME)..."
+    # Create LXC container
+    if ! retry_command "$pct_cmd"; then
+        log "ERROR" "$0: Failed to create LXC $lxc_id"
+        return 1
+    fi
 
-# Construct the pct create command
-create_cmd="pct create $LXC_ID '$LXC_TEMPLATE' \
-  --storage '$LXC_STORAGE_POOL' \
-  --memory $LXC_MEMORY_MB \
-  --cores $LXC_CORES \
-  --hostname '$LXC_NAME' \
-  --net0 name=eth0,bridge=vmbr0,ip=$LXC_IP_CIDR,gw=$LXC_GATEWAY \
-  --features '$LXC_FEATURES' \
-  --rootfs $LXC_STORAGE_POOL:$LXC_STORAGE_SIZE_GB \
-  --password \$(echo \$LXC_DEFAULT_ROOT_PASSWORD | base64 -d) \
-  --start 1"
+    # Configure GPU passthrough
+    if [[ -n "$gpu_assignment" ]]; then
+        if ! configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
+            log "ERROR" "$0: Failed to configure GPU passthrough for LXC $lxc_id"
+            return 1
+        fi
+    fi
 
-log "DEBUG" "Executing: $create_cmd"
-# Execute the command
-if eval "$create_cmd"; then
-    log "INFO" "LXC container $LXC_ID created successfully."
+    # Start the container
+    log "INFO" "$0: Starting LXC $lxc_id..."
+    if ! retry_command "pct start $lxc_id"; then
+        log "ERROR" "$0: Failed to start LXC $lxc_id"
+        return 1
+    fi
+
+    # Wait for the container to be running
+    if ! wait_for_lxc_running "$lxc_id"; then
+        log "ERROR" "$0: LXC $lxc_id failed to reach running state"
+        return 1
+    fi
+
+    # Wait for networking
+    if ! wait_for_lxc_network "$lxc_id"; then
+        log "ERROR" "$0: Networking failed to become available for LXC $lxc_id"
+        return 1
+    fi
+
+    # Mark container creation as complete
     mark_script_completed "$marker_file"
-else
-    log "ERROR" "Failed to create LXC container $LXC_ID."
+    log "INFO" "$0: LXC $lxc_id ($name) created and started successfully"
+}
+
+# --- Main execution ---
+# Re-validate JSON config
+validate_json_config "$PHOENIX_LXC_CONFIG_FILE"
+
+# Check if LXC_CONFIGS is populated
+if [[ ${#LXC_CONFIGS[@]} -eq 0 ]]; then
+    log "ERROR" "$0: No LXC configurations found in $PHOENIX_LXC_CONFIG_FILE"
     exit 1
 fi
 
-log "INFO" "Completed phoenix_hypervisor_create_lxc.sh for LXC $LXC_ID."
+# Iterate over LXC configurations
+for lxc_id in "${!LXC_CONFIGS[@]}"; do
+    create_lxc_container "$lxc_id" "${LXC_CONFIGS[$lxc_id]}"
+done
+
+log "INFO" "$0: Completed phoenix_hypervisor_create_lxc.sh successfully"
 exit 0

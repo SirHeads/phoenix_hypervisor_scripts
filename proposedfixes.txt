@@ -1,0 +1,172 @@
+# ✅ Phoenix Hypervisor: Requirements Specification
+**File:** `requirements.markdown`  
+**Version:** 1.1  
+**Author:** Assistant  
+**Date:** 2025-04-05  
+
+---
+
+This document outlines a prioritized list of **requirements and enhancements** for the **Phoenix Hypervisor** automation suite, based on a comprehensive architectural review of the provided codebase. Each requirement is ranked by **impact on security, reliability, maintainability, and operational safety**.
+
+After implementation, the system will transition from a **highly capable but production-risky** framework to a **production-hardened, secure, and enterprise-grade** automation platform.
+
+> **Note on Deferred Requirements (REQ-007, REQ-008, REQ-010):**
+> The following requirements have been identified as valuable for future scalability and extensibility but are deferred for later consideration:
+> *   **REQ-007 (Parallel Execution):** To simplify the initial refactoring and focus on core stability.
+> *   **REQ-008 (Multi-Vendor GPU Abstraction):** Requires significant architectural changes and is specific to non-NVIDIA hardware.
+> *   **REQ-010 (Comprehensive Testing Framework):** Essential long-term, but setting up `bats` and mocks is a substantial initial effort.
+> These items are acknowledged as important strategic goals but are not part of the immediate critical or operational improvement plan.
+
+---
+
+## 🔝 Tier 1: Critical Security & Stability Fixes
+> These changes address **critical vulnerabilities** and **systemic failure risks**. Implementation is **mandatory** before deployment in any production or shared environment.
+
+### **REQ-001: Replace Base64 Secret Storage with Strong Encryption**
+- **Description**: Secrets (Hugging Face token, LXC root password) are currently stored in base64-encoded files, which is not secure.
+- **Requirement**:  
+  - Use **AES-256-GCM** or **GPG-based encryption** to store secrets at rest.
+  - Secrets must be encrypted using a **host-specific key** (e.g., stored in `/etc/phoenix/secret.key`, `600` perms).
+  - Decryption must occur in memory only.
+  - Support for **external KMS** (e.g., Hashicorp Vault) is optional but desirable.
+- **Impact**:  
+  - Prevents credential leakage on host compromise.
+  - Meets basic security compliance (e.g., CIS, SOC2).
+- **Affected Files**:  
+  - `phoenix_hypervisor_common.sh` (`prompt_for_hf_token`, `prompt_for_lxc_root_password`)
+  - Secret storage paths: `/usr/local/etc/phoenix_hf_token.conf`, `/root/.phoenix_lxc_root_passwd`
+- **Test Case**:  
+  - After setup, inspect secret files — they must not contain readable or base64-decoded tokens/passwords.
+  - Re-run scripts — secrets must be decrypted and used correctly.
+
+### **REQ-002: Fix Fragile JSON-to-Bash Parsing**
+- **Description**: The use of `IFS='|'` to parse `jq` output is brittle and breaks if any field contains a `|`.
+- **Requirement**:  
+  - Replace delimited string parsing with **tab-separated values (TSV)** or **structured iteration**.
+  - Use `jq -r '@tsv'` and `IFS=$'\t'` to safely parse multi-field output.
+  - Validate that all required fields are non-empty before processing.
+- **Impact**:  
+  - Eliminates silent parsing failures.
+  - Enables safe use of model names, features, or network configs containing special characters.
+- **Affected Files**:  
+  - `phoenix_hypervisor_config.sh` (JSON parsing loop)
+  - `phoenix_hypervisor_create_lxc.sh`
+  - `phoenix_hypervisor_setup_drdevstral.sh`
+- **Test Case**:  
+  - Inject a model name with `|` (e.g., `"mistralai/Devstral|Small"`) — LXC must still be created and configured.
+
+### **REQ-003: Add Idempotent Cleanup & Rollback Mechanism**
+- **Description**: No rollback exists if a script fails mid-execution. Leftover state (e.g., partial LXCs, marker files) can block recovery.
+- **Requirement**:  
+  - Implement a `phoenix_hypervisor_destroy.sh` script to **tear down** all created resources:
+    - Stop and destroy LXCs.
+    - Remove marker files.
+    - Remove systemd services.
+    - Unmount bind mounts (if any).
+  - Add `trap`-based cleanup in long-running scripts to handle SIGINT/SIGTERM.
+  - `establish_hypervisor.sh` should support a `--dry-run` or `--rollback-on-failure` flag.
+- **Impact**:  
+  - Enables safe development and recovery.
+  - Prevents "wedged" state after partial failures.
+- **Test Case**:  
+  - Kill `establish_hypervisor.sh` during LXC creation.
+  - Run `destroy.sh` — all resources must be removed.
+  - Re-run `establish_hypervisor.sh` — deployment must succeed.
+
+---
+
+## ⚙️ Tier 2: Operational Robustness & Maintainability
+> These changes improve **reliability, flexibility, and observability**. They are essential for long-term maintainability and multi-environment support.
+
+### **REQ-004: Externalize Hardcoded Paths and Configs**
+- **Description**: Paths like `/usr/local/bin`, `/var/log/phoenix_hypervisor_markers`, and `quickOS/lxc-disks` are hardcoded.
+- **Requirement**:  
+  - Allow all paths and storage pools to be **overridden via environment variables** or a **config override file**.
+  - Default values remain, but must be replaceable.
+  - Example: `export PHOENIX_MARKER_DIR="/opt/phoenix/markers"`
+- **Impact**:  
+  - Enables testing in non-root environments.
+  - Supports alternative Proxmox layouts.
+- **Affected Files**:  
+  - All scripts using `HYPERVISOR_MARKER_DIR`, `LOGFILE`, `PHOENIX_LXC_CONFIG_FILE`, ZFS pool names.
+- **Test Case**:  
+  - Set custom `PHOENIX_MARKER_DIR` and `PHOENIX_LOG_DIR`.
+  - Run full deployment — logs and markers must appear in new locations.
+
+### **REQ-005: Input Sanitization and Command Injection Protection**
+- **Description**: Untrusted inputs (e.g., model name, network CIDR) are interpolated into shell commands without validation.
+- **Requirement**:  
+  - Validate all user-provided inputs:
+    - LXC ID: must be numeric.
+    - Model name: no shell metacharacters unless explicitly allowed.
+    - Network CIDR: valid format.
+  - Use **shell-safe quoting** in all `pct exec`, `docker run`, and `systemd` commands.
+  - Reject configs with dangerous characters unless escaped.
+- **Impact**:  
+  - Prevents command injection via malicious JSON config.
+  - Hardens against config drift or typo-induced failures.
+- **Test Case**:  
+  - Set `vllm_model='; rm -rf /'` — deployment must fail during validation, not execute.
+
+### **REQ-006: Add Post-Deployment Health Checks**
+- **Description**: No validation that vLLM is actually running or responsive after setup.
+- **Requirement**:  
+  - After starting the vLLM container, execute:
+    ```bash
+    curl -f http://localhost:8000/health
+    ```
+  - Retry with timeout (e.g., 5 attempts, 10s delay).
+  - Fail setup if health check does not pass.
+- **Impact**:  
+  - Ensures functional deployment, not just syntactic success.
+  - Catches container startup issues (e.g., OOM, model load failure).
+- **Test Case**:  
+  - Simulate a failing vLLM container (e.g., wrong image).
+  - Setup script must detect failure and exit non-zero.
+
+### **REQ-009: Implement Configuration Schema Validation**
+- **Description**: JSON config is parsed but not validated against a schema.
+- **Requirement**:  
+  - Define a **JSON Schema** for `phoenix_lxc_configs.json`.
+  - Validate config against schema using `jq` or `jsonschema` (if Python available).
+  - Validate types (e.g., `memory_mb` is integer), ranges, and enum values.
+- **Impact**:  
+  - Catches config errors early (e.g., `"cores": "two"`).
+  - Improves user experience and debuggability.
+- **Test Case**:  
+  - Set `"memory_mb": "invalid"` — script must fail with clear error before any action.
+
+---
+
+## 📊 Revised Overall Assessment After Implementation
+| Category                  | Before Score | After Score | Notes |
+|--------------------------|--------------|-------------|-------|
+| **Security**             | 2.5          | **5.0**     | Secrets encrypted; input sanitization prevents injection |
+| **Error Handling**       | 5.0          | **5.0**     | Enhanced with health checks and rollback |
+| **Modularity**           | 5.0          | **5.0**     | Improved by addressing parsing fragility |
+| **Maintainability**      | 4.5          | **5.0**     | Configurable paths, schema validation |
+| **Scalability**          | 3.0          | **3.0**     | No change (Parallel execution deferred) |
+| **Reproducibility**      | 5.0          | **5.0**     | Now includes full destroy/recreate cycle |
+| **Extensibility**        | 4.0          | **4.0**     | No change (Multi-vendor GPU deferred) |
+| **Operational Safety**   | 3.5          | **5.0**     | Rollback, health checks, and sanitization ensure safety |
+
+> ✅ **Final Assessment**:  
+> After implementing these prioritized requirements, the Phoenix Hypervisor evolves from a **capable prototype** into a **production-hardened, secure, and maintainable** automation framework suitable for enterprise AI/ML infrastructure. Deferred requirements (Parallel Execution, Multi-Vendor GPU, Comprehensive Testing) remain important strategic goals for future development.
+
+---
+
+## ✅ Summary of Test Cases After Prioritized Implementation
+| Test Case | Description | Expected Outcome |
+|---------|-------------|------------------|
+| **T-101** | Deploy with `vllm_model="mistralai/Devstral\|Small"` | Success — `|` handled safely via TSV parsing |
+| **T-102** | Run `establish_hypervisor.sh`, then `destroy.sh` | All LXCs, logs, markers removed; system clean |
+| **T-103** | Set `PHOENIX_MARKER_DIR="/tmp/phoenix/markers"` | Markers created in custom location |
+| **T-104** | Inject `vllm_model='; rm -rf /'` | Setup fails during validation — no command injection |
+| **T-105** | *(Deferred)* Run with 3 LXCs and `--parallel` | *(N/A for this phase)* |
+| **T-106** | Run with failing vLLM container | Setup fails — health check detects non-responsive API |
+| **T-107** | *(Deferred)* Run on AMD GPU host | *(N/A for this phase)* |
+| **T-108** | Set `"memory_mb": "invalid"` in JSON | Script fails early with schema validation error |
+| **T-109** | *(Deferred)* Run `bats test/` | *(N/A for this phase)* |
+| **T-110** | Kill script during LXC creation | `destroy.sh` cleans up partial state successfully |
+
+---
