@@ -1,4 +1,5 @@
 {
+  "$schema": "./phoenix_lxc_configs.schema.json",
   "lxc_configs": {
     "901": {
       "name": "drdevstral",
@@ -6,19 +7,19 @@
       "cores": 8,
       "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
       "storage_pool": "lxc-disks",
-      "storage_size_gb": 64,
-      "nvidia_pci_ids": "",
-      "network_config": "10.0.0.110/24,10.0.0.1,8.8.8.8",
-      "features": "nesting=1",
-      "gpu_assignment": "0 1",
-      "vllm_model": "mistralai/Devstral-Small-2507",
-      "vllm_tensor_parallel_size": 2,
-      "vllm_max_model_len": 128000,
+      "storage_size_gb": "64",
+      "network_config": "10.0.0.111/24,10.0.0.1,8.8.8.8",
+      "features": "nesting=1,keyctl=1",
+      "vllm_model": "mistralai/Devstral-Small-2507-Q5_K_M.gguf",
+      "vllm_tensor_parallel_size": "1",
+      "vllm_max_model_len": "16384",
       "vllm_kv_cache_dtype": "fp8",
       "vllm_shm_size": "10.24gb",
-      "vllm_gpu_count": "all",
+      "vllm_gpu_count": "1",
       "vllm_quantization": "bitsandbytes",
-      "vllm_quantization_config_type": "int8"
+      "vllm_quantization_config_type": "int8",
+      "vllm_api_port": 8000,
+      "setup_script": "/usr/local/bin/phoenix_hypervisor_setup_drdevstral.sh"
     }
   }
 }

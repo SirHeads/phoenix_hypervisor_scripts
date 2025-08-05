@@ -1,0 +1,173 @@
+{
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "$id": "https://example.com/phoenix_lxc_configs.schema.json",
+    "title": "Phoenix Hypervisor LXC Configuration",
+    "description": "Schema for defining LXC containers and their configurations for the Phoenix Hypervisor",
+    "type": "object",
+    "properties": {
+        "$schema": {
+            "type": "string",
+            "description": "Optional reference to this schema file"
+        },
+        "lxc_configs": {
+            "type": "object",
+            "description": "A dictionary of LXC container configurations, keyed by LXC ID (string)",
+            "patternProperties": {
+                "^[0-9]+$": {
+                    "type": "object",
+                    "properties": {
+                        "name": {
+                            "type": "string",
+                            "description": "Hostname for the LXC container"
+                        },
+                        "memory_mb": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ],
+                            "description": "RAM allocation for the LXC container in MB",
+                            "minimum": 128,
+                            "pattern": "^[0-9]+$"
+                        },
+                        "cores": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ],
+                            "description": "Number of CPU cores allocated to the LXC container",
+                            "minimum": 1,
+                            "pattern": "^[0-9]+$"
+                        },
+                        "template": {
+                            "type": "string",
+                            "description": "Path to the LXC template file on the Proxmox host"
+                        },
+                        "storage_pool": {
+                            "type": "string",
+                            "description": "The Proxmox storage pool to use for the container's root disk"
+                        },
+                        "storage_size_gb": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ],
+                            "description": "Size of the root disk for the container",
+                            "minimum": 1,
+                            "pattern": "^[0-9]+$"
+                        },
+                        "network_config": {
+                            "type": "string",
+                            "description": "Network configuration in the format 'IP/prefix,gateway,DNS' or 'name=eth0,bridge=vmbr0,ip=dhcp'",
+                            "pattern": "^(([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2},([0-9]{1,3}\\.){3}[0-9]{1,3},([0-9]{1,3}\\.){3}[0-9]{1,3}|name=[a-zA-Z0-9_-]+,bridge=[a-zA-Z0-9_-]+,ip=dhcp)$"
+                        },
+                        "features": {
+                            "type": "string",
+                            "description": "LXC features string (e.g., 'nesting=1,keyctl=1')"
+                        },
+                        "vllm_model": {
+                            "type": "string",
+                            "description": "The Hugging Face model path for vLLM (e.g., 'mistralai/Devstral-Small-2507-Q5_K_M.gguf')"
+                        },
+                        "vllm_tensor_parallel_size": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ],
+                            "description": "Number of GPUs for tensor parallelism",
+                            "minimum": 1,
+                            "pattern": "^[0-9]+$"
+                        },
+                        "vllm_max_model_len": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ],
+                            "description": "Maximum sequence length for the model",
+                            "minimum": 1,
+                            "pattern": "^[0-9]+$"
+                        },
+                        "vllm_kv_cache_dtype": {
+                            "type": "string",
+                            "description": "Data type for the key-value cache (e.g., 'auto', 'fp8', 'fp16')",
+                            "enum": [
+                                "auto",
+                                "fp8",
+                                "fp16"
+                            ]
+                        },
+                        "vllm_shm_size": {
+                            "type": "string",
+                            "description": "Shared memory size for Docker (e.g., '10.24gb', '1gb')",
+                            "pattern": "^[0-9]+(\\.[0-9]+)?[gm]b$"
+                        },
+                        "vllm_gpu_count": {
+                            "type": [
+                                "string",
+                                "integer"
+                            ],
+                            "description": "Number of GPUs or 'all' for Docker (e.g., 'all', '2')",
+                            "pattern": "^(all|[0-9]+)$"
+                        },
+                        "vllm_quantization": {
+                            "type": "string",
+                            "description": "Quantization method (e.g., 'bitsandbytes', 'awq', 'gptq')",
+                            "enum": [
+                                "bitsandbytes",
+                                "awq",
+                                "gptq",
+                                "squeezellm",
+                                "fp8",
+                                "fp16",
+                                "int8",
+                                "int4",
+                                "none"
+                            ]
+                        },
+                        "vllm_quantization_config_type": {
+                            "type": "string",
+                            "description": "Specific configuration type for the quantization method (e.g., 'int8', 'int4')",
+                            "enum": [
+                                "int8",
+                                "int4",
+                                "nf4",
+                                "fp4",
+                                "none"
+                            ]
+                        },
+                        "vllm_api_port": {
+                            "type": [
+                                "integer",
+                                "string"
+                            ],
+                            "description": "The port on which the vLLM API will listen inside the LXC",
+                            "minimum": 1,
+                            "maximum": 65535,
+                            "pattern": "^[0-9]+$"
+                        },
+                        "setup_script": {
+                            "type": "string",
+                            "description": "Path to the setup script for the LXC container"
+                        }
+                    },
+                    "required": [
+                        "name",
+                        "memory_mb",
+                        "cores",
+                        "template",
+                        "storage_pool",
+                        "storage_size_gb",
+                        "network_config",
+                        "features",
+                        "vllm_api_port"
+                    ],
+                    "additionalProperties": false
+                }
+            },
+            "additionalProperties": false
+        }
+    },
+    "required": [
+        "lxc_configs"
+    ],
+    "additionalProperties": false
+}
