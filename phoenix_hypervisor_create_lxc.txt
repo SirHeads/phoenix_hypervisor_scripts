@@ -7,292 +7,486 @@
 # - phoenix_hypervisor_common.sh and phoenix_hypervisor_config.sh sourced
 # - /usr/local/etc/phoenix_lxc_configs.json configured with required fields
 # - NVIDIA GPU(s) validated on the host
-# Usage: ./phoenix_hypervisor_create_lxc.sh <lxc_id> <template> <storage_pool> <storage_size_gb> <memory_mb> <cores> <hostname> <network_config> <gpu_enabled>
+# Usage: ./phoenix_hypervisor_create_lxc.sh <lxc_id>
 # Version: 1.7.3
 # Author: Assistant
 set -euo pipefail
 
-# Source common functions and configuration
-source /usr/local/bin/phoenix_hypervisor_common.sh || { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $0: Failed to source phoenix_hypervisor_common.sh" >&2; exit 1; }
-source /usr/local/bin/phoenix_hypervisor_config.sh || { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $0: Failed to source phoenix_hypervisor_config.sh" >&2; exit 1; }
-
-# Check root privileges
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Checking root privileges..." >&2
-check_root
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Root check passed." >&2
-
-# Log start of script
-log "INFO" "$0: Starting phoenix_hypervisor_create_lxc.sh"
-
-# --- Function: create_lxc_container ---
-# Description: Creates a single LXC container based on provided arguments.
-# Parameters: lxc_id, template, storage_pool, storage_size_gb, memory_mb, cores, hostname, network_config, gpu_enabled
-# Returns: Exits with status 1 on failure
-create_lxc_container() {
-    local lxc_id="$1"
-    local template="$2"
-    local storage_pool="$3"
-    local storage_size_gb="$4"
-    local memory_mb="$5"
-    local cores="$6"
-    local hostname="$7"
-    local network_config="$8"
-    local gpu_enabled="$9"
-    local marker_file="${PHOENIX_HYPERVISOR_LXC_MARKER/lxc_id/$lxc_id}"
-
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Processing LXC $lxc_id..." >&2
-
-    if is_script_completed "$marker_file"; then
-        log "INFO" "$0: LXC $lxc_id already created. Skipping."
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] LXC $lxc_id already created. Skipping." >&2
-        return 0
-    fi
-
-    # Validate LXC ID format
-    if ! validate_lxc_id "$lxc_id"; then
-        log "ERROR" "$0: Invalid LXC ID format: '$lxc_id'"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Invalid LXC ID format: '$lxc_id'." >&2
-        return 1
-    fi
-
-    # Validate template file
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Validating template file $template..." >&2
-    if [[ ! -f "$template" ]]; then
-        log "ERROR" "$0: Template file not found: $template"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Template file not found: $template." >&2
-        return 1
-    fi
-
-    # Validate required fields
-    local required_fields=("template" "storage_pool" "storage_size_gb" "memory_mb" "cores" "hostname" "network_config")
-    for field in "${required_fields[@]}"; do
-        if [[ -z "${!field}" ]]; then
-            log "ERROR" "$0: Missing required field '$field' for LXC $lxc_id"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Missing required field '$field' for LXC $lxc_id." >&2
-            return 1
-        fi
-        local sanitized_value
-        sanitized_value=$(sanitize_input "${!field}")
-        if [[ "$sanitized_value" != "${!field}" ]]; then
-            if [[ "$field" == "hostname" ]]; then
-                log "ERROR" "$0: Hostname '$hostname' for LXC $lxc_id contains invalid characters."
-                echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Hostname '$hostname' for LXC $lxc_id contains invalid characters." >&2
-                return 1
-            fi
-        fi
-    done
-
-    # Validate numeric fields
-    if ! validate_numeric "$memory_mb"; then
-        log "ERROR" "$0: Invalid memory_mb value for LXC $lxc_id: '$memory_mb'"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Invalid memory_mb value for LXC $lxc_id: '$memory_mb'." >&2
-        return 1
-    fi
-    if ! validate_numeric "$cores"; then
-        log "ERROR" "$0: Invalid cores value for LXC $lxc_id: '$cores'"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Invalid cores value for LXC $lxc_id: '$cores'." >&2
-        return 1
-    fi
-    if ! validate_numeric "$storage_size_gb"; then
-        log "ERROR" "$0: Invalid storage_size_gb value for LXC $lxc_id: '$storage_size_gb'"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Invalid storage_size_gb value for LXC $lxc_id: '$storage_size_gb'." >&2
-        return 1
-    fi
-
-    # Validate storage pool
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Validating storage pool $storage_pool..." >&2
-    if ! pvesm status | grep -q "^$storage_pool.*active.*1"; then
-        log "ERROR" "$0: Storage pool $storage_pool is not active for LXC $lxc_id"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Storage pool $storage_pool is not active for LXC $lxc_id." >&2
-        pvesm status | while read -r line; do log "DEBUG" "$0: pvesm: $line"; done
-        return 1
-    fi
-    if [[ "$storage_pool" == "lxc-disks" ]]; then
-        local zfs_pool_name_to_check="${PHOENIX_ZFS_LXC_POOL:-quickOS/lxc-disks}"
-        if ! validate_zfs_pool "$zfs_pool_name_to_check"; then
-            log "ERROR" "$0: ZFS pool validation failed for $zfs_pool_name_to_check for LXC $lxc_id"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] ZFS pool validation failed for $zfs_pool_name_to_check." >&2
-            return 1
-        fi
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Storage pool validated." >&2
-
-    # Parse network configuration and validate
-    IFS=',' read -r ip_cidr gateway dns <<< "$network_config"
-    if [[ -z "$ip_cidr" ]] || [[ -z "$gateway" ]]; then
-        log "ERROR" "$0: Invalid network configuration for LXC $lxc_id: $network_config"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Invalid network configuration for LXC $lxc_id: $network_config." >&2
-        return 1
-    fi
-    if ! validate_network_cidr "$ip_cidr"; then
-        log "ERROR" "$0: Invalid IP CIDR format for LXC $lxc_id: '$ip_cidr'"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Invalid IP CIDR format for LXC $lxc_id: '$ip_cidr'." >&2
-        return 1
-    fi
-    if ! validate_network_cidr "$gateway"; then
-        log "WARN" "$0: Gateway '$gateway' for LXC $lxc_id might not be in standard CIDR format."
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] Gateway '$gateway' for LXC $lxc_id might not be in standard CIDR format." >&2
-    fi
-    if [[ -n "$dns" ]] && ! validate_network_cidr "$dns"; then
-        log "WARN" "$0: DNS '$dns' for LXC $lxc_id might not be in standard IP format."
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] DNS '$dns' for LXC $lxc_id might not be in standard IP format." >&2
-    fi
-
-    # Check for LXC_ROOT_PASSWORD in non-interactive environment
-    if [[ ! -t 0 ]] && [[ -z "${LXC_ROOT_PASSWORD:-}" ]]; then
-        log "ERROR" "$0: Non-interactive environment detected and no LXC_ROOT_PASSWORD provided for LXC $lxc_id."
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Non-interactive environment detected and no LXC_ROOT_PASSWORD provided for LXC $lxc_id." >&2
-        return 1
-    fi
-
-    # Construct pct create command
-    local features="${DEFAULT_LXC_FEATURES:-nesting=1}"
-    local pct_cmd="pct create $lxc_id \"$template\" \
-        -cores $cores \
-        -memory $memory_mb \
-        -hostname \"$hostname\" \
-        -storage $storage_pool \
-        -rootfs $storage_pool:$storage_size_gb \
-        -net0 name=eth0,bridge=vmbr0,ip=$ip_cidr,gw=$gateway \
-        -features \"$features\""
-    if [[ -n "${LXC_ROOT_PASSWORD:-}" ]]; then
-        pct_cmd="$pct_cmd -password \"$LXC_ROOT_PASSWORD\""
-    fi
-    log "DEBUG" "$0: Executing pct create command: $pct_cmd"
-
-    # Create LXC container
-    if ! retry_command "$pct_cmd" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct create: $line" >&2; done; then
-        log "ERROR" "$0: Failed to create LXC $lxc_id"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Failed to create LXC $lxc_id." >&2
-        if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-            if ! retry_command "pct destroy $lxc_id" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct destroy: $line" >&2; done; then
-                log "WARN" "$0: Failed to rollback by destroying LXC $lxc_id"
-            else
-                log "INFO" "$0: Rolled back by destroying LXC $lxc_id"
-            fi
-        fi
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] LXC $lxc_id created." >&2
-
-    # Configure GPU passthrough
-    if [[ "$gpu_enabled" == "true" ]]; then
-        local gpu_assignment="${PHOENIX_GPU_ASSIGNMENTS[$lxc_id]}"
-        if [[ -z "$gpu_assignment" ]]; then
-            log "ERROR" "$0: GPU enabled for LXC $lxc_id but no assignment found in PHOENIX_GPU_ASSIGNMENTS."
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] GPU enabled for LXC $lxc_id but no assignment found in PHOENIX_GPU_ASSIGNMENTS." >&2
-            if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-                if ! retry_command "pct destroy $lxc_id" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct destroy: $line" >&2; done; then
-                    log "WARN" "$0: Failed to rollback by destroying LXC $lxc_id"
-                else
-                    log "INFO" "$0: Rolled back by destroying LXC $lxc_id"
-                fi
-            fi
-            return 1
-        fi
-        log "INFO" "$0: Found GPU assignment '$gpu_assignment' for LXC $lxc_id from PHOENIX_GPU_ASSIGNMENTS."
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Validating GPU assignment for LXC $lxc_id..." >&2
-        if ! detect_gpu_details "$gpu_assignment"; then
-            log "ERROR" "$0: Failed to validate GPU details for assignment: $gpu_assignment"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Failed to validate GPU details for assignment: $gpu_assignment." >&2
-            if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-                if ! retry_command "pct destroy $lxc_id" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct destroy: $line" >&2; done; then
-                    log "WARN" "$0: Failed to rollback by destroying LXC $lxc_id"
-                else
-                    log "INFO" "$0: Rolled back by destroying LXC $lxc_id"
-                fi
-            fi
-            return 1
-        fi
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Configuring GPU passthrough for LXC $lxc_id..." >&2
-        if ! configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
-            log "ERROR" "$0: Failed to configure GPU passthrough for LXC $lxc_id"
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Failed to configure GPU passthrough for LXC $lxc_id." >&2
-            if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-                if ! retry_command "pct destroy $lxc_id" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct destroy: $line" >&2; done; then
-                    log "WARN" "$0: Failed to rollback by destroying LXC $lxc_id"
-                else
-                    log "INFO" "$0: Rolled back by destroying LXC $lxc_id"
-                fi
-            fi
-            return 1
-        fi
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] GPU passthrough configured for LXC $lxc_id." >&2
-    fi
-
-    # Start the container
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Starting LXC $lxc_id..." >&2
-    log "INFO" "$0: Starting LXC $lxc_id..."
-    if ! retry_command "pct start $lxc_id" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct start: $line" >&2; done; then
-        log "ERROR" "$0: Failed to start LXC $lxc_id"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Failed to start LXC $lxc_id." >&2
-        if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-            if ! retry_command "pct destroy $lxc_id" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct destroy: $line" >&2; done; then
-                log "WARN" "$0: Failed to rollback by destroying LXC $lxc_id"
-            else
-                log "INFO" "$0: Rolled back by destroying LXC $lxc_id"
-            fi
-        fi
-        return 1
-    fi
-
-    # Wait for the container to be running
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Waiting for LXC $lxc_id to start..." >&2
-    if ! wait_for_lxc_running "$lxc_id"; then
-        log "ERROR" "$0: LXC $lxc_id failed to reach running state"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] LXC $lxc_id failed to reach running state." >&2
-        if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-            if ! retry_command "pct destroy $lxc_id" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct destroy: $line" >&2; done; then
-                log "WARN" "$0: Failed to rollback by destroying LXC $lxc_id"
-            else
-                log "INFO" "$0: Rolled back by destroying LXC $lxc_id"
-            fi
-        fi
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] LXC $lxc_id is running." >&2
-
-    # Wait for networking
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Waiting for LXC $lxc_id network..." >&2
-    if ! wait_for_lxc_network "$lxc_id"; then
-        log "ERROR" "$0: Networking failed to become available for LXC $lxc_id"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Networking failed to become available for LXC $lxc_id." >&2
-        if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-            if ! retry_command "pct destroy $lxc_id" 2>&1 | while read -r line; do echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [DEBUG] pct destroy: $line" >&2; done; then
-                log "WARN" "$0: Failed to rollback by destroying LXC $lxc_id"
-            else
-                log "INFO" "$0: Rolled back by destroying LXC $lxc_id"
-            fi
-        fi
-        return 1
-    fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] LXC $lxc_id network is available." >&2
-
-    # Mark container creation as complete
-    mark_script_completed "$marker_file"
-    log "INFO" "$0: LXC $lxc_id ($hostname) created and started successfully"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] LXC $lxc_id ($hostname) created and started successfully." >&2
+# --- Enhanced User Experience Functions ---
+log_info() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $1" >&2
 }
 
-# --- Main execution ---
-if [[ $# -ne 9 ]]; then
-    log "ERROR" "$0: Incorrect number of arguments. Expected 9, got $#"
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] Usage: $0 <lxc_id> <template> <storage_pool> <storage_size_gb> <memory_mb> <cores> <hostname> <network_config> <gpu_enabled>" >&2
-    exit 1
-fi
+log_warn() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $1" >&2
+}
 
-lxc_id="$1"
-template="$2"
-storage_pool="$3"
-storage_size_gb="$4"
-memory_mb="$5"
-cores="$6"
-hostname="$7"
-network_config="$8"
-gpu_enabled="$9"
+log_error() {
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $1" >&2
+}
 
-create_lxc_container "$lxc_id" "$template" "$storage_pool" "$storage_size_gb" "$memory_mb" "$cores" "$hostname" "$network_config" "$gpu_enabled"
+prompt_user() {
+    local prompt="$1"
+    local default="${2:-}"
+    read -p "$prompt [$default]: " response
+    echo "${response:-$default}"
+}
 
-log "INFO" "$0: Completed phoenix_hypervisor_create_lxc.sh successfully"
-echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Phoenix Hypervisor LXC creation completed successfully." >&2
-exit 0
+# --- Enhanced Logging Function ---
+log() {
+    local level="$1"
+    shift
+    local message="$*"
+    if [[ -z "${HYPERVISOR_LOGFILE:-}" ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $0: HYPERVISOR_LOGFILE variable not set" >&2
+        exit 1
+    fi
+    # Ensure log directory exists
+    local log_dir
+    log_dir=$(dirname "$HYPERVISOR_LOGFILE")
+    mkdir -p "$log_dir" || { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $0: Failed to create log directory: $log_dir" >&2; exit 1; }
+    # Log to file via fd 4
+    if [[ ! -e /proc/self/fd/4 ]]; then
+        exec 4>>"$HYPERVISOR_LOGFILE"
+        chmod 600 "$HYPERVISOR_LOGFILE" || { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $0: Failed to set permissions on $HYPERVISOR_LOGFILE" >&2; }
+    fi
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [$level] $message" >&4
+    # Output INFO, WARN, ERROR to stderr for terminal visibility
+    if [[ "$level" =~ ^(INFO|WARN|ERROR)$ ]]; then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [$level] $message" >&2
+    fi
+}
+
+# --- Enhanced Main Function ---
+main() {
+    # Check if we have the required arguments
+    if [[ $# -lt 1 ]]; then
+        log_error "Usage: $0 <lxc_id>"
+        echo ""
+        echo "Example: $0 901"
+        echo ""
+        exit 1
+    fi
+    
+    local lxc_id="$1"
+    
+    # Validate LXC ID
+    if ! validate_lxc_id "$lxc_id"; then
+        log_error "Invalid LXC ID format: $lxc_id"
+        exit 1
+    fi
+    
+    log_info "Starting LXC container creation for ID: $lxc_id"
+    echo ""
+    echo "==============================================="
+    echo "CREATING LXC CONTAINER $lxc_id"
+    echo "==============================================="
+    echo ""
+    
+    # Check if already created
+    local marker_file="${HYPERVISOR_MARKER_DIR}/lxc_${lxc_id}_created"
+    if is_script_completed "$marker_file"; then
+        log_info "LXC container $lxc_id already exists. Skipping creation."
+        echo "Container $lxc_id already exists - skipping creation."
+        echo ""
+        exit 0
+    fi
+    
+    # Confirm with user before proceeding
+    read -p "Do you want to create LXC container $lxc_id? (yes/no): " confirm
+    if [[ "$confirm" != "yes" ]]; then
+        log_info "Creation of LXC container $lxc_id cancelled by user."
+        echo ""
+        echo "Container creation cancelled for $lxc_id."
+        echo ""
+        exit 0
+    fi
+    
+    echo ""
+    echo "Creating container $lxc_id..."
+    echo "----------------------------"
+    
+    # Load configuration for this specific container
+    log_info "Loading configuration for LXC container $lxc_id..."
+    local config_data
+    if [[ -n "${LXC_CONFIGS[$lxc_id]:-}" ]]; then
+        config_data="${LXC_CONFIGS[$lxc_id]}"
+        log_info "Configuration loaded for LXC container $lxc_id"
+    else
+        log_error "No configuration found for LXC container $lxc_id"
+        exit 1
+    fi
+    
+    # Extract container details from JSON
+    local name
+    name=$(echo "$config_data" | jq -r '.name // empty')
+    
+    local memory_mb
+    memory_mb=$(echo "$config_data" | jq -r '.memory_mb // empty')
+    if [[ -z "$memory_mb" || "$memory_mb" == "null" ]]; then
+        memory_mb="$DEFAULT_LXC_MEMORY_MB"
+    fi
+    
+    local cores
+    cores=$(echo "$config_data" | jq -r '.cores // empty')
+    if [[ -z "$cores" || "$cores" == "null" ]]; then
+        cores="$DEFAULT_LXC_CORES"
+    fi
+    
+    local template
+    template=$(echo "$config_data" | jq -r '.template // empty')
+    if [[ -z "$template" || "$template" == "null" ]]; then
+        template="$DEFAULT_LXC_TEMPLATE"
+    fi
+    
+    local storage_pool
+    storage_pool=$(echo "$config_data" | jq -r '.storage_pool // empty')
+    if [[ -z "$storage_pool" || "$storage_pool" == "null" ]]; then
+        storage_pool="$DEFAULT_LXC_STORAGE_POOL"
+    fi
+    
+    local storage_size_gb
+    storage_size_gb=$(echo "$config_data" | jq -r '.storage_size_gb // empty')
+    if [[ -z "$storage_size_gb" || "$storage_size_gb" == "null" ]]; then
+        storage_size_gb="$DEFAULT_LXC_STORAGE_SIZE_GB"
+    fi
+    
+    local network_config
+    network_config=$(echo "$config_data" | jq -r '.network_config // empty')
+    if [[ -z "$network_config" || "$network_config" == "null" ]]; then
+        network_config="$DEFAULT_LXC_NETWORK_CONFIG"
+    fi
+    
+    local features
+    features=$(echo "$config_data" | jq -r '.features // empty')
+    if [[ -z "$features" || "$features" == "null" ]]; then
+        features="$DEFAULT_LXC_FEATURES"
+    fi
+    
+    # Show container configuration
+    echo ""
+    echo "Container Configuration:"
+    echo "------------------------"
+    echo "ID: $lxc_id"
+    echo "Name: $name"
+    echo "Memory: ${memory_mb} MB"
+    echo "CPU Cores: $cores"
+    echo "Template: $template"
+    echo "Storage Pool: $storage_pool"
+    echo "Storage Size: ${storage_size_gb} GB"
+    echo "Network Config: $network_config"
+    echo "Features: $features"
+    echo ""
+    
+    # Validate storage pool exists
+    log_info "Validating storage pool: $storage_pool"
+    if ! pvesm status | grep -q "^$storage_pool.*active.*1"; then
+        log_error "Storage pool $storage_pool is not active or does not exist"
+        exit 1
+    fi
+    
+    # Validate template exists
+    log_info "Validating template: $template"
+    if [[ ! -f "$template" ]]; then
+        log_warn "Template file not found: $template"
+        echo "Warning: Template file not found. Container creation may fail."
+    fi
+    
+    # Check if container already exists
+    log_info "Checking if container $lxc_id already exists..."
+    if pct status "$lxc_id" >/dev/null 2>&1; then
+        log_warn "Container $lxc_id already exists"
+        echo ""
+        read -p "Do you want to recreate this container? (yes/no): " recreate_confirm
+        if [[ "$recreate_confirm" != "yes" ]]; then
+            log_info "Skipping recreation of existing container $lxc_id"
+            echo "Container $lxc_id not recreated."
+            echo ""
+            exit 0
+        fi
+        
+        # Stop and destroy existing container
+        echo "Stopping existing container $lxc_id..."
+        pct stop "$lxc_id" >/dev/null 2>&1 || true
+        echo "Destroying existing container $lxc_id..."
+        pct destroy "$lxc_id" --force >/dev/null 2>&1 || true
+    fi
+    
+    # Create LXC container with progress indicators
+    log_info "Creating LXC container $lxc_id..."
+    
+    echo "Creating LXC container with the following settings:"
+    echo "- ID: $lxc_id"
+    echo "- Name: $name"
+    echo "- Memory: ${memory_mb} MB"
+    echo "- Cores: $cores"
+    echo "- Template: $template"
+    echo "- Storage Pool: $storage_pool"
+    echo "- Storage Size: ${storage_size_gb} GB"
+    echo ""
+    
+    # Create the container with a detailed command
+    local create_cmd="pct create $lxc_id \
+        --ostemplate \"$template\" \
+        --memory $memory_mb \
+        --cores $cores \
+        --hostname \"$name\" \
+        --net0 net0 \
+        --features \"$features\" \
+        --storage \"$storage_pool\" \
+        --size \"${storage_size_gb}G\""
+    
+    echo "Executing command: $create_cmd"
+    
+    # Execute container creation
+    if ! retry_command 3 10 "$create_cmd"; then
+        log_error "Failed to create LXC container $lxc_id"
+        exit 1
+    fi
+    
+    log_info "Container $lxc_id created successfully"
+    
+    # Configure networking
+    echo ""
+    log_info "Configuring network settings for container $lxc_id..."
+    
+    local net_config="net0=name=eth0,bridge=vmbr0,gw=$network_config"
+    if ! pct set "$lxc_id" --net0 "$net_config"; then
+        log_warn "Failed to configure network for container $lxc_id"
+    else
+        log_info "Network configuration applied to container $lxc_id"
+    fi
+    
+    # Configure GPU passthrough if needed
+    local gpu_assignment
+    gpu_assignment="${PHOENIX_GPU_ASSIGNMENTS[$lxc_id]:-}"
+    
+    if [[ -n "$gpu_assignment" ]]; then
+        echo ""
+        log_info "Configuring GPU passthrough for container $lxc_id..."
+        
+        # Validate GPU assignment
+        if ! validate_gpu_assignment "$lxc_id" "$gpu_assignment"; then
+            log_warn "GPU assignment validation failed for container $lxc_id"
+            echo "Skipping GPU passthrough configuration."
+        else
+            if configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
+                log_info "GPU passthrough configured for container $lxc_id"
+            else
+                log_warn "Failed to configure GPU passthrough for container $lxc_id"
+            fi
+        fi
+    else
+        log_info "No GPU assignment found for container $lxc_id, skipping GPU configuration"
+    fi
+    
+    # Start the container
+    echo ""
+    log_info "Starting container $lxc_id..."
+    
+    if ! pct start "$lxc_id"; then
+        log_error "Failed to start LXC container $lxc_id"
+        exit 1
+    fi
+    
+    # Wait for container to fully start
+    echo "Waiting for container $lxc_id to fully start..."
+    sleep 5
+    
+    # Verify container is running
+    if pct status "$lxc_id" | grep -q "status: running"; then
+        log_info "Container $lxc_id is now running"
+        
+        # Show container information
+        echo ""
+        echo "Container Information:"
+        echo "----------------------"
+        echo "ID: $lxc_id"
+        echo "Status: Running"
+        echo "Name: $name"
+        echo "Memory: ${memory_mb} MB"
+        echo "CPU Cores: $cores"
+        echo ""
+        
+        # Show network information
+        local ip_address
+        ip_address=$(pct exec "$lxc_id" -- ip addr show eth0 2>/dev/null | grep 'inet ' | awk '{print $2}' | cut -d'/' -f1)
+        if [[ -n "$ip_address" ]]; then
+            echo "IP Address: $ip_address"
+        else
+            echo "IP Address: Not available (container may still be initializing)"
+        fi
+        
+    else
+        log_warn "Container $lxc_id may not have started properly"
+    fi
+    
+    # Mark completion
+    mark_script_completed "$marker_file"
+    log_info "LXC container $lxc_id creation completed successfully"
+    
+    echo ""
+    echo "==============================================="
+    echo "CONTAINER CREATION COMPLETED SUCCESSFULLY!"
+    echo "==============================================="
+    echo ""
+}
+
+# --- Enhanced Validation Functions ---
+validate_lxc_id() {
+    local lxc_id="$1"
+    
+    # Check if it's a valid numeric ID
+    if ! [[ "$lxc_id" =~ ^[0-9]+$ ]]; then
+        return 1
+    fi
+    
+    # Check if ID is in valid range (typically 100-999 for containers)
+    if [[ "$lxc_id" -lt 100 ]] || [[ "$lxc_id" -gt 999 ]]; then
+        log_warn "LXC ID $lxc_id is outside typical range (100-999)"
+    fi
+    
+    return 0
+}
+
+validate_gpu_assignment() {
+    local lxc_id="$1"
+    local gpu_indices="$2"
+    
+    log_info "Validating GPU assignment for container $lxc_id: $gpu_indices"
+    
+    # Check if nvidia-smi is available
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "nvidia-smi not found. Cannot validate GPU assignment."
+        return 1
+    fi
+    
+    # Get number of GPUs
+    local gpu_count
+    gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits | tr -d ' ')
+    
+    if [[ "$gpu_count" -eq 0 ]]; then
+        log_warn "No NVIDIA GPUs detected. Cannot validate GPU assignment."
+        return 1
+    fi
+    
+    # Validate each GPU index
+    IFS=',' read -ra indices <<< "$gpu_indices"
+    for index in "${indices[@]}"; do
+        if ! [[ "$index" =~ ^[0-9]+$ ]]; then
+            log_warn "Invalid GPU index: $index"
+            return 1
+        fi
+        
+        if [[ "$index" -ge "$gpu_count" ]]; then
+            log_warn "GPU index $index exceeds available GPUs ($gpu_count)"
+            return 1
+        fi
+    done
+    
+    log_info "GPU assignment validation passed for container $lxc_id: $gpu_indices"
+    return 0
+}
+
+# --- Enhanced GPU Passthrough Configuration ---
+configure_lxc_gpu_passthrough() {
+    local lxc_id="$1"
+    local gpu_indices="$2"
+    
+    log_info "Configuring GPU passthrough for LXC container $lxc_id using indices: '$gpu_indices'"
+    
+    # Check if we have the required tools
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "nvidia-smi not found. Cannot configure GPU passthrough."
+        return 1
+    fi
+    
+    # Get GPU details
+    local gpu_details=()
+    IFS=',' read -ra indices <<< "$gpu_indices"
+    for index in "${indices[@]}"; do
+        local gpu_name
+        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits -i "$index" | tr -d ' ')
+        gpu_details+=("$gpu_name")
+    done
+    
+    echo "Configuring GPU passthrough for container $lxc_id with GPUs: ${gpu_details[*]}"
+    
+    # Add GPU configuration to LXC config
+    local config_file="/etc/pve/lxc/$lxc_id.conf"
+    
+    if [[ ! -f "$config_file" ]]; then
+        log_error "LXC config file not found: $config_file"
+        return 1
+    fi
+    
+    # Add GPU device mappings
+    local gpu_config=""
+    for index in ${indices[@]}; do
+        # For each GPU, we need to add it to the container's device configuration
+        gpu_config="$gpu_config\nlxc.cgroup2.devices.allow: c 195:$index rwm"
+    done
+    
+    # Write to config file
+    echo -e "$gpu_config" >> "$config_file"
+    
+    log_info "GPU passthrough configured for container $lxc_id with indices: $gpu_indices"
+    return 0
+}
+
+# --- Enhanced Retry Function ---
+retry_command() {
+    local max_attempts="${1:-3}"
+    local delay="${2:-5}"
+    shift 2
+    local cmd="$*"
+    
+    log_info "Executing command with retries (max $max_attempts attempts): $cmd"
+    
+    local attempt=1
+    while [[ $attempt -le $max_attempts ]]; do
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Attempt $attempt/$max_attempts: $cmd" >&2
+        eval "$cmd"
+        if [[ $? -eq 0 ]]; then
+            log_info "Command succeeded on attempt $attempt"
+            return 0
+        fi
+        log_warn "Command failed (attempt $attempt/$max_attempts): $cmd"
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] Command failed, retrying in $delay seconds..." >&2
+        sleep "$delay"
+        ((attempt++))
+    done
+    
+    log_error "Command failed after $max_attempts attempts: $cmd"
+    return 1
+}
+
+# --- Enhanced Marker Functions ---
+is_script_completed() {
+    local marker_file="$1"
+    if [[ -f "$marker_file" ]]; then
+        grep -Fxq "$(basename "$0")" "$marker_file" 2>/dev/null
+        return $?
+    fi
+    return 1
+}
+
+mark_script_completed() {
+    local marker_file="$1"
+    local script_name=$(basename "$0")
+    
+    # Ensure marker directory exists
+    mkdir -p "$(dirname "$marker_file")"
+    
+    # Add to marker file
+    echo "$script_name" >> "$marker_file"
+    chmod 600 "$marker_file"
+    
+    log_info "Marked script $script_name as completed for container $lxc_id"
+}
+
+# --- Enhanced Error Handling ---
+trap 'log_error "Script failed at line $LINENO"; exit 1' ERR
+
+# --- Execute Main Function ---
+main "$@"
