@@ -1,15 +1,32 @@
 #!/bin/bash
 # Phoenix Hypervisor Initial Setup Script
-# Performs initial setup of the Proxmox host, including system updates, LXC tools installation, ZFS validation, and NVIDIA GPU checks.
+# Performs initial system setup for the Phoenix Hypervisor environment
+# This script should be run before creating any LXC containers
 # Prerequisites:
 # - Proxmox VE 8.x (tested with 8.4.6)
-# - Internet access for package downloads
 # - Root privileges
-# - NVIDIA GPU(s) installed on the host
+# - NVIDIA drivers installed on host
 # Usage: ./phoenix_hypervisor_initial_setup.sh
-# Version: 1.7.3
+# Version: 1.7.4
 # Author: Assistant
+
 set -euo pipefail
+
+# Source configuration first
+if [[ -f "/usr/local/bin/phoenix_hypervisor_config.sh" ]]; then
+    source /usr/local/bin/phoenix_hypervisor_config.sh
+else
+    echo "Configuration file not found: /usr/local/bin/phoenix_hypervisor_config.sh"
+    exit 1
+fi
+
+# Source common functions
+if [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
+    source /usr/local/bin/phoenix_hypervisor_common.sh
+else
+    echo "Common functions file not found: /usr/local/bin/phoenix_hypervisor_common.sh"
+    exit 1
+fi
 
 # --- Enhanced User Experience Functions ---
 log_info() {
@@ -24,36 +41,299 @@ log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $1" >&2
 }
 
-prompt_user() {
-    local prompt="$1"
-    local default="${2:-}"
-    read -p "$prompt [$default]: " response
-    echo "${response:-$default}"
-}
-
-# --- Enhanced Logging Function ---
-log() {
-    local level="$1"
-    shift
-    local message="$*"
-    if [[ -z "${HYPERVISOR_LOGFILE:-}" ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $0: HYPERVISOR_LOGFILE variable not set" >&2
+# --- Enhanced System Prerequisites Check ---
+check_system_requirements() {
+    log_info "Checking system requirements..."
+    
+    # Check if we're running as root
+    if [[ $EUID -ne 0 ]]; then
+        log_error "This script must be run as root"
         exit 1
     fi
-    # Ensure log directory exists
-    local log_dir
-    log_dir=$(dirname "$HYPERVISOR_LOGFILE")
-    mkdir -p "$log_dir" || { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $0: Failed to create log directory: $log_dir" >&2; exit 1; }
-    # Log to file via fd 4
-    if [[ ! -e /proc/self/fd/4 ]]; then
-        exec 4>>"$HYPERVISOR_LOGFILE"
-        chmod 600 "$HYPERVISOR_LOGFILE" || { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $0: Failed to set permissions on $HYPERVISOR_LOGFILE" >&2; }
+    
+    # Check Proxmox environment
+    if ! command -v pct >/dev/null 2>&1; then
+        log_error "Proxmox Container Toolkit (pct) not found. This script requires Proxmox VE."
+        exit 1
     fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [$level] $message" >&4
-    # Output INFO, WARN, ERROR to stderr for terminal visibility
-    if [[ "$level" =~ ^(INFO|WARN|ERROR)$ ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [$level] $message" >&2
+    
+    # Get Proxmox version
+    local proxmox_version
+    proxmox_version=$(pveversion | grep -o 'pve-manager/[0-9.]*' | cut -d'/' -f2)
+    
+    if [[ -z "$proxmox_version" ]]; then
+        log_warn "Could not determine Proxmox version"
+    else
+        log_info "Proxmox VE environment verified (Version: $proxmox_version)"
     fi
+    
+    # Check for required tools
+    local required_tools=("jq" "nvidia-smi" "docker")
+    
+    for tool in "${required_tools[@]}"; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            log_warn "Required tool '$tool' not found"
+        fi
+    done
+    
+    # Check NVIDIA driver availability
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        local driver_version
+        driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits | tr -d ' ')
+        log_info "NVIDIA driver version: $driver_version"
+        
+        # Check if we have at least one GPU available
+        local gpu_count
+        gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits | tr -d ' ')
+        log_info "Available NVIDIA GPUs: $gpu_count"
+    else
+        log_warn "NVIDIA driver not found on host system"
+    fi
+    
+    # Check if we have sufficient disk space
+    local root_space
+    root_space=$(df / | tail -1 | awk '{print $4}')
+    log_info "Available space on root partition: ${root_space} KB"
+    
+    log_info "System requirements check completed"
+}
+
+# --- Enhanced Directory Setup ---
+setup_directories() {
+    log_info "Setting up Phoenix Hypervisor directories..."
+    
+    # Create main directories
+    local dirs=(
+        "/usr/local/lib/phoenix_hypervisor"
+        "/usr/local/bin/phoenix_hypervisor"
+        "/var/lib/phoenix_hypervisor"
+        "/var/log/phoenix_hypervisor"
+        "/var/lib/phoenix_hypervisor/containers"
+        "/var/lib/phoenix_hypervisor/markers"
+        "/usr/local/etc"
+    )
+    
+    for dir in "${dirs[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            mkdir -p "$dir"
+            log_info "Created directory: $dir"
+        else
+            log_info "Directory already exists: $dir"
+        fi
+    done
+    
+    # Set proper permissions
+    chmod 755 "/var/lib/phoenix_hypervisor"
+    chmod 755 "/var/log/phoenix_hypervisor"
+    
+    log_info "Directory setup completed"
+}
+
+# --- Enhanced NVIDIA Driver Setup ---
+setup_nvidia_drivers() {
+    log_info "Setting up NVIDIA drivers for host system..."
+    
+    # Check if nvidia-smi is available
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "NVIDIA driver not found on host. Please install NVIDIA drivers manually."
+        return 1
+    fi
+    
+    # Get current driver version
+    local current_driver_version
+    current_driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits | tr -d ' ')
+    
+    log_info "Host NVIDIA driver version: $current_driver_version"
+    
+    # Check if we have the required NVIDIA driver version for our system
+    local required_driver="580.65.06"
+    
+    if [[ "$current_driver_version" == "$required_driver" ]]; then
+        log_info "Required NVIDIA driver version ($required_driver) is already installed"
+    else
+        log_warn "Host driver version ($current_driver_version) differs from required version ($required_driver)"
+        log_info "Please ensure the correct NVIDIA drivers are installed on the host system"
+    fi
+    
+    # Verify GPU access
+    if ! nvidia-smi >/dev/null 2>&1; then
+        log_error "Cannot access NVIDIA GPUs. Please verify driver installation."
+        return 1
+    fi
+    
+    # Check GPU capabilities
+    local gpu_count
+    gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits | tr -d ' ')
+    
+    if [[ "$gpu_count" -gt 0 ]]; then
+        log_info "GPU access verified. Found $gpu_count NVIDIA GPU(s)."
+        
+        # List GPUs
+        local gpu_list
+        gpu_list=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits | head -5)
+        log_info "GPU details:"
+        echo "$gpu_list" | while read -r gpu; do
+            log_info "  - $gpu"
+        done
+    else
+        log_warn "No NVIDIA GPUs detected on system"
+    fi
+    
+    return 0
+}
+
+# --- Enhanced Configuration Setup ---
+setup_configurations() {
+    log_info "Setting up configuration files..."
+    
+    # Create default configuration if needed
+    if [[ ! -f "$PHOENIX_LXC_CONFIG_FILE" ]]; then
+        log_info "Creating default configuration file: $PHOENIX_LXC_CONFIG_FILE"
+        
+        # Create a basic default configuration with NVIDIA support
+        cat > "$PHOENIX_LXC_CONFIG_FILE" << EOF
+{
+    "\$schema": "./phoenix_lxc_configs.schema.json",
+    "nvidia_driver_version": "580.65.06",
+    "nvidia_repo_url": "http://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/",
+    "lxc_configs": {
+        "901": {
+            "name": "drdevstral",
+            "memory_mb": 32768,
+            "cores": 8,
+            "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
+            "storage_pool": "lxc-disks",
+            "storage_size_gb": "64",
+            "network_config": "10.0.0.111/24,10.0.0.1,8.8.8.8",
+            "features": "nesting=1,keyctl=1",
+            "vllm_model": "mistralai/Devstral-7B-v0.5",
+            "setup_script": "/usr/local/bin/phoenix_hypervisor_setup_drdevstral.sh",
+            "gpu_assignment": "0"
+        }
+    }
+}
+EOF
+        log_info "Default configuration created"
+    fi
+    
+    # Create schema if needed
+    if [[ ! -f "$PHOENIX_LXC_CONFIG_SCHEMA_FILE" ]]; then
+        log_info "Creating default schema file: $PHOENIX_LXC_CONFIG_SCHEMA_FILE"
+        
+        cat > "$PHOENIX_LXC_CONFIG_SCHEMA_FILE" << EOF
+{
+    "\$schema": "https://json-schema.org/draft/2020-12/schema",
+    "\$id": "https://example.com/phoenix_lxc_configs.schema.json",
+    "title": "Phoenix LXC Configuration",
+    "description": "Configuration schema for Phoenix Hypervisor LXC containers",
+    "type": "object",
+    "properties": {
+        "nvidia_driver_version": {
+            "type": "string",
+            "description": "NVIDIA driver version to use"
+        },
+        "nvidia_repo_url": {
+            "type": "string",
+            "format": "uri",
+            "description": "NVIDIA repository URL for driver installation"
+        },
+        "lxc_configs": {
+            "type": "object",
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "memory_mb": {"type": "integer"},
+                    "cores": {"type": "integer"},
+                    "template": {"type": "string"},
+                    "storage_pool": {"type": "string"},
+                    "storage_size_gb": {"type": "string"},
+                    "network_config": {"type": "string"},
+                    "features": {"type": "string"},
+                    "vllm_model": {"type": "string"},
+                    "setup_script": {"type": "string"},
+                    "gpu_assignment": {"type": "string"}
+                },
+                "required": ["name", "memory_mb", "cores", "template", "storage_pool", "network_config"]
+            }
+        }
+    },
+    "required": ["lxc_configs"]
+}
+EOF
+        log_info "Default schema created"
+    fi
+    
+    # Create token file if needed
+    if [[ ! -f "$PHOENIX_HF_TOKEN_FILE" ]]; then
+        log_info "Creating empty token file: $PHOENIX_HF_TOKEN_FILE"
+        touch "$PHOENIX_HF_TOKEN_FILE"
+        chmod 600 "$PHOENIX_HF_TOKEN_FILE"
+        log_info "Token file created with restricted permissions"
+    fi
+    
+    log_info "Configuration setup completed"
+}
+
+# --- Enhanced Service Setup ---
+setup_services() {
+    log_info "Setting up service configurations..."
+    
+    # Create systemd service files if needed
+    local service_dirs=("/etc/systemd/system" "/lib/systemd/system")
+    
+    for dir in "${service_dirs[@]}"; do
+        if [[ -d "$dir" ]]; then
+            log_info "Service directory found: $dir"
+            break
+        fi
+    done
+    
+    # Create marker file to indicate setup completion
+    mkdir -p "$HYPERVISOR_MARKER_DIR"
+    touch "$HYPERVISOR_MARKER"
+    
+    log_info "Service setup completed"
+}
+
+# --- Enhanced Cleanup and Validation ---
+validate_setup() {
+    log_info "Validating setup..."
+    
+    # Check that all required directories exist
+    local required_dirs=(
+        "/usr/local/lib/phoenix_hypervisor"
+        "/usr/local/bin/phoenix_hypervisor" 
+        "/var/lib/phoenix_hypervisor"
+        "/var/log/phoenix_hypervisor"
+        "/usr/local/etc"
+    )
+    
+    for dir in "${required_dirs[@]}"; do
+        if [[ ! -d "$dir" ]]; then
+            log_error "Required directory missing: $dir"
+            return 1
+        fi
+    done
+    
+    # Check configuration files exist
+    if [[ ! -f "$PHOENIX_LXC_CONFIG_FILE" ]]; then
+        log_error "Configuration file missing: $PHOENIX_LXC_CONFIG_FILE"
+        return 1
+    fi
+    
+    if [[ ! -f "$PHOENIX_LXC_CONFIG_SCHEMA_FILE" ]]; then
+        log_error "Schema file missing: $PHOENIX_LXC_CONFIG_SCHEMA_FILE"
+        return 1
+    fi
+    
+    # Validate configuration JSON
+    if ! jq empty "$PHOENIX_LXC_CONFIG_FILE" >/dev/null 2>&1; then
+        log_error "Invalid JSON in configuration file: $PHOENIX_LXC_CONFIG_FILE"
+        return 1
+    fi
+    
+    log_info "Setup validation completed successfully"
 }
 
 # --- Enhanced Main Function ---
@@ -65,409 +345,54 @@ main() {
     echo "==============================================="
     echo ""
     
-    # Check prerequisites
-    log_info "Checking system prerequisites..."
-    check_root
-    check_proxmox_environment
+    # Verify prerequisites
+    check_system_requirements
     
-    # Show system information
-    show_system_info
+    # Setup directories
+    setup_directories
     
-    # Confirm with user before proceeding
-    read -p "Do you want to proceed with initial setup? (yes/no): " confirm
-    if [[ "$confirm" != "yes" ]]; then
-        log_info "Initial setup cancelled by user."
-        echo ""
-        echo "Setup cancelled. No changes were made."
-        echo ""
-        exit 0
+    # Setup NVIDIA drivers (if available)
+    if command -v nvidia-smi >/dev/null 2>&1; then
+        log_info "NVIDIA driver detected, setting up GPU support..."
+        setup_nvidia_drivers || { log_error "NVIDIA driver setup failed"; exit 1; }
+    else
+        log_info "No NVIDIA drivers detected, continuing with CPU-only setup"
     fi
     
-    echo ""
-    echo "Starting setup process..."
-    echo "-------------------------"
+    # Setup configurations
+    setup_configurations
     
-    # Update system packages
-    log_info "Updating system packages..."
-    update_system_packages
+    # Setup services
+    setup_services
     
-    # Install required packages for LXC containers and GPU support
-    log_info "Installing required packages..."
-    install_required_packages
+    # Validate setup
+    validate_setup
     
-    # Validate ZFS pools
-    log_info "Validating ZFS storage..."
-    validate_zfs_storage
-    
-    # Check NVIDIA GPU compatibility
-    log_info "Checking NVIDIA GPU compatibility..."
-    check_nvidia_compatibility
-    
-    # Configure system for LXC containers
-    log_info "Configuring system for LXC containers..."
-    configure_lxc_system
-    
-    # Setup logging and markers
-    setup_logging_and_markers
-    
-    # Final confirmation
-    log_info "Initial setup completed successfully!"
+    # Show completion summary
     echo ""
     echo "==============================================="
-    echo "INITIAL SETUP COMPLETED SUCCESSFULLY!"
+    echo "SETUP COMPLETED SUCCESSFULLY"
     echo "==============================================="
+    echo "Directories created:"
+    echo "- /usr/local/lib/phoenix_hypervisor"
+    echo "- /usr/local/bin/phoenix_hypervisor"
+    echo "- /var/lib/phoenix_hypervisor"
+    echo "- /var/log/phoenix_hypervisor"
+    echo "- /usr/local/etc"
     echo ""
-    echo "System information:"
-    show_system_info
+    echo "Configuration files created:"
+    echo "- $PHOENIX_LXC_CONFIG_FILE"
+    echo "- $PHOENIX_LXC_CONFIG_SCHEMA_FILE"
+    echo "- $PHOENIX_HF_TOKEN_FILE"
     echo ""
-}
-
-# --- Enhanced Prerequisite Functions ---
-check_root() {
-    log_info "Checking if running as root..."
-    if [[ $EUID -ne 0 ]]; then
-        log_error "This script must be run as root"
-        exit 1
-    fi
-    log_info "Script is running with root privileges"
-}
-
-check_proxmox_environment() {
-    log_info "Checking Proxmox VE environment..."
-    
-    if ! command -v pveversion >/dev/null 2>&1; then
-        log_error "pveversion command not found. Ensure this script is running on a Proxmox VE system."
-        exit 1
-    fi
-    
-    local proxmox_version
-    proxmox_version=$(pveversion | cut -d'/' -f2 | cut -d'-' -f1)
-    
-    if [[ ! "$proxmox_version" =~ ^8\..* ]]; then
-        log_warn "This script is designed for Proxmox VE 8.x. Found Proxmox VE version: $proxmox_version"
-        echo "Proceeding anyway, but compatibility may not be guaranteed."
-    fi
-    
-    local debian_version
-    debian_version=$(cat /etc/debian_version 2>/dev/null || echo "unknown")
-    
-    if [[ ! "$debian_version" =~ ^12\..* ]]; then
-        log_warn "This script is designed for Debian 12. Found Debian version: $debian_version"
-        echo "Proceeding anyway, but compatibility may not be guaranteed."
-    fi
-    
-    log_info "Proxmox VE environment verified (Version: $proxmox_version, Debian: $debian_version)"
-}
-
-show_system_info() {
-    echo ""
-    echo "System Information:"
-    echo "-------------------"
-    
-    # Get system architecture
-    local arch
-    arch=$(uname -m)
-    echo "Architecture: $arch"
-    
-    # Get OS version
-    if [[ -f /etc/os-release ]]; then
-        . /etc/os-release
-        echo "OS: $NAME $VERSION_ID"
-    fi
-    
-    # Get Proxmox version
-    if command -v pveversion >/dev/null 2>&1; then
-        echo "Proxmox VE Version: $(pveversion)"
-    fi
-    
-    # Check if we have GPU
     if command -v nvidia-smi >/dev/null 2>&1; then
-        local gpu_count
-        gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits | tr -d ' ')
-        echo "NVIDIA GPUs: $gpu_count detected"
+        echo "NVIDIA GPU support enabled"
     else
-        echo "NVIDIA GPU: Not detected or drivers not installed"
+        echo "NVIDIA GPU support: Not detected on system"
     fi
+    echo "==============================================="
     
-    # Show available memory
-    local mem_total
-    mem_total=$(free -h | awk '/^Mem:/ {print $2}')
-    echo "Total Memory: $mem_total"
-    
-    echo ""
+    log_info "Phoenix Hypervisor initial setup completed successfully"
 }
 
-# --- Enhanced System Update Functions ---
-update_system_packages() {
-    log_info "Updating system packages..."
-    
-    # Check if we're connected to internet
-    if ! ping -c 1 -W 5 google.com >/dev/null 2>&1; then
-        log_warn "No internet connection detected. Package updates may fail."
-    fi
-    
-    # Update package lists
-    echo "Updating package lists..."
-    retry_command 3 10 "apt-get update" || {
-        log_error "Failed to update package lists"
-        exit 1
-    }
-    
-    # Upgrade system packages
-    echo "Upgrading system packages..."
-    retry_command 3 10 "apt-get dist-upgrade -y" || {
-        log_error "Failed to upgrade system packages"
-        exit 1
-    }
-    
-    # Update Proxmox boot tool
-    echo "Updating Proxmox boot tool..."
-    retry_command 3 10 "proxmox-boot-tool refresh" || {
-        log_warn "Failed to refresh proxmox-boot-tool"
-    }
-    
-    # Update initramfs
-    echo "Updating initramfs..."
-    retry_command 3 10 "update-initramfs -u" || {
-        log_error "Failed to update initramfs"
-        exit 1
-    }
-    
-    log_info "System packages updated successfully"
-}
-
-# --- Enhanced Package Installation ---
-install_required_packages() {
-    log_info "Installing required packages..."
-    
-    # Define packages needed for LXC containers and GPU support
-    local packages=(
-        "lxc"           # LXC container tools
-        "pve-container" # Proxmox container support
-        "zfsutils-linux" # ZFS utilities
-        "jq"            # JSON processing
-        "nvidia-driver-535" # NVIDIA drivers (if available)
-        "nvidia-container-toolkit" # NVIDIA container runtime
-        "docker.io"     # Docker for containerized services
-        "libvirt-daemon-system" # Virtualization support
-    )
-    
-    echo "Installing packages: ${packages[*]}"
-    
-    # Install packages with retry mechanism
-    local failed_packages=()
-    for package in "${packages[@]}"; do
-        echo "Installing $package..."
-        if ! retry_command 3 10 "apt-get install -y $package"; then
-            log_warn "Failed to install $package"
-            failed_packages+=("$package")
-        else
-            log_info "Successfully installed $package"
-        fi
-    done
-    
-    # Report any failures
-    if [[ ${#failed_packages[@]} -gt 0 ]]; then
-        echo ""
-        log_warn "Some packages failed to install: ${failed_packages[*]}"
-        echo "This might be expected depending on your system configuration."
-        echo ""
-    fi
-    
-    log_info "Package installation completed"
-}
-
-# --- Enhanced ZFS Validation ---
-validate_zfs_storage() {
-    log_info "Validating ZFS storage..."
-    
-    # Check if ZFS is available
-    if ! command -v zpool >/dev/null 2>&1; then
-        log_error "ZFS utilities not found. Please install them first."
-        exit 1
-    fi
-    
-    # List all ZFS pools
-    echo "Available ZFS pools:"
-    if zpool list >/dev/null 2>&1; then
-        zpool list -H | awk '{print "  - "$1}' || true
-    else
-        echo "  No ZFS pools found"
-    fi
-    
-    # Check specific pool (if configured)
-    if [[ -n "${PHOENIX_ZFS_LXC_POOL:-}" ]]; then
-        log_info "Checking for required ZFS pool: $PHOENIX_ZFS_LXC_POOL"
-        if zpool list "$PHOENIX_ZFS_LXC_POOL" >/dev/null 2>&1; then
-            echo "Pool $PHOENIX_ZFS_LXC_POOL found and is accessible"
-        else
-            log_warn "Required ZFS pool $PHOENIX_ZFS_LXC_POOL not found"
-            echo "If this is expected, continue with setup."
-        fi
-    fi
-    
-    log_info "ZFS storage validation completed"
-}
-
-# --- Enhanced NVIDIA Compatibility Check ---
-check_nvidia_compatibility() {
-    log_info "Checking NVIDIA GPU compatibility..."
-    
-    # Check if nvidia-smi is available
-    if ! command -v nvidia-smi >/dev/null 2>&1; then
-        echo ""
-        echo "NVIDIA drivers not found. Installing recommended NVIDIA drivers..."
-        echo ""
-        
-        # Install NVIDIA drivers
-        retry_command 3 10 "apt-get install -y nvidia-driver-535" || {
-            log_warn "Failed to install NVIDIA drivers"
-        }
-        
-        # Check if installation succeeded
-        if command -v nvidia-smi >/dev/null 2>&1; then
-            echo "NVIDIA drivers installed successfully"
-        else
-            echo "Warning: NVIDIA drivers may not be properly installed"
-        fi
-    else
-        echo "NVIDIA drivers already installed"
-        
-        # Show GPU information
-        local gpu_info
-        gpu_info=$(nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits | head -n1)
-        echo "GPU Information: $gpu_info"
-    fi
-    
-    # Check driver compatibility with Proxmox
-    if command -v nvidia-smi >/dev/null 2>&1; then
-        local driver_version
-        driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits | tr -d ' ')
-        echo "Driver Version: $driver_version"
-        
-        # Check if we have the NVIDIA container toolkit
-        if ! command -v nvidia-container-toolkit >/dev/null 2>&1; then
-            echo "Installing NVIDIA Container Toolkit..."
-            retry_command 3 10 "apt-get install -y nvidia-container-toolkit" || {
-                log_warn "Failed to install NVIDIA Container Toolkit"
-            }
-        else
-            echo "NVIDIA Container Toolkit already installed"
-        fi
-    fi
-    
-    log_info "NVIDIA compatibility check completed"
-}
-
-# --- Enhanced LXC System Configuration ---
-configure_lxc_system() {
-    log_info "Configuring system for LXC containers..."
-    
-    # Ensure LXC modules are loaded
-    echo "Ensuring LXC modules are loaded..."
-    
-    # Check if LXC is enabled in kernel
-    if ! grep -q "lxc" /proc/modules 2>/dev/null; then
-        echo "LXC module not found in kernel. Enabling if possible..."
-    fi
-    
-    # Configure LXC container settings
-    local lxc_config="/etc/lxc/default.conf"
-    
-    if [[ -f "$lxc_config" ]]; then
-        echo "Updating existing LXC configuration: $lxc_config"
-    else
-        echo "Creating new LXC configuration: $lxc_config"
-        mkdir -p "$(dirname "$lxc_config")"
-    fi
-    
-    # Add or update common LXC settings
-    local settings=(
-        "lxc.net.0.type = veth"
-        "lxc.net.0.link = lxcbr0"
-        "lxc.net.0.flags = up"
-        "lxc.net.0.hwaddr = 02:00:00:00:00:00"
-    )
-    
-    for setting in "${settings[@]}"; do
-        if ! grep -q "^$setting" "$lxc_config" 2>/dev/null; then
-            echo "$setting" >> "$lxc_config"
-        fi
-    done
-    
-    # Enable nested virtualization (if needed)
-    echo "Checking nested virtualization support..."
-    if [[ -f "/sys/module/kvm_intel/parameters/nested" ]]; then
-        local nested_status
-        nested_status=$(cat /sys/module/kvm_intel/parameters/nested)
-        if [[ "$nested_status" == "Y" ]] || [[ "$nested_status" == "1" ]]; then
-            echo "Nested virtualization is enabled"
-        else
-            echo "Nested virtualization is not enabled"
-        fi
-    fi
-    
-    log_info "System configuration for LXC completed"
-}
-
-# --- Enhanced Logging and Marker Setup ---
-setup_logging_and_markers() {
-    log_info "Setting up logging and markers..."
-    
-    # Create log directory if needed
-    mkdir -p "$(dirname "$HYPERVISOR_LOGFILE")" || {
-        log_error "Failed to create log directory: $(dirname "$HYPERVISOR_LOGFILE")"
-        exit 1
-    }
-    
-    # Set proper permissions on log file
-    touch "$HYPERVISOR_LOGFILE" || {
-        log_error "Failed to create log file: $HYPERVISOR_LOGFILE"
-        exit 1
-    }
-    chmod 600 "$HYPERVISOR_LOGFILE"
-    
-    # Create marker directory
-    mkdir -p "$HYPERVISOR_MARKER_DIR" || {
-        log_error "Failed to create marker directory: $HYPERVISOR_MARKER_DIR"
-        exit 1
-    }
-    
-    # Set proper permissions on marker directory
-    chmod 700 "$HYPERVISOR_MARKER_DIR"
-    
-    log_info "Logging and marker setup completed"
-}
-
-# --- Enhanced Retry Function ---
-retry_command() {
-    local max_attempts="${1:-3}"
-    local delay="${2:-5}"
-    shift 2
-    local cmd="$*"
-    
-    log_info "Executing command with retries (max $max_attempts attempts): $cmd"
-    
-    local attempt=1
-    while [[ $attempt -le $max_attempts ]]; do
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Attempt $attempt/$max_attempts: $cmd" >&2
-        eval "$cmd"
-        if [[ $? -eq 0 ]]; then
-            log_info "Command succeeded on attempt $attempt"
-            return 0
-        fi
-        log_warn "Command failed (attempt $attempt/$max_attempts): $cmd"
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] Command failed, retrying in $delay seconds..." >&2
-        sleep "$delay"
-        ((attempt++))
-    done
-    
-    log_error "Command failed after $max_attempts attempts: $cmd"
-    return 1
-}
-
-# --- Enhanced Error Handling ---
-trap 'log_error "Script failed at line $LINENO"; exit 1' ERR
-
-# --- Execute Main Function ---
 main "$@"

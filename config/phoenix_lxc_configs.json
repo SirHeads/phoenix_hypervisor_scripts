@@ -1,5 +1,7 @@
 {
     "$schema": "./phoenix_lxc_configs.schema.json",
+    "nvidia_driver_version": "580.65.06",
+    "nvidia_repo_url": "http://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/",
     "lxc_configs": {
         "901": {
             "name": "drdevstral",
@@ -19,7 +21,8 @@
             "vllm_quantization": "bitsandbytes",
             "vllm_quantization_config_type": "int8",
             "vllm_api_port": 8000,
-            "setup_script": "/usr/local/bin/phoenix_hypervisor_setup_drdevstral.sh"
+            "setup_script": "/usr/local/bin/phoenix_hypervisor_setup_drdevstral.sh",
+            "gpu_assignment": "0"
         }
     }
 }

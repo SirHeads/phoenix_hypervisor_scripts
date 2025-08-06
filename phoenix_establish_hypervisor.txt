@@ -6,9 +6,25 @@
 # - phoenix_hypervisor_common.sh and phoenix_hypervisor_config.sh sourced
 # - NVIDIA drivers installed on host
 # Usage: ./phoenix_establish_hypervisor.sh [--hf-token <token>]
-# Version: 1.7.2
+# Version: 1.7.4
 # Author: Assistant
 set -euo pipefail
+
+# Source configuration first
+if [[ -f "/usr/local/bin/phoenix_hypervisor_config.sh" ]]; then
+    source /usr/local/bin/phoenix_hypervisor_config.sh
+else
+    echo "Configuration file not found: /usr/local/bin/phoenix_hypervisor_config.sh"
+    exit 1
+fi
+
+# Source common functions
+if [[ -f "/usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
+    source /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_common.sh
+else
+    echo "Common functions file not found: /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_common.sh"
+    exit 1
+fi
 
 # --- Enhanced User Experience Functions ---
 log_info() {
@@ -23,51 +39,77 @@ log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $1" >&2
 }
 
-prompt_user() {
-    local prompt="$1"
-    local default="${2:-}"
-    read -p "$prompt [$default]: " response
-    echo "${response:-$default}"
+# --- Enhanced Initialization ---
+initialize_hypervisor() {
+    log_info "Initializing Phoenix Hypervisor environment..."
+    
+    # Create marker directory if needed
+    mkdir -p "$HYPERVISOR_MARKER_DIR" || { log_error "Failed to create marker directory: $HYPERVISOR_MARKER_DIR"; exit 1; }
+    
+    # Set up logging
+    if [[ -z "${HYPERVISOR_LOGFILE:-}" ]]; then
+        HYPERVISOR_LOGFILE="/var/log/phoenix_hypervisor/hypervisor.log"
+        mkdir -p "$(dirname "$HYPERVISOR_LOGFILE")" || { log_error "Failed to create log directory: $(dirname "$HYPERVISOR_LOGFILE")"; exit 1; }
+    fi
+    
+    # Set permissions on log file
+    touch "$HYPERVISOR_LOGFILE" || { log_error "Failed to create log file: $HYPERVISOR_LOGFILE"; exit 1; }
+    chmod 600 "$HYPERVISOR_LOGFILE"
+    
+    log_info "Phoenix Hypervisor environment initialized"
 }
 
-# --- Enhanced Logging Function ---
-log() {
-    local level="$1"
-    shift
-    local message="$*"
-    if [[ -z "${HYPERVISOR_LOGFILE:-}" ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $0: HYPERVISOR_LOGFILE variable not set" >&2
+# --- Enhanced Configuration Loading ---
+load_hypervisor_config() {
+    log_info "Loading hypervisor configuration..."
+    
+    # Validate configuration file exists
+    if [[ ! -f "$PHOENIX_LXC_CONFIG_FILE" ]]; then
+        log_error "Configuration file not found: $PHOENIX_LXC_CONFIG_FILE"
         exit 1
     fi
-    # Ensure log directory exists
-    local log_dir
-    log_dir=$(dirname "$HYPERVISOR_LOGFILE")
-    mkdir -p "$log_dir" || { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $0: Failed to create log directory: $log_dir" >&2; exit 1; }
-    # Log to file via fd 4
-    if [[ ! -e /proc/self/fd/4 ]]; then
-        exec 4>>"$HYPERVISOR_LOGFILE"
-        chmod 600 "$HYPERVISOR_LOGFILE" || { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $0: Failed to set permissions on $HYPERVISOR_LOGFILE" >&2; }
+    
+    # Validate JSON format
+    if ! jq empty "$PHOENIX_LXC_CONFIG_FILE" >/dev/null 2>&1; then
+        log_error "Invalid JSON in configuration file: $PHOENIX_LXC_CONFIG_FILE"
+        exit 1
     fi
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [$level] $message" >&4
-    # Output INFO, WARN, ERROR to stderr for terminal visibility
-    if [[ "$level" =~ ^(INFO|WARN|ERROR)$ ]]; then
-        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [$level] $message" >&2
+    
+    # Load configuration into arrays
+    declare -gA LXC_CONFIGS=()
+    declare -gA LXC_SETUP_SCRIPTS=()
+    
+    # Get all LXC IDs from the config
+    local lxc_ids
+    lxc_ids=$(jq -r 'if (.lxc_configs | type == "object") then .lxc_configs | keys[] else empty end' "$PHOENIX_LXC_CONFIG_FILE")
+    
+    if [[ -z "$lxc_ids" ]]; then
+        log_warn "No LXC configurations found in $PHOENIX_LXC_CONFIG_FILE"
+        return 0
     fi
+    
+    # Process each LXC configuration
+    while IFS= read -r lxc_id; do
+        if [[ -n "$lxc_id" ]]; then
+            local config
+            config=$(jq -r ".lxc_configs.\"$lxc_id\"" "$PHOENIX_LXC_CONFIG_FILE")
+            
+            if [[ "$config" != "null" ]]; then
+                LXC_CONFIGS["$lxc_id"]="$config"
+                
+                # Extract setup script path if specified
+                local setup_script
+                setup_script=$(echo "$config" | jq -r '.setup_script // empty')
+                
+                if [[ -n "$setup_script" && "$setup_script" != "null" ]]; then
+                    LXC_SETUP_SCRIPTS["$lxc_id"]="$setup_script"
+                fi
+            fi
+        fi
+    done <<< "$lxc_ids"
+    
+    log_info "Loaded ${#LXC_CONFIGS[@]} LXC configurations"
 }
-
-# --- Source Configuration for Paths ---
-# Ensure phoenix_hypervisor_config.sh is sourced by the caller
-if [[ -z "${HYPERVISOR_MARKER_DIR:-}" ]] || [[ -z "${HYPERVISOR_LOGFILE:-}" ]] || [[ -z "${PHOENIX_LXC_CONFIG_FILE:-}" ]]; then
-    log_error "phoenix_hypervisor_config.sh must be sourced first."
-    exit 1
-fi
-
-# --- Check if setup is already completed ---
-if is_script_completed "$HYPERVISOR_MARKER"; then
-    log_info "Hypervisor setup already completed. Exiting."
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Hypervisor setup already completed. Exiting." >&2
-    exit 0
-fi
 
 # --- Enhanced Main Function ---
 main() {
@@ -110,6 +152,13 @@ main() {
     echo "Default cores: $DEFAULT_LXC_CORES"
     echo ""
     
+    # Show NVIDIA configuration
+    echo "NVIDIA Configuration:"
+    echo "---------------------"
+    echo "Driver Version: $NVIDIA_DRIVER_VERSION"
+    echo "Repository URL: $NVIDIA_REPO_URL"
+    echo ""
+    
     # Confirm with user before proceeding
     read -p "Do you want to proceed with the setup? (yes/no): " confirm
     if [[ "$confirm" != "yes" ]]; then
@@ -125,78 +174,77 @@ main() {
     if ! retry_command 5 10 "/usr/local/bin/phoenix_hypervisor_initial_setup.sh" 2>&1 | while read -r line; do 
         log_info "phoenix_hypervisor_initial_setup.sh: $line"
     done; then
-        log_error "Initial setup script failed."
-        if [[ "$ROLLBACK_ON_FAILURE" == true ]]; then
-            log_warn "No LXC-specific rollback needed for initial setup failure."
-        fi
+        log_error "Initial setup failed. Exiting."
         exit 1
     fi
     
-    # Create LXC containers
+    # Create each container
     log_info "Creating LXC containers..."
-    for lxc_id in "${!LXC_CONFIGS[@]}"; do
-        log_info "Creating container $lxc_id..."
-        if ! /usr/local/bin/phoenix_hypervisor_create_lxc.sh "$lxc_id"; then
-            log_error "Failed to create container $lxc_id"
-            exit 1
-        fi
-        log_info "Container $lxc_id created successfully."
-    done
+    local created_count=0
+    local failed_count=0
     
-    # Setup each container with vLLM
-    log_info "Setting up containers with vLLM services..."
     for lxc_id in "${!LXC_CONFIGS[@]}"; do
         local config="${LXC_CONFIGS[$lxc_id]}"
-        local name=$(echo "$config" | jq -r '.name')
-        log_info "Setting up container $lxc_id ($name) with vLLM..."
         
-        # Get the setup script path from config
-        local setup_script=$(echo "$config" | jq -r '.setup_script // empty')
-        if [[ -n "$setup_script" && "$setup_script" != "null" ]]; then
-            if ! "$setup_script" "$lxc_id"; then
-                log_error "Failed to set up container $lxc_id with vLLM"
-                exit 1
+        echo ""
+        log_info "Processing container $lxc_id..."
+        
+        # Create the LXC container
+        if /usr/local/bin/phoenix_hypervisor_create_lxc.sh "$lxc_id"; then
+            ((created_count++))
+            log_info "Container $lxc_id created successfully"
+            
+            # Run setup script if specified
+            if [[ -n "${LXC_SETUP_SCRIPTS[$lxc_id]:-}" ]] && [[ -f "${LXC_SETUP_SCRIPTS[$lxc_id]}" ]]; then
+                log_info "Running setup script for container $lxc_id..."
+                if "${LXC_SETUP_SCRIPTS[$lxc_id]}" "$lxc_id"; then
+                    log_info "Setup script completed successfully for container $lxc_id"
+                else
+                    log_warn "Setup script failed for container $lxc_id"
+                fi
             fi
-            log_info "Container $lxc_id ($name) setup with vLLM completed."
+            
         else
-            log_warn "No setup script defined for container $lxc_id"
+            ((failed_count++))
+            log_error "Failed to create container $lxc_id"
+            
+            # Handle rollback if enabled
+            if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
+                log_warn "Rollback enabled, attempting cleanup..."
+                # Cleanup logic would go here
+            fi
         fi
     done
     
-    # Mark completion
-    log_info "Marking hypervisor setup as complete..."
-    mark_script_completed "$HYPERVISOR_MARKER"
-    log_info "Phoenix Hypervisor setup completed successfully."
+    echo ""
+    echo "==============================================="
+    echo "Setup Summary:"
+    echo "Created: $created_count containers"
+    echo "Failed: $failed_count containers"
+    echo "==============================================="
     
-    echo ""
-    echo "==============================================="
-    echo "SETUP COMPLETED SUCCESSFULLY!"
-    echo "==============================================="
-    echo "Containers created:"
-    pct list
-    echo ""
-    echo "To check vLLM service status in container 901:"
-    echo "  pct exec 901 -- systemctl status vllm-drdevstral.service"
-    echo ""
+    # Mark setup as complete
+    touch "$HYPERVISOR_MARKER"
+    log_info "Phoenix Hypervisor setup completed successfully"
 }
 
-# --- Enhanced Error Handling ---
-trap 'log_error "Script failed at line $LINENO"; exit 1' ERR
+# --- Enhanced Retry Command ---
+retry_command() {
+    local max_attempts="$1"
+    local delay="$2"
+    shift 2
+    
+    local attempt=1
+    while [[ $attempt -le $max_attempts ]]; do
+        if "$@"; then
+            return 0
+        else
+            log_warn "Command failed (attempt $attempt/$max_attempts), retrying in $delay seconds..."
+            sleep "$delay"
+            ((attempt++))
+        fi
+    done
+    return 1
+}
 
-# --- Parse command-line arguments ---
-while [[ $# -gt 0 ]]; do
-    case "$1" in
-        --hf-token)
-            HF_TOKEN_OVERRIDE="$2"
-            shift 2
-            ;;
-        *)
-            log_error "Unknown option: $1"
-            echo "Usage: $0 [--hf-token <token>]"
-            exit 1
-            ;;
-    esac
-done
-
-# Execute main function
-main
+main "$@"

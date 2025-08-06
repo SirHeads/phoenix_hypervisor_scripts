@@ -1,0 +1,191 @@
+#!/bin/bash
+# Phoenix Hypervisor NVIDIA Common Functions
+# Provides centralized functions for NVIDIA driver management in LXC containers
+# Version: 1.7.4
+# Author: Assistant
+
+set -euo pipefail
+
+# Source configuration first
+if [[ -f "/usr/local/bin/phoenix_hypervisor_config.sh" ]]; then
+    source /usr/local/bin/phoenix_hypervisor_config.sh
+else
+    echo "Configuration file not found: /usr/local/bin/phoenix_hypervisor_config.sh"
+    exit 1
+fi
+
+# Source common functions
+if [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
+    source /usr/local/bin/phoenix_hypervisor_common.sh
+else
+    echo "Common functions file not found: /usr/local/bin/phoenix_hypervisor_common.sh"
+    exit 1
+fi
+
+# --- Enhanced NVIDIA Driver Installation ---
+install_nvidia_driver_in_container() {
+    local lxc_id="$1"
+    
+    log_info "Installing NVIDIA drivers in container $lxc_id..."
+    
+    # Check if we have the required tools
+    if ! pct exec "$lxc_id" -- command -v apt-get >/dev/null 2>&1; then
+        log_warn "apt-get not found in container $lxc_id. Cannot install NVIDIA drivers."
+        return 1
+    fi
+    
+    # Get NVIDIA configuration from environment
+    local nvidia_driver_version="${NVIDIA_DRIVER_VERSION:-580.65.06}"
+    local nvidia_repo_url="${NVIDIA_REPO_URL:-http://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/}"
+    
+    log_info "Installing NVIDIA driver version $nvidia_driver_version from repository $nvidia_repo_url"
+    
+    # Configure NVIDIA repository
+    local repo_config="/etc/apt/sources.list.d/nvidia-cuda.list"
+    local keyring_file="/usr/share/keyrings/cuda-archive-keyring.gpg"
+    
+    # Create repository configuration in container
+    local repo_line="deb [signed-by=$keyring_file] $nvidia_repo_url /"
+    
+    # Check if we need to configure the repository
+    if ! pct exec "$lxc_id" -- test -f "$repo_config"; then
+        log_info "Configuring NVIDIA repository in container $lxc_id..."
+        
+        # Install required packages for repository configuration
+        if ! pct exec "$lxc_id" -- apt-get update; then
+            log_warn "Failed to update package lists in container $lxc_id"
+        fi
+        
+        # Download and install the CUDA keyring
+        if ! pct exec "$lxc_id" -- wget -O /tmp/cuda-keyring.deb https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/cuda-keyring_1.1-1_all.deb; then
+            log_warn "Failed to download CUDA keyring in container $lxc_id"
+        fi
+        
+        if ! pct exec "$lxc_id" -- dpkg -i /tmp/cuda-keyring.deb; then
+            log_warn "Failed to install CUDA keyring in container $lxc_id"
+        fi
+        
+        # Remove temporary file
+        pct exec "$lxc_id" -- rm -f /tmp/cuda-keyring.deb
+        
+        # Create repository configuration file
+        pct exec "$lxc_id" -- echo "$repo_line" > "$repo_config"
+        
+        # Update package lists
+        if ! pct exec "$lxc_id" -- apt-get update; then
+            log_warn "Failed to update package lists after repository setup in container $lxc_id"
+        fi
+    else
+        log_info "NVIDIA repository already configured in container $lxc_id"
+    fi
+    
+    # Install NVIDIA drivers with specific version
+    local driver_packages=(
+        "nvidia-driver-libs=$nvidia_driver_version-1"
+        "nvidia-utils-$nvidia_driver_version=$nvidia_driver_version-1"
+        "libnvidia-compute-$nvidia_driver_version=$nvidia_driver_version-1"
+    )
+    
+    # Install drivers
+    log_info "Installing NVIDIA driver packages in container $lxc_id..."
+    
+    local install_cmd="apt-get install -y ${driver_packages[*]}"
+    
+    if ! pct exec "$lxc_id" -- $install_cmd; then
+        log_warn "Failed to install NVIDIA drivers in container $lxc_id"
+        return 1
+    fi
+    
+    # Verify installation
+    if pct exec "$lxc_id" -- command -v nvidia-smi >/dev/null 2>&1; then
+        log_info "NVIDIA driver installed successfully in container $lxc_id"
+        local driver_version
+        driver_version=$(pct exec "$lxc_id" -- nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits | tr -d ' ')
+        log_info "Driver version: $driver_version"
+    else
+        log_warn "NVIDIA driver installation may have failed in container $lxc_id"
+        return 1
+    fi
+    
+    return 0
+}
+
+# --- Enhanced GPU Passthrough Configuration ---
+configure_lxc_gpu_passthrough() {
+    local lxc_id="$1"
+    local gpu_indices="$2"
+    
+    log_info "Configuring GPU passthrough for LXC container $lxc_id using indices: '$gpu_indices'"
+    
+    # Check if we have the required tools
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "nvidia-smi not found. Cannot configure GPU passthrough."
+        return 1
+    fi
+    
+    # Get GPU details
+    local gpu_details=()
+    IFS=',' read -ra indices <<< "$gpu_indices"
+    for index in "${indices[@]}"; do
+        local gpu_name
+        gpu_name=$(nvidia-smi --query-gpu=name --format=csv,noheader,nounits -i "$index" | tr -d ' ')
+        gpu_details+=("$gpu_name")
+    done
+    
+    echo "Configuring GPU passthrough for container $lxc_id with GPUs: ${gpu_details[*]}"
+    
+    # Add GPU configuration to LXC config
+    local config_file="/etc/pve/lxc/$lxc_id.conf"
+    
+    if [[ ! -f "$config_file" ]]; then
+        log_error "LXC config file not found: $config_file"
+        return 1
+    fi
+    
+    # Remove existing GPU device configurations
+    sed -i '/^lxc.cgroup2.devices.allow: c 195:/d' "$config_file"
+    
+    # Add new GPU device mappings
+    local gpu_config=""
+    for index in ${indices[@]}; do
+        # For each GPU, we need to add it to the container's device configuration
+        gpu_config="$gpu_config\nlxc.cgroup2.devices.allow: c 195:$index rwm"
+    done
+    
+    # Write to config file
+    echo -e "$gpu_config" >> "$config_file"
+    
+    log_info "GPU passthrough configured for container $lxc_id with indices: $gpu_indices"
+    return 0
+}
+
+# --- Enhanced GPU Detection ---
+detect_gpus_in_container() {
+    local lxc_id="$1"
+    
+    log_info "Detecting NVIDIA GPUs in container $lxc_id..."
+    
+    # Check if nvidia-smi is available in container
+    if ! pct exec "$lxc_id" -- command -v nvidia-smi >/dev/null 2>&1; then
+        log_warn "nvidia-smi not found in container $lxc_id. NVIDIA drivers may not be installed."
+        return 1
+    fi
+    
+    # Get GPU count
+    local gpu_count
+    gpu_count=$(pct exec "$lxc_id" -- nvidia-smi --query-gpu=count --format=csv,noheader,nounits | tr -d ' ')
+    
+    if [[ "$gpu_count" -eq 0 ]]; then
+        log_warn "No NVIDIA GPUs detected in container $lxc_id"
+        return 1
+    fi
+    
+    log_info "Detected $gpu_count NVIDIA GPU(s) in container $lxc_id"
+    
+    # Get GPU details
+    local gpu_details
+    gpu_details=$(pct exec "$lxc_id" -- nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits | head -n1)
+    log_info "GPU Details in container: $gpu_details"
+    
+    return 0
+}
