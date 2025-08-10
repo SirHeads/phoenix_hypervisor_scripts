@@ -18,14 +18,6 @@ else
     exit 1
 fi
 
-# Source common functions
-if [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
-    source /usr/local/bin/phoenix_hypervisor_common.sh
-else
-    echo "Common functions file not found: /usr/local/bin/phoenix_hypervisor_common.sh"
-    exit 1
-fi
-
 # --- Enhanced Logging Functions ---
 log_info() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] $1" >&2
@@ -37,6 +29,63 @@ log_warn() {
 
 log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S')] [ERROR] $1" >&2
+}
+
+# --- Enhanced LXC ID Validation Functions ---
+validate_lxc_id() {
+    local lxc_id="$1"
+    
+    if [[ -z "$lxc_id" ]]; then
+        return 1
+    fi
+    
+    # Check if ID is numeric and within valid range (typically 100-999 for Proxmox)
+    if ! [[ "$lxc_id" =~ ^[0-9]+$ ]] || [[ "$lxc_id" -lt 100 ]] || [[ "$lxc_id" -gt 999 ]]; then
+        return 1
+    fi
+    
+    return 0
+}
+
+# --- Enhanced Container Status Functions ---
+get_container_status() {
+    local container_id="$1"
+    
+    if [[ -z "$container_id" ]]; then
+        log_error "Container ID cannot be empty"
+        return 1
+    fi
+    
+    # Check if container exists in Proxmox
+    if pct status "$container_id" >/dev/null 2>&1; then
+        local status
+        status=$(pct status "$container_id" | grep -E '^status:' | awk '{print $2}')
+        echo "$status"
+        return 0
+    else
+        echo "not_found"
+        return 1
+    fi
+}
+
+# --- Enhanced GPU Assignment Handling ---
+get_gpu_assignment() {
+    local container_id="$1"
+    
+    if [[ -z "$container_id" ]]; then
+        log_error "Container ID cannot be empty"
+        return 1
+    fi
+    
+    # Get GPU assignment from configuration file
+    if command -v jq >/dev/null 2>&1; then
+        local gpu_assignment
+        gpu_assignment=$(jq -r ".lxc_configs.\"$container_id\".gpu_assignment // \"none\"" "$PHOENIX_LXC_CONFIG_FILE" 2>/dev/null || echo "none")
+        echo "$gpu_assignment"
+    else
+        log_warn "jq not available, returning default GPU assignment"
+        echo "none"
+    fi
 }
 
 # --- Enhanced System Prerequisites Check ---

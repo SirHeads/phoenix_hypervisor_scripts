@@ -8,21 +8,22 @@
 # Usage: ./phoenix_establish_hypervisor.sh [--hf-token <token>]
 # Version: 1.7.4
 # Author: Assistant
+
 set -euo pipefail
 
 # Source configuration first
-if [[ -f "/usr/local/bin/phoenix_hypervisor_config.sh" ]]; then
-    source /usr/local/bin/phoenix_hypervisor_config.sh
+if [[ -f "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
+    source /usr/local/etc/phoenix_hypervisor_config.sh
 else
-    echo "Configuration file not found: /usr/local/bin/phoenix_hypervisor_config.sh"
+    echo "Configuration file not found: /usr/local/etc/phoenix_hypervisor_config.sh"
     exit 1
 fi
 
 # Source common functions
-if [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
-    source /usr/local/bin/phoenix_hypervisor_common.sh
+if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
+    source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh
 else
-    echo "Common functions file not found: /usr/local/bin/phoenix_hypervisor_common.sh"
+    echo "Common functions file not found: /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh"
     exit 1
 fi
 
@@ -42,25 +43,27 @@ log_error() {
 # --- Enhanced Initialization ---
 initialize_hypervisor() {
     log_info "Initializing Phoenix Hypervisor environment..."
-    
     # Create marker directory if needed
     mkdir -p "$HYPERVISOR_MARKER_DIR" || { log_error "Failed to create marker directory: $HYPERVISOR_MARKER_DIR"; exit 1; }
-    
     # Set up logging
     if [[ -z "${HYPERVISOR_LOGFILE:-}" ]]; then
         HYPERVISOR_LOGFILE="/var/log/phoenix_hypervisor/hypervisor.log"
         mkdir -p "$(dirname "$HYPERVISOR_LOGFILE")" || { log_error "Failed to create log directory: $(dirname "$HYPERVISOR_LOGFILE")"; exit 1; }
     fi
-    
     # Set permissions on log file
     touch "$HYPERVISOR_LOGFILE" || { log_error "Failed to create log file: $HYPERVISOR_LOGFILE"; exit 1; }
     chmod 600 "$HYPERVISOR_LOGFILE"
-    
     log_info "Phoenix Hypervisor environment initialized"
 }
 
 # --- Enhanced Configuration Loading ---
 load_hypervisor_config() {
+    # Add guard to prevent multiple calls
+    if [[ "${CONFIG_LOADED:-false}" == "true" ]]; then
+        log_info "Configuration already loaded, skipping..."
+        return 0
+    fi
+    
     log_info "Loading hypervisor configuration..."
     
     # Validate configuration file exists
@@ -69,7 +72,7 @@ load_hypervisor_config() {
         exit 1
     fi
     
-    # Validate JSON format
+    # Validate JSON format (only once)
     if ! jq empty "$PHOENIX_LXC_CONFIG_FILE" >/dev/null 2>&1; then
         log_error "Invalid JSON in configuration file: $PHOENIX_LXC_CONFIG_FILE"
         exit 1
@@ -85,6 +88,7 @@ load_hypervisor_config() {
     
     if [[ -z "$lxc_ids" ]]; then
         log_warn "No LXC configurations found in $PHOENIX_LXC_CONFIG_FILE"
+        CONFIG_LOADED=true
         return 0
     fi
     
@@ -93,14 +97,11 @@ load_hypervisor_config() {
         if [[ -n "$lxc_id" ]]; then
             local config
             config=$(jq -r ".lxc_configs.\"$lxc_id\"" "$PHOENIX_LXC_CONFIG_FILE")
-            
             if [[ "$config" != "null" ]]; then
                 LXC_CONFIGS["$lxc_id"]="$config"
-                
                 # Extract setup script path if specified
                 local setup_script
                 setup_script=$(echo "$config" | jq -r '.setup_script // empty')
-                
                 if [[ -n "$setup_script" && "$setup_script" != "null" ]]; then
                     LXC_SETUP_SCRIPTS["$lxc_id"]="$setup_script"
                 fi
@@ -109,6 +110,7 @@ load_hypervisor_config() {
     done <<< "$lxc_ids"
     
     log_info "Loaded ${#LXC_CONFIGS[@]} LXC configurations"
+    CONFIG_LOADED=true
 }
 
 # --- Enhanced Main Function ---
@@ -138,33 +140,12 @@ main() {
         exit 1
     fi
     
-    # Load configuration
+    # Load configuration (once)
     log_info "Loading configuration..."
     load_hypervisor_config
     
-    # Show configuration summary
-    echo ""
-    echo "Configuration Summary:"
-    echo "----------------------"
-    echo "LXC configs found: ${#LXC_CONFIGS[@]}"
-    echo "Default storage pool: $DEFAULT_LXC_STORAGE_POOL"
-    echo "Default memory: $DEFAULT_LXC_MEMORY_MB MB"
-    echo "Default cores: $DEFAULT_LXC_CORES"
-    echo ""
-    
-    # Show NVIDIA configuration
-    echo "NVIDIA Configuration:"
-    echo "---------------------"
-    echo "Driver Version: $NVIDIA_DRIVER_VERSION"
-    echo "Repository URL: $NVIDIA_REPO_URL"
-    echo ""
-    
-    # Confirm with user before proceeding
-    read -p "Do you want to proceed with the setup? (yes/no): " confirm
-    if [[ "$confirm" != "yes" ]]; then
-        log_info "Setup cancelled by user."
-        exit 0
-    fi
+    # Initialize hypervisor environment
+    initialize_hypervisor
     
     echo ""
     log_info "Starting initial system setup..."
@@ -195,40 +176,36 @@ main() {
             log_info "Container $lxc_id created successfully"
             
             # Run setup script if specified
-            if [[ -n "${LXC_SETUP_SCRIPTS[$lxc_id]:-}" ]] && [[ -f "${LXC_SETUP_SCRIPTS[$lxc_id]}" ]]; then
+            if [[ -n "${LXC_SETUP_SCRIPTS[$lxc_id]:-}" ]]; then
                 log_info "Running setup script for container $lxc_id..."
-                if "${LXC_SETUP_SCRIPTS[$lxc_id]}" "$lxc_id"; then
-                    log_info "Setup script completed successfully for container $lxc_id"
-                else
+                if ! /usr/local/bin/phoenix_hypervisor_setup_drdevstral.sh "$lxc_id"; then
                     log_warn "Setup script failed for container $lxc_id"
+                    ((failed_count++))
                 fi
             fi
-            
         else
-            ((failed_count++))
             log_error "Failed to create container $lxc_id"
-            
-            # Handle rollback if enabled
-            if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-                log_warn "Rollback enabled, attempting cleanup..."
-                # Cleanup logic would go here
-            fi
+            ((failed_count++))
         fi
     done
     
     echo ""
     echo "==============================================="
-    echo "Setup Summary:"
-    echo "Created: $created_count containers"
-    echo "Failed: $failed_count containers"
+    echo "SETUP SUMMARY"
+    echo "==============================================="
+    echo "Created containers: $created_count"
+    echo "Failed containers: $failed_count"
     echo "==============================================="
     
-    # Mark setup as complete
-    touch "$HYPERVISOR_MARKER"
-    log_info "Phoenix Hypervisor setup completed successfully"
+    if [[ $failed_count -eq 0 ]]; then
+        log_info "Phoenix Hypervisor setup completed successfully!"
+    else
+        log_error "Some containers failed to set up. Check logs for details."
+        exit 1
+    fi
 }
 
-# --- Enhanced Retry Command ---
+# --- Enhanced Retry Command Function ---
 retry_command() {
     local max_attempts="$1"
     local delay="$2"
@@ -239,7 +216,7 @@ retry_command() {
         if "$@"; then
             return 0
         else
-            log_warn "Command failed (attempt $attempt/$max_attempts), retrying in $delay seconds..."
+            log_warn "Command failed (attempt $attempt/$max_attempts). Retrying in $delay seconds..."
             sleep "$delay"
             ((attempt++))
         fi
@@ -247,4 +224,5 @@ retry_command() {
     return 1
 }
 
+# --- Execute Main Function ---
 main "$@"
