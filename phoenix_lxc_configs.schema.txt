@@ -51,12 +51,37 @@
                         "features": {
                             "type": "string"
                         },
-                        "gpu_assignment": {
-                            "type": "string",
-                            "description": "GPU assignment for the container (e.g., '0', '1', or '0,1')",
-                            "pattern": "^(0|1|2|3|0,1|0,2|0,3|1,2|1,3|2,3|0,1,2|0,1,3|0,2,3|1,2,3|0,1,2,3)$"
+                        "vllm_model": {
+                            "type": "string"
+                        },
+                        "vllm_tensor_parallel_size": {
+                            "type": "string"
+                        },
+                        "vllm_max_model_len": {
+                            "type": "string"
+                        },
+                        "vllm_kv_cache_dtype": {
+                            "type": "string"
+                        },
+                        "vllm_shm_size": {
+                            "type": "string"
+                        },
+                        "vllm_gpu_count": {
+                            "type": "string"
+                        },
+                        "vllm_quantization": {
+                            "type": "string"
+                        },
+                        "vllm_quantization_config_type": {
+                            "type": "string"
+                        },
+                        "vllm_api_port": {
+                            "type": "integer"
                         },
                         "setup_script": {
+                            "type": "string"
+                        },
+                        "gpu_assignment": {
                             "type": "string"
                         }
                     },
@@ -68,8 +93,7 @@
                         "storage_pool",
                         "storage_size_gb",
                         "network_config",
-                        "features",
-                        "vllm_api_port"
+                        "features"
                     ],
                     "additionalProperties": false
                 }

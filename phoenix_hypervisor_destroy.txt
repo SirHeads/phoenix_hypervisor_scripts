@@ -20,10 +20,10 @@ else
 fi
 
 # Source common functions
-if [[ -f "/usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
-    source /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_common.sh
+if [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
+    source /usr/local/bin/phoenix_hypervisor_common.sh
 else
-    echo "Common functions file not found: /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_common.sh"
+    echo "Common functions file not found: /usr/local/bin/phoenix_hypervisor_common.sh"
     exit 1
 fi
 
