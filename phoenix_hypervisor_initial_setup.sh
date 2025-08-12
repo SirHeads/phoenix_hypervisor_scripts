@@ -42,30 +42,33 @@ fi
 
 # --- Enhanced Setup Functions ---
 
+# ... (existing sourcing and other functions)
+
 # - Enhanced System Requirements Check -
 setup_system_requirements() {
-    log_info "Checking system requirements..."
-    # Use the common function for checking requirements if available
-    # Otherwise, perform basic checks inline
-    if declare -f check_system_requirements > /dev/null; then
-        if ! check_system_requirements; then
-            log_error "System requirements check failed. Please resolve issues and rerun."
+    log_info "Checking and installing system requirements..."
+    # Install jq and python3-jsonschema if missing
+    if ! command -v jq >/dev/null 2>&1; then
+        log_info "Installing jq..."
+        apt update -y
+        apt install -y jq || {
+            log_error "Failed to install jq."
             exit 1
-        fi
-    else
-        # Fallback basic checks if common function isn't available
-        log_warn "check_system_requirements function not found, performing basic checks."
-        if ! command -v jq >/dev/null 2>&1; then
-            log_error "Required tool 'jq' not found."
-            exit 1
-        fi
-        if ! command -v pct >/dev/null 2>&1; then
-             log_error "Required tool 'pct' (Proxmox Container Tools) not found."
-             exit 1
-        fi
-        # Add other basic checks as needed...
+        }
     fi
-    log_info "System requirements check completed"
+    if ! command -v jsonschema >/dev/null 2>&1; then
+        log_info "Installing python3-jsonschema..."
+        apt update -y
+        apt install -y python3-jsonschema || {
+            log_error "Failed to install python3-jsonschema."
+            exit 1
+        }
+    fi
+    if ! command -v pct >/dev/null 2>&1; then
+        log_error "Required tool 'pct' (Proxmox Container Tools) not found."
+        exit 1
+    fi
+    log_info "System requirements check and installation completed"
 }
 
 # - Enhanced Directory Setup -
