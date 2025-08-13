@@ -89,34 +89,17 @@ install_nvidia_driver_in_container() {
     output=$(pct exec "$lxc_id" -- bash -c "$install_cmd" 2>&1)
     local exit_code=$?
 
-    if [[ $exit_code -ne 0 ]]; then
-        log_error "phoenix_hypervisor_lxc_common_nvidia.sh: Failed to install NVIDIA drivers in container $lxc_id. Output: $output"
-        return 1
+    if [[ $exit_code -eq 0 ]]; then
+        log_info "phoenix_hypervisor_lxc_common_nvidia.sh: $output"
+        return 0
     else
-        # Parse the driver version from the successful output
-        local installed_version
-        installed_version=$(echo "$output" | grep "\[SUCCESS\]" -A 1 | tail -n 1)
-        if [[ -n "$installed_version" ]]; then
-             log_info "phoenix_hypervisor_lxc_common_nvidia.sh: NVIDIA driver version $installed_version installed successfully in container $lxc_id."
-        else
-             # Fallback if parsing fails
-             log_info "phoenix_hypervisor_lxc_common_nvidia.sh: NVIDIA driver installation completed (exit code 0) in container $lxc_id. Verifying..."
-             if detect_gpus_in_container "$lxc_id"; then
-                 local final_version
-                 final_version=$(pct exec "$lxc_id" -- nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits | tr -d ' ' | head -n 1)
-                 log_info "phoenix_hypervisor_lxc_common_nvidia.sh: Verified NVIDIA driver version $final_version in container $lxc_id."
-             else
-                 log_warn "phoenix_hypervisor_lxc_common_nvidia.sh: Driver installation command succeeded, but GPU access could not be verified in container $lxc_id."
-                 return 1
-             fi
-        fi
+        log_error "phoenix_hypervisor_lxc_common_nvidia.sh: Failed to install NVIDIA driver in container $lxc_id. Output: $output"
+        return 1
     fi
-    return 0
 }
 
-# - Verify GPU Access Inside Container -
-# This function checks if GPUs are accessible *inside* a running container
-# It uses nvidia-smi to query GPUs
+# - Detect GPUs Inside Container -
+# Checks if GPUs are accessible inside the container using nvidia-smi
 detect_gpus_in_container() {
     local lxc_id="$1"
 
@@ -125,23 +108,12 @@ detect_gpus_in_container() {
         return 1
     fi
 
-    log_info "phoenix_hypervisor_lxc_common_nvidia.sh: Detecting NVIDIA GPUs inside container $lxc_id..."
-
-    # Check if nvidia-smi is available and can query GPUs
     local check_cmd="
         if command -v nvidia-smi >/dev/null 2>&1; then
-            # Try a simple query
-            nvidia-smi --query-gpu=count --format=csv,noheader,nounits > /dev/null 2>&1
-            if [[ \$? -eq 0 ]]; then
-                # Query successful, get count
-                count=\$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits | head -n 1 | tr -d ' ')
-                if [[ -n \"\$count\" ]] && [[ \"\$count\" -ge 1 ]]; then
-                    echo \"[DETECTED] Found \$count NVIDIA GPU(s) accessible in container $lxc_id.\"
-                    exit 0
-                else
-                    echo \"[WARNING] nvidia-smi available but reported 0 GPUs in container $lxc_id.\"
-                    exit 1
-                fi
+            if nvidia-smi >/dev/null 2>&1; then
+                echo \"[SUCCESS] GPUs detected in container $lxc_id.\"
+                nvidia-smi --query-gpu=count --format=csv,noheader,nounits | head -n 1
+                exit 0
             else
                 echo \"[ERROR] nvidia-smi command failed inside container $lxc_id.\"
                 exit 1
@@ -194,52 +166,57 @@ verify_lxc_gpu_access_in_container() {
     fi
 }
 
-# --- Raw LXC Configuration Modification ---
-# The original upload contained direct 'echo' commands to modify /etc/pve/lxc/$lxc_id.conf.
-# This logic is powerful but bypasses structured configuration.
-# It's kept here as a separate function, assuming it's needed for a specific type of setup.
-# WARNING: Using this requires extreme care to avoid conflicts with phoenix_hypervisor_common.sh's configure_lxc_gpu_passthrough.
+# Configures GPU passthrough by modifying the LXC config file directly.
+# This adds cgroup allowances and mount entries for the specified GPUs.
+configure_lxc_gpu_passthrough() {
+    local lxc_id="$1"
+    local gpu_indices="$2" # e.g., "0,1"
 
-# configure_lxc_for_full_gpu_passthrough_raw() {
-#     local lxc_id="$1"
-#     local gpu_indices="$2" # e.g., "0", "1", "0,1"
-#
-#     if [[ -z "$lxc_id" ]] || [[ -z "$gpu_indices" ]]; then
-#         log_error "phoenix_hypervisor_lxc_common_nvidia.sh: configure_lxc_for_full_gpu_passthrough_raw: Missing lxc_id or gpu_indices"
-#         return 1
-#     fi
-#
-#     log_warn "phoenix_hypervisor_lxc_common_nvidia.sh: Using raw LXC config modification. Ensure no conflicts with other GPU setup methods."
-#     local config_file="/etc/pve/lxc/$lxc_id.conf"
-#
-#     if [[ ! -f "$config_file" ]]; then
-#         log_error "phoenix_hypervisor_lxc_common_nvidia.sh: LXC config file not found: $config_file"
-#         return 1
-#     fi
-#
-#     # Remove existing potentially conflicting entries
-#     # (Add specific patterns if needed)
-#     # sed -i '/pattern/d' "$config_file"
-#
-#     # Add cgroup and mount entries for each GPU index
-#     IFS=',' read -ra INDICES <<< "$gpu_indices"
-#     for index in "${INDICES[@]}"; do
-#         # Validate index is numeric?
-#         echo "lxc.cgroup2.devices.allow: c 195:* rwm" >> "$config_file"
-#         echo "lxc.cgroup2.devices.allow: c 235:* rwm" >> "$config_file"
-#         echo "lxc.cgroup2.devices.allow: c 236:$index rwm" >> "$config_file"
-#         echo "lxc.cgroup2.devices.allow: c 237:$index rwm" >> "$config_file"
-#         echo "lxc.mount.entry: /dev/nvidia$index dev/nvidia$index none bind,optional,create=file" >> "$config_file"
-#     done
-#     # Add common entries
-#     echo "lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file" >> "$config_file"
-#     echo "lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file" >> "$config_file"
-#     echo "lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file" >> "$config_file"
-#     echo "lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file" >> "$config_file"
-#
-#     log_info "phoenix_hypervisor_lxc_common_nvidia.sh: Raw GPU passthrough entries added to $config_file for indices: $gpu_indices"
-#     return 0
-# }
+    if [[ -z "$lxc_id" ]] || [[ -z "$gpu_indices" ]]; then
+        log_error "configure_lxc_gpu_passthrough: Missing lxc_id or gpu_indices"
+        return 1
+    fi
+
+    local config_file="/etc/pve/lxc/$lxc_id.conf"
+    if [[ ! -f "$config_file" ]]; then
+        log_error "configure_lxc_gpu_passthrough: LXC config file not found: $config_file"
+        return 1
+    fi
+
+    log_info "configure_lxc_gpu_passthrough: Adding GPU passthrough entries to $config_file for GPUs: $gpu_indices"
+
+    # Remove any existing GPU-related entries to avoid duplicates (idempotent)
+    sed -i '/^lxc\.cgroup2\.devices\.allow: c 195/d' "$config_file"
+    sed -i '/^lxc\.cgroup2\.devices\.allow: c 235/d' "$config_file"
+    sed -i '/^lxc\.cgroup2\.devices\.allow: c 236/d' "$config_file"
+    sed -i '/^lxc\.cgroup2\.devices\.allow: c 237/d' "$config_file"
+    sed -i '/^lxc\.mount\.entry: \/dev\/nvidia/d' "$config_file"
+
+    # Add common cgroup allowances (for NVIDIA control devices)
+    echo "lxc.cgroup2.devices.allow: c 195:* rwm" >> "$config_file"  # /dev/nvidia*
+    echo "lxc.cgroup2.devices.allow: c 235:* rwm" >> "$config_file"  # NVIDIA render
+
+    # Add per-GPU entries
+    IFS=',' read -ra INDICES <<< "$gpu_indices"
+    for index in "${INDICES[@]}"; do
+        if ! [[ "$index" =~ ^[0-9]+$ ]]; then
+            log_error "configure_lxc_gpu_passthrough: Invalid GPU index: $index (must be numeric)"
+            return 1
+        fi
+        echo "lxc.cgroup2.devices.allow: c 236:$index rwm" >> "$config_file"  # Specific GPU
+        echo "lxc.cgroup2.devices.allow: c 237:$index rwm" >> "$config_file"  # Specific GPU MIG if applicable
+        echo "lxc.mount.entry: /dev/nvidia$index dev/nvidia$index none bind,optional,create=file" >> "$config_file"
+    done
+
+    # Add common mount entries
+    echo "lxc.mount.entry: /dev/nvidiactl dev/nvidiactl none bind,optional,create=file" >> "$config_file"
+    echo "lxc.mount.entry: /dev/nvidia-uvm dev/nvidia-uvm none bind,optional,create=file" >> "$config_file"
+    echo "lxc.mount.entry: /dev/nvidia-uvm-tools dev/nvidia-uvm-tools none bind,optional,create=file" >> "$config_file"
+    echo "lxc.mount.entry: /dev/nvidia-modeset dev/nvidia-modeset none bind,optional,create=file" >> "$config_file"
+
+    log_info "configure_lxc_gpu_passthrough: GPU passthrough configured for container $lxc_id (GPUs: $gpu_indices)"
+    return 0
+}
 
 # Signal that this library has been loaded (optional, good practice)
 export PHOENIX_HYPERVISOR_LXC_NVIDIA_LOADED=1

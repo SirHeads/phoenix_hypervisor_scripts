@@ -11,21 +11,42 @@
 
 set -euo pipefail
 
-# Source configuration first
-if [[ -f "/usr/local/bin/phoenix_hypervisor_config.sh" ]]; then
-    source /usr/local/bin/phoenix_hypervisor_config.sh
+# --- Enhanced Sourcing ---
+# Source configuration from the standard location
+# Ensures paths like PHOENIX_LXC_CONFIG_FILE are available
+if [[ -f "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
+    source /usr/local/etc/phoenix_hypervisor_config.sh
 else
-    echo "Configuration file not found: /usr/local/bin/phoenix_hypervisor_config.sh"
-    exit 1
+    # Fallback to current directory if standard location not found (less ideal)
+    if [[ -f "./phoenix_hypervisor_config.sh" ]]; then
+        source ./phoenix_hypervisor_config.sh
+        echo "[WARN] phoenix_hypervisor_destroy.sh: Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh" >&2
+    else
+        echo "[ERROR] phoenix_hypervisor_destroy.sh: Configuration file not found: /usr/local/etc/phoenix_hypervisor_config.sh or ./phoenix_hypervisor_config.sh" >&2
+        exit 1
+    fi
 fi
 
-# Source common functions
-if [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
+# Source common functions from the standard location (as defined in corrected common.sh)
+# Priority: 1. Standard lib location, 2. Standard bin location, 3. Current directory
+# This provides access to logging functions (log_info, etc.) and other utilities if needed.
+if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
+    source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh
+elif [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
     source /usr/local/bin/phoenix_hypervisor_common.sh
+    echo "[WARN] phoenix_hypervisor_destroy.sh: Sourced common functions from /usr/local/bin/. Prefer /usr/local/lib/phoenix_hypervisor/." >&2
+elif [[ -f "./phoenix_hypervisor_common.sh" ]]; then
+    source ./phoenix_hypervisor_common.sh
+    echo "[WARN] phoenix_hypervisor_destroy.sh: Sourced common functions from current directory. Prefer standard locations." >&2
 else
-    echo "Common functions file not found: /usr/local/bin/phoenix_hypervisor_common.sh"
-    exit 1
+    # Define minimal fallback logging if common functions can't be sourced
+    # This ensures the script can report basic errors even if sourcing fails completely
+    log_info() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $1"; }
+    log_warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $1" >&2; }
+    log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $1" >&2; }
+    log_warn "phoenix_hypervisor_destroy.sh: Common functions file not found in standard locations. Using minimal logging."
 fi
+# --- END Enhanced Sourcing ---
 
 # --- Enhanced User Experience Functions ---
 log_info() {
@@ -40,68 +61,104 @@ log_error() {
     echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $1" >&2
 }
 
-# --- Enhanced Container Destruction Functions ---
+# Validates that a given string is a valid LXC container ID (numeric)
+validate_lxc_id() {
+    local id="$1"
+    if [[ -z "$id" ]]; then
+        log_error "Container ID cannot be empty"
+        return 1
+    fi
+    # Check if the ID consists only of digits
+    if [[ "$id" =~ ^[0-9]+$ ]]; then
+        return 0 # Valid
+    else
+        log_error "Invalid container ID format: $id (must be numeric)"
+        return 1 # Invalid
+    fi
+}
+
+# - Enhanced Container Destruction -
 destroy_container() {
     local container_id="$1"
-    local force="${2:-false}"
-    
+    local force="${2:-false}" # Default to false if not provided
+
     if [[ -z "$container_id" ]]; then
         log_error "Container ID cannot be empty"
         return 1
     fi
-    
-    # Check if container exists
-    if ! pct status "$container_id" >/dev/null 2>&1; then
-        log_warn "Container $container_id does not exist or is not accessible"
-        return 0
-    fi
-    
-    log_info "Starting destruction process for container $container_id..."
-    
-    # Stop container if running (with retry logic)
-    local max_attempts=5
-    local attempt=1
-    
-    while [[ $attempt -le $max_attempts ]]; do
-        if pct status "$container_id" >/dev/null 2>&1; then
-            log_info "Stopping container $container_id (attempt $attempt/$max_attempts)..."
-            if pct stop "$container_id" 2>/dev/null; then
-                log_info "Container $container_id stopped successfully"
-                break
-            else
-                log_warn "Failed to stop container $container_id on attempt $attempt"
-                sleep 2
-                ((attempt++))
-            fi
+
+    # Check container existence and get its status
+    local status_output
+    local status_exit_code
+    status_output=$(pct status "$container_id" 2>&1)
+    status_exit_code=$?
+
+    if [[ $status_exit_code -ne 0 ]]; then
+        # Container does not exist or is inaccessible
+        if [[ "$status_output" == *"does not exist"* ]] || [[ $status_exit_code -eq 1 ]]; then
+            log_warn "Container $container_id does not exist or is not accessible"
+            return 0 # Consider it a success if it's already gone
         else
-            log_info "Container $container_id is already stopped"
-            break
-        fi
-    done
-    
-    if [[ $attempt -gt $max_attempts ]]; then
-        log_warn "Failed to stop container $container_id after $max_attempts attempts"
-        if [[ "$force" == "true" ]]; then
-            log_info "Force destruction requested, continuing with purge..."
-        else
-            log_error "Failed to stop container $container_id. Use --force to proceed anyway."
+            # Some other error occurred getting status
+            log_error "Failed to get status for container $container_id: $status_output"
             return 1
         fi
     fi
-    
+
+    # If we get here, the container exists. Check if it's running.
+    # The output of `pct status` is typically just "status: running" or "status: stopped"
+    if echo "$status_output" | grep -q "running"; then
+        log_info "Container $container_id is currently running. Initiating shutdown..."
+        # Stop container if running (with retry logic)
+        local max_attempts=5
+        local attempt=1
+        local stop_success=false
+        while [[ $attempt -le $max_attempts ]]; do
+            log_info "Stopping container $container_id (attempt $attempt/$max_attempts)..."
+            if pct stop "$container_id"; then
+                log_info "Stop command issued successfully for container $container_id"
+                # Wait a bit and then verify it stopped
+                sleep 2
+                local verify_status
+                verify_status=$(pct status "$container_id" 2>&1)
+                if echo "$verify_status" | grep -q "stopped"; then
+                    log_info "Container $container_id confirmed stopped."
+                    stop_success=true
+                    break
+                else
+                    log_warn "Container $container_id might still be stopping (status: $verify_status)"
+                fi
+            else
+                log_warn "Failed to issue stop command for container $container_id on attempt $attempt"
+            fi
+            sleep 2
+            ((attempt++))
+        done
+
+        if [[ "$stop_success" != "true" ]]; then
+            log_warn "Failed to stop container $container_id after $max_attempts attempts"
+            if [[ "$force" == "true" ]]; then
+                log_info "Force destruction requested, continuing with purge..."
+            else
+                log_error "Failed to stop container $container_id. Use --force to proceed anyway."
+                return 1
+            fi
+        fi
+    else
+        # Container exists but is not running (likely stopped)
+        log_info "Container $container_id is already stopped."
+    fi
+
     # Destroy container with purge
     log_info "Destroying container $container_id with purge..."
-    
     if pct destroy "$container_id" --purge; then
         log_info "Container $container_id destroyed successfully"
-        
         # Remove marker file if it exists
-        local marker_file="$HYPERVISOR_MARKER_DIR/container_$container_id_created"
+        local marker_file="$HYPERVISOR_MARKER_DIR/container_${container_id}_created"
         if [[ -f "$marker_file" ]]; then
             rm -f "$marker_file"
             log_info "Removed container marker file: $marker_file"
         fi
-        
         return 0
     else
         log_error "Failed to destroy container $container_id"
