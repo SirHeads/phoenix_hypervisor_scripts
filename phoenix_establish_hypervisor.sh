@@ -9,6 +9,11 @@
 # Version: 1.7.4
 # Author: Assistant
 set -euo pipefail
+set -x  # Enable tracing for debugging
+
+# Reset terminal state on exit to prevent corruption
+trap 'stty sane; echo "Terminal reset"' EXIT
+
 # --- Sourcing Dependencies ---
 # Source configuration first
 if [[ -f "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
@@ -24,6 +29,7 @@ else
     echo "[ERROR] Common functions file not found: /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh or /usr/local/bin/phoenix_hypervisor_common.sh" >&2
     exit 1
 fi
+
 # --- Main Logic ---
 # - Main Function -
 main() {
@@ -49,6 +55,10 @@ main() {
         log_error "pct (Proxmox Container Tools) is required but not installed."
         exit 1
     fi
+    # Additional dependency validations
+    command -v jq >/dev/null 2>&1 || { log_error "jq not installed"; exit 1; }
+    command -v pct >/dev/null 2>&1 || { log_error "pct not installed"; exit 1; }
+    systemctl is-active --quiet apparmor || { log_error "apparmor service not active"; exit 1; }
     # Validate configuration file exists and is readable (explicit check)
     if [[ ! -f "$PHOENIX_LXC_CONFIG_FILE" ]]; then
         log_error "Configuration file not found: $PHOENIX_LXC_CONFIG_FILE"
@@ -101,17 +111,16 @@ main() {
     if ! retry_command 5 10 "/usr/local/bin/phoenix_hypervisor_initial_setup.sh" 2>&1 | while read -r line; do
         log_info "phoenix_hypervisor_initial_setup.sh: $line"
     done; then
-        log_error "Initial setup failed. Exiting."
+        log_error "Initial setup failed after retries."
         exit 1
     fi
-    # --- END CHANGE ---
-    # Create each container
+    # Initialize counters
+    created_count=0
+    failed_count=0
+    echo ""
     log_info "Creating LXC containers..."
-    local created_count=0
-    local failed_count=0
-    # Process each LXC configuration from the loaded array
     for lxc_id in "${!LXC_CONFIGS[@]}"; do
-        if pct status "$lxc_id" >/dev/null 2>&1; then
+        if pct status "$lxc_id" &>/dev/null; then
             log_warn "Container $lxc_id already exists. Skipping creation."
             continue
         fi        
@@ -127,14 +136,35 @@ main() {
             # For now, continue to try others
             continue
         fi
+        # Ensure AppArmor unconfined profile
+        log_info "Setting AppArmor profile for $lxc_id to unconfined..."
+        echo "lxc.apparmor.profile: unconfined" >> "/etc/pve/lxc/$lxc_id.conf" || {
+            log_error "Failed to set AppArmor profile for $lxc_id"
+            ((failed_count++))
+            continue
+        }
+        # Start container
+        log_info "Starting container $lxc_id..."
+        if ! pct start "$lxc_id"; then
+            log_error "Failed to start container $lxc_id"
+            ((failed_count++))
+            continue
+        fi
+        sleep 10
+        if ! pct status "$lxc_id" | grep -q "running"; then
+            log_error "Container $lxc_id failed to start properly"
+            ((failed_count++))
+            continue
+        fi
+        log_info "Container $lxc_id started successfully"
         # Run container-specific setup script if defined
         local setup_script_path
         # Use jq to get the setup script path from the config file for this specific container
         setup_script_path=$(jq -r ".lxc_configs.\"$lxc_id\".setup_script // \"\"" "$PHOENIX_LXC_CONFIG_FILE")
         if [[ -n "${setup_script_path:-}" ]] && [[ -f "$setup_script_path" ]]; then
             log_info "Running container-specific setup script for $lxc_id: $setup_script_path"
-            # Execute the setup script with container ID as parameter
-            if ! "$setup_script_path" "$lxc_id"; then
+            # Execute the setup script with container ID as parameter, tee output for logging
+            if ! "$setup_script_path" "$lxc_id" 2>&1 | tee -a "$HYPERVISOR_LOGFILE"; then
                 log_error "Container-specific setup script failed for $lxc_id"
                 ((failed_count++))
                 # Continue with other containers even if one fails

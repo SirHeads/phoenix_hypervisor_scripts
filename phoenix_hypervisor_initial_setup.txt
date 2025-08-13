@@ -4,6 +4,12 @@
 # Version: 1.7.4
 # Author: Assistant
 
+set -euo pipefail
+set -x  # Enable tracing for debugging
+
+# Reset terminal state on exit to prevent corruption
+trap 'stty sane; echo "Terminal reset"' EXIT
+
 # --- Enhanced Sourcing ---
 # Source configuration from the standard location
 # Ensures paths like PHOENIX_LXC_CONFIG_FILE are available
@@ -20,9 +26,8 @@ else
     fi
 fi
 
-# Source common functions from the standard location (as defined in corrected common.sh)
+# Source common functions from the standard location
 # Priority: 1. Standard lib location, 2. Standard bin location, 3. Current directory
-# This provides access to logging functions (log_info, etc.) and other utilities if needed.
 if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
     source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh
 elif [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
@@ -33,7 +38,6 @@ elif [[ -f "./phoenix_hypervisor_common.sh" ]]; then
     echo "[WARN] phoenix_hypervisor_initial_setup.sh: Sourced common functions from current directory. Prefer standard locations." >&2
 else
     # Define minimal fallback logging if common functions can't be sourced
-    # This ensures the script can report basic errors even if sourcing fails completely
     log_info() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $1"; }
     log_warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $1" >&2; }
     log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $1" >&2; }
@@ -42,15 +46,24 @@ fi
 
 # --- Enhanced Setup Functions ---
 
-# ... (existing sourcing and other functions)
+# - Validate APT Sources -
+validate_apt_sources() {
+    log_info "Validating APT sources..."
+    if ! apt update -y 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+        log_error "APT update failed. Check /etc/apt/sources.list and network connectivity."
+        exit 1
+    fi
+    log_info "APT sources validated successfully"
+}
 
 # - Enhanced System Requirements Check -
 setup_system_requirements() {
     log_info "Checking and installing system requirements..."
+    # Validate APT sources before any apt commands
+    validate_apt_sources
     # Install jq and python3-jsonschema if missing
     if ! command -v jq >/dev/null 2>&1; then
         log_info "Installing jq..."
-        apt update -y
         apt install -y jq || {
             log_error "Failed to install jq."
             exit 1
@@ -58,7 +71,6 @@ setup_system_requirements() {
     fi
     if ! command -v jsonschema >/dev/null 2>&1; then
         log_info "Installing python3-jsonschema..."
-        apt update -y
         apt install -y python3-jsonschema || {
             log_error "Failed to install python3-jsonschema."
             exit 1
@@ -68,6 +80,18 @@ setup_system_requirements() {
         log_error "Required tool 'pct' (Proxmox Container Tools) not found."
         exit 1
     fi
+    # Additional dependency check for apparmor
+    systemctl is-active --quiet apparmor || {
+        log_info "Installing apparmor..."
+        apt install -y apparmor || {
+            log_error "Failed to install apparmor."
+            exit 1
+        }
+        systemctl enable --now apparmor || {
+            log_error "Failed to enable apparmor service."
+            exit 1
+        }
+    }
     log_info "System requirements check and installation completed"
 }
 
@@ -93,83 +117,51 @@ setup_directories() {
                 log_error "Failed to create directory: $dir"
                 exit 1
             fi
-        else
-            log_info "Directory already exists: $dir"
         fi
     done
-
-    # Set specific permissions if needed (example)
-    # chmod 700 /var/lib/phoenix_hypervisor
-    # chmod 600 /var/log/phoenix_hypervisor/* 2>/dev/null || true # Ignore if no files
-
     log_info "Directory setup completed"
 }
 
-# - Configuration Setup (WITHOUT Default File Creation) -
-# This function now only validates that required config files exist
-# or reports if they are missing. It DOES NOT create them.
+# - Enhanced Configuration Setup -
 setup_configuration() {
-    log_info "Checking for required configuration files..."
-
-    local required_files=(
-        "$PHOENIX_LXC_CONFIG_FILE"      # From phoenix_hypervisor_config.sh
-        "$PHOENIX_LXC_CONFIG_SCHEMA_FILE" # From phoenix_hypervisor_config.sh
+    log_info "Checking configuration files..."
+    # Check critical config files (no creation, just validation)
+    local critical_files=(
+        "$PHOENIX_LXC_CONFIG_FILE"
+        "$PHOENIX_LXC_CONFIG_SCHEMA_FILE"
     )
-
-    # Add token file if PHOENIX_HF_TOKEN_FILE is defined in the environment/config
+    # Add token file if defined
     if [[ -n "${PHOENIX_HF_TOKEN_FILE:-}" ]]; then
-        required_files+=("$PHOENIX_HF_TOKEN_FILE")
+        critical_files+=("$PHOENIX_HF_TOKEN_FILE")
     fi
 
-    local all_found=true
-    for file in "${required_files[@]}"; do
-        if [[ -f "$file" ]]; then
-            log_info "Found required configuration file: $file"
-        else
-            log_error "Required configuration file missing: $file"
-            all_found=false
+    for file in "${critical_files[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            log_error "Configuration file missing: $file"
+            exit 1
+        fi
+        if [[ ! -r "$file" ]]; then
+            log_error "Configuration file not readable: $file"
+            exit 1
         fi
     done
-
-    if [[ "$all_found" != "true" ]]; then
-        log_error "One or more required configuration files are missing. Please ensure they are placed correctly before running setup."
-        # Optionally, exit here to force manual intervention:
-        # exit 1
-        # Or, just warn and let the process potentially fail later:
-        log_warn "Continuing setup, but subsequent steps may fail due to missing config files."
-    else
-        log_info "All required configuration files are present."
-    fi
-
-    log_info "Configuration check completed"
+    log_info "Configuration files checked successfully"
 }
-
 
 # - Enhanced NVIDIA Support Setup -
 setup_nvidia_support() {
-    log_info "Setting up NVIDIA driver support..."
-    # Use the common function to show system info which includes NVIDIA details if available
-    if declare -f show_system_info > /dev/null; then
-        show_system_info
-    else
-        # Fallback to basic info display
-        log_warn "show_system_info function not found, displaying basic info."
-        if command -v nvidia-smi >/dev/null 2>&1; then
-            local driver_version
-            driver_version=$(nvidia-smi --query-gpu=driver_version --format=csv,noheader,nounits | head -n 1 | tr -d ' ')
-            log_info "Host NVIDIA driver version: $driver_version"
-
-            local gpu_count
-            gpu_count=$(nvidia-smi --query-gpu=count --format=csv,noheader,nounits | head -n 1 | tr -d ' ')
-            log_info "Available NVIDIA GPUs: $gpu_count"
-        else
-            log_info "NVIDIA tools (nvidia-smi) not found on host."
-        fi
+    log_info "Checking NVIDIA support..."
+    # Check for NVIDIA driver on host (no repository additions)
+    if ! command -v nvidia-smi >/dev/null 2>&1; then
+        log_error "NVIDIA driver not found on host. Please install NVIDIA drivers."
+        exit 1
     fi
-
-    # Additional NVIDIA-specific checks can be added here if needed
-
-    log_info "NVIDIA support check completed"
+    # Verify GPU availability
+    if ! nvidia-smi --query-gpu=name --format=csv --id=0 >/dev/null 2>&1; then
+        log_error "No NVIDIA GPUs detected or nvidia-smi failed."
+        exit 1
+    fi
+    log_info "NVIDIA GPU support verified on host"
 }
 
 # - Enhanced Service Setup -
@@ -179,7 +171,6 @@ setup_services() {
     if [[ -d "/etc/systemd/system" ]]; then
         log_info "Service directory found: /etc/systemd/system"
         # Placeholder for future service setup logic if needed
-        # e.g., copying service files, enabling services
     else
         log_warn "Service directory not found: /etc/systemd/system. Skipping service setup."
     fi
@@ -201,7 +192,7 @@ validate_setup() {
         "/usr/local/bin/phoenix_hypervisor"
         "/var/lib/phoenix_hypervisor"
         "/var/log/phoenix_hypervisor"
-        "$HYPERVISOR_MARKER_DIR" # Comes from config
+        "$HYPERVISOR_MARKER_DIR"
     )
     for dir in "${required_dirs[@]}"; do
         if [[ -d "$dir" ]]; then
@@ -212,13 +203,11 @@ validate_setup() {
         fi
     done
 
-    # Check config files presence (existence checked in setup_configuration)
-    # We can re-check the critical ones here for final validation
+    # Check config files presence
     local critical_files=(
         "$PHOENIX_LXC_CONFIG_FILE"
         "$PHOENIX_LXC_CONFIG_SCHEMA_FILE"
     )
-    # Add token file if defined
     if [[ -n "${PHOENIX_HF_TOKEN_FILE:-}" ]]; then
         critical_files+=("$PHOENIX_HF_TOKEN_FILE")
     fi
@@ -235,10 +224,6 @@ validate_setup() {
     # Summary
     log_info "Setup validation: $checks_passed passed, $checks_failed failed"
     if [[ $checks_failed -gt 0 ]]; then
-        log_error "Setup validation failed. Please check logs."
-        # Depending on policy, you might want to exit here
-        # exit 1
-        # Or just warn
         log_warn "Validation had failures, but continuing. Subsequent steps may fail."
     fi
     log_info "Setup validation completed successfully"
@@ -276,7 +261,6 @@ main() {
     echo "SETUP COMPLETED SUCCESSFULLY"
     echo "==============================================="
     echo "Directories checked/created:"
-    # Use PHOENIX_HYPERVISOR_LIB_DIR from config if available, otherwise default
     local lib_dir="${PHOENIX_HYPERVISOR_LIB_DIR:-/usr/local/lib/phoenix_hypervisor}"
     echo "- $lib_dir"
     echo "- /usr/local/bin/phoenix_hypervisor"
