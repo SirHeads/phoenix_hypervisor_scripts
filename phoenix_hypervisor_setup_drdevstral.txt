@@ -1,11 +1,11 @@
 #!/bin/bash
 # Container-specific setup script for drdevstral (LXC ID 901)
-# Installs NVIDIA drivers, vLLM, and sets up the AI model
-# Version: 1.7.6
+# Installs NVIDIA drivers, toolkit, vLLM, and sets up the AI model
+# Version: 1.8.0
 # Author: Assistant
 
 set -euo pipefail
-set -x  # Enable tracing for debugging
+# Don't enable set -x here to avoid exposing secrets in logs
 
 # Reset terminal state on exit to prevent corruption
 trap 'stty sane; echo "Terminal reset"' EXIT
@@ -66,6 +66,22 @@ else
     exit 1
 fi
 
+# --- Logging Setup ---
+setup_logging() {
+    local log_dir="/var/log/phoenix_hypervisor"
+    mkdir -p "$log_dir"
+    touch "$HYPERVISOR_LOGFILE" "${HYPERVISOR_LOGFILE%.log}_debug.log"
+    chmod 644 "$HYPERVISOR_LOGFILE" "${HYPERVISOR_LOGFILE%.log}_debug.log"
+    if [[ ! -w "$HYPERVISOR_LOGFILE" ]] || [[ ! -w "${HYPERVISOR_LOGFILE%.log}_debug.log" ]]; then
+        echo "[ERROR] Cannot write to log files: $HYPERVISOR_LOGFILE or ${HYPERVISOR_LOGFILE%.log}_debug.log" >&2
+        exit 1
+    fi
+    exec 3>>"$HYPERVISOR_LOGFILE"
+    exec 4>>"${HYPERVISOR_LOGFILE%.log}_debug.log"
+}
+
+setup_logging
+
 # --- Dependency Validation ---
 validate_dependencies() {
     log_info "Validating dependencies for container setup..."
@@ -86,6 +102,8 @@ validate_container_state() {
             exit 1
         fi
     fi
+
+    # Check if AppArmor unconfined profile is set properly
     if ! grep -q "lxc.apparmor.profile: unconfined" "/etc/pve/lxc/$container_id.conf"; then
         log_info "Adding AppArmor unconfined profile to container $container_id..."
         echo "lxc.apparmor.profile: unconfined" >> "/etc/pve/lxc/$container_id.conf" || {
@@ -99,7 +117,10 @@ validate_container_state() {
             log_error "Failed to restart container $container_id"
             exit 1
         fi
+    else
+        log_info "AppArmor unconfined profile already set for container $container_id"
     fi
+
     log_info "Container $container_id state validated successfully"
 }
 
@@ -215,10 +236,15 @@ pct_exec_with_retry() {
     local command="$2"
     local max_attempts=3
     local delay=30
+    local attempt=1
 
     while [[ $attempt -le $max_attempts ]]; do
         log_info "pct_exec_with_retry: Executing command in container $container_id (attempt $attempt/$max_attempts)..."
-        if retry_command "$max_attempts" "$delay" "pct exec $container_id -- bash -c '$command'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+        # Use heredoc to handle multi-line commands robustly
+        if pct exec "$container_id" -- bash <<EOF 2>&1 | tee -a "$HYPERVISOR_LOGFILE"
+$command
+EOF
+        then
             log_info "pct_exec_with_retry: Command executed successfully in container $container_id"
             return 0
         else
@@ -291,13 +317,14 @@ show_setup_info() {
 # - Setup Container Environment -
 setup_container_environment() {
     local container_id="$1"
-    log_info "DEBUG setup_container_environment: Setting up environment for container $container_id..."
+    log_info "Setting up environment for container $container_id..."
+    echo "Setting up base environment for container $container_id... This may take a few minutes."
 
     # Start the container if not running
     local status
     status=$(pct status "$container_id" 2>/dev/null | grep 'status' | awk '{print $2}')
     if [[ "$status" != "running" ]]; then
-        log_info "DEBUG setup_container_environment: Starting container $container_id..."
+        log_info "Starting container $container_id..."
         if ! pct start "$container_id"; then
             log_error "setup_container_environment: Failed to start container $container_id"
             return 1
@@ -307,75 +334,119 @@ setup_container_environment() {
 
     # Check network connectivity
     local network_check_cmd="
-        ping -c 4 8.8.8.8 || { echo '[ERROR] Network connectivity check failed'; exit 1; }
-    "
-    if ! retry_command 3 30 "pct exec $container_id -- bash -c '$network_check_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+set -e
+echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+ping -c 4 8.8.8.8 || { echo '[ERROR] Network connectivity check failed'; exit 1; }
+"
+    if ! pct_exec_with_retry "$container_id" "$network_check_cmd"; then
         log_error "setup_container_environment: Network connectivity check failed for container $container_id"
         return 1
     fi
-    log_info "DEBUG setup_container_environment: Network connectivity verified for container $container_id"
+    log_info "Network connectivity verified for container $container_id"
 
     # Update package lists and install base dependencies
     local setup_cmd="
-        set -e
-        export DEBIAN_FRONTEND=noninteractive
-        apt-get update -y
-        apt-get upgrade -y
-        apt-get install -y python3 python3-pip git curl wget docker.io nvtop
-        if apt-cache show python3-huggingface-hub >/dev/null 2>&1; then
-            apt-get install -y python3-huggingface-hub
-        else
-            apt-get install -y pipx
-            pipx install huggingface_hub
-            pipx ensurepath
-        fi
-        systemctl start docker
-        systemctl enable docker
-    "
-    if ! retry_command 3 30 "pct exec $container_id -- bash -c '$setup_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+set -e
+export DEBIAN_FRONTEND=noninteractive
+echo 'nameserver 8.8.8.8' > /etc/resolv.conf
+echo '[INFO] Updating package lists... This may take a few minutes.'
+apt-get update -y --fix-missing || { echo '[ERROR] Failed to update package lists'; exit 1; }
+echo '[INFO] Upgrading packages... This may take a few minutes.'
+apt-get upgrade -y --fix-missing || { echo '[ERROR] Failed to upgrade packages'; exit 1; }
+echo '[INFO] Installing base dependencies... This may take a few minutes.'
+apt-get install -y python3 python3-pip git curl wget docker.io nvtop || { echo '[ERROR] Failed to install base dependencies'; exit 1; }
+if apt-cache show python3-huggingface-hub >/dev/null 2>&1; then
+    apt-get install -y python3-huggingface-hub
+else
+    apt-get install -y pipx
+    pipx install huggingface_hub
+    pipx ensurepath
+fi
+systemctl start docker || true
+systemctl enable docker || true
+"
+    if ! pct_exec_with_retry "$container_id" "$setup_cmd"; then
         log_error "setup_container_environment: Failed to install base dependencies in container $container_id"
         return 1
     fi
 
-    log_info "DEBUG setup_container_environment: Container environment setup completed for $container_id"
+    log_info "Container environment setup completed for $container_id"
+    echo "Base environment setup completed for container $container_id."
     return 0
 }
 
-# - Setup NVIDIA Drivers in Container -
-setup_nvidia_drivers_in_container() {
+# - Setup NVIDIA Packages and Toolkit -
+setup_nvidia_packages() {
     local container_id="$1"
-    local nvidia_driver_version
-    local nvidia_runfile_url
-
-    log_info "DEBUG setup_nvidia_drivers_in_container: Setting up NVIDIA drivers in container $container_id..."
-
-    nvidia_driver_version=$(jq -r '.nvidia_driver_version // empty' "$PHOENIX_LXC_CONFIG_FILE")
-    nvidia_runfile_url=$(jq -r '.nvidia_repo_url // empty' "$PHOENIX_LXC_CONFIG_FILE")
-    if [[ -z "$nvidia_driver_version" ]] || [[ -z "$nvidia_runfile_url" ]]; then
-        log_error "setup_nvidia_drivers_in_container: NVIDIA driver version or runfile URL not specified in $PHOENIX_LXC_CONFIG_FILE"
-        return 1
-    fi
-
-    nvidia_runfile_url="${nvidia_runfile_url}NVIDIA-Linux-x86_64-${nvidia_driver_version}.run"
+    log_info "Installing NVIDIA packages and toolkit in container $container_id..."
+    echo "Installing NVIDIA packages and toolkit for container $container_id... This may take several minutes."
 
     local gpu_assignment
     gpu_assignment=$(get_container_config_value "$container_id" "gpu_assignment") || gpu_assignment="none"
     if [[ "$gpu_assignment" == "none" ]]; then
-        log_info "setup_nvidia_drivers_in_container: No GPU assignment for container $container_id, skipping NVIDIA driver setup."
+        log_info "No GPU assignment for container $container_id, skipping NVIDIA package setup."
         return 0
     fi
 
-    if ! install_nvidia_driver_in_container "$container_id" "$nvidia_driver_version" "$nvidia_runfile_url"; then
-        log_error "setup_nvidia_drivers_in_container: Failed to install/check NVIDIA drivers in container $container_id"
+    # Install CUDA keyring, NVIDIA driver, and container toolkit
+    local nvidia_setup_cmd="
+set -e
+export DEBIAN_FRONTEND=noninteractive
+mkdir -p /etc/apt/keyrings
+if [[ ! -f /etc/apt/keyrings/cuda-archive-keyring.gpg ]]; then
+    echo '[INFO] Downloading CUDA keyring...'
+    wget -qO /etc/apt/keyrings/cuda-archive-keyring.gpg https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-archive-keyring.gpg || { echo '[ERROR] Failed to download CUDA keyring'; exit 1; }
+fi
+if [[ ! -f /etc/apt/sources.list.d/cuda.list ]]; then
+    echo '[INFO] Setting up CUDA repository...'
+    echo 'deb [signed-by=/etc/apt/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /' | tee /etc/apt/sources.list.d/cuda.list > /dev/null
+fi
+echo '[INFO] Updating package lists... This may take a few minutes.'
+apt-get update -y --fix-missing || { echo '[ERROR] Failed to update package lists'; exit 1; }
+if ! dpkg -l | grep -q nvidia-open-580; then
+    echo '[INFO] Installing NVIDIA open driver (580)... This may take a few minutes.'
+    apt-get install -y --no-install-recommends nvidia-open-580 || { echo '[ERROR] Failed to install NVIDIA driver'; exit 1; }
+fi
+if ! dpkg -l | grep -q nvidia-container-toolkit; then
+    echo '[INFO] Installing NVIDIA Container Toolkit... This may take a few minutes.'
+    apt-get install -y nvidia-container-toolkit || { echo '[ERROR] Failed to install NVIDIA Container Toolkit'; exit 1; }
+fi
+if ! dpkg -l | grep -q docker.io; then
+    echo '[INFO] Installing Docker... This may take a few minutes.'
+    apt-get install -y docker.io || { echo '[ERROR] Failed to install Docker'; exit 1; }
+fi
+"
+    if ! pct_exec_with_retry "$container_id" "$nvidia_setup_cmd"; then
+        log_error "setup_nvidia_packages: Failed to install NVIDIA packages in container $container_id"
         return 1
     fi
 
-    if ! retry_command 3 30 "pct exec $container_id -- nvidia-smi" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
-        log_error "setup_nvidia_drivers_in_container: Failed to verify GPU access in container $container_id"
+    # Configure NVIDIA runtime for Docker
+    local nvidia_runtime_cmd="
+set -e
+if ! command -v nvidia-ctk >/dev/null 2>&1; then
+    echo '[ERROR] NVIDIA Container Toolkit not installed'
+    exit 1
+fi
+if [[ ! -f /etc/docker/daemon.json ]]; then
+    echo '[INFO] Configuring NVIDIA runtime for Docker...'
+    nvidia-ctk runtime configure --runtime=nvidia || { echo '[ERROR] Failed to configure NVIDIA runtime'; exit 1; }
+    systemctl restart docker || { echo '[ERROR] Failed to restart Docker'; exit 1; }
+fi
+"
+    if ! pct_exec_with_retry "$container_id" "$nvidia_runtime_cmd"; then
+        log_error "setup_nvidia_packages: Failed to configure NVIDIA runtime for Docker in container $container_id"
         return 1
     fi
 
-    log_info "DEBUG setup_nvidia_drivers_in_container: NVIDIA drivers setup completed for $container_id"
+    # Verify GPU access
+    if ! pct_exec_with_retry "$container_id" "nvidia-smi"; then
+        log_error "setup_nvidia_packages: Failed to verify GPU access in container $container_id"
+        return 1
+    fi
+
+    log_info "NVIDIA packages and toolkit installed successfully for container $container_id"
+    echo "NVIDIA packages and toolkit setup completed for container $container_id."
     return 0
 }
 
@@ -388,7 +459,8 @@ setup_model() {
         return 1
     }
 
-    log_info "DEBUG setup_model: Setting up model $vllm_model in container $container_id..."
+    log_info "Setting up model $vllm_model in container $container_id..."
+    echo "Downloading model $vllm_model for container $container_id... This may take several minutes."
 
     local hf_token=""
     if [[ -f "$PHOENIX_HF_TOKEN_FILE" ]]; then
@@ -402,17 +474,29 @@ setup_model() {
     fi
 
     local model_cmd="
-        set -e
-        mkdir -p /models
-        export HF_TOKEN='$hf_token'
-        /usr/bin/python3 -m huggingface_hub download --repo-type model --local-dir /models/$vllm_model $vllm_model
-    "
-    if ! retry_command 3 30 "pct exec $container_id -- bash -c '$model_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+set -e
+mkdir -p /models
+export HF_TOKEN='$hf_token'
+for i in 1 2 3; do
+    echo \"[INFO] Attempting to download model $vllm_model (attempt \$i)\"
+    if /usr/bin/python3 -m huggingface_hub download --repo-type model --local-dir /models/$vllm_model $vllm_model; then
+        echo '[SUCCESS] Model downloaded successfully'
+        exit 0
+    else
+        echo '[WARNING] Model download failed, retrying in 10 seconds...'
+        sleep 10
+    fi
+done
+echo '[ERROR] Failed to download model after 3 attempts'
+exit 1
+"
+    if ! pct_exec_with_retry "$container_id" "$model_cmd"; then
         log_error "setup_model: Failed to download model $vllm_model in container $container_id"
         return 1
     fi
 
-    log_info "DEBUG setup_model: Model $vllm_model downloaded successfully in container $container_id"
+    log_info "Model $vllm_model downloaded successfully in container $container_id"
+    echo "Model $vllm_model download completed for container $container_id."
     return 0
 }
 
@@ -429,11 +513,23 @@ setup_service() {
     local vllm_quantization_config_type=$(get_container_config_value "$container_id" "vllm_quantization_config_type")
     local vllm_api_port=$(get_container_config_value "$container_id" "vllm_api_port")
 
-    log_info "DEBUG setup_service: Setting up Docker-based vLLM service in container $container_id..."
+    log_info "Setting up Docker-based vLLM service in container $container_id..."
+    echo "Configuring vLLM Docker service for container $container_id..."
+
+    # Ensure AppArmor configuration (already handled in validate_container_state, but keep for robustness)
+    local apparmor_cmd="
+set -e
+if ! grep -q 'lxc.apparmor.profile: unconfined' /etc/pve/lxc/$container_id.conf; then
+    echo 'lxc.apparmor.profile: unconfined' >> /etc/pve/lxc/$container_id.conf
+fi
+"
+    if ! pct_exec_with_retry "$container_id" "$apparmor_cmd"; then
+        log_info "Could not update AppArmor config for container, continuing anyway..."
+    fi
 
     local service_cmd="
-        set -e
-        cat <<EOF > /etc/systemd/system/vllm-docker.service
+set -e
+cat <<EOF > /etc/systemd/system/vllm-docker.service
 [Unit]
 Description=vLLM Docker Container
 After=docker.service
@@ -442,6 +538,7 @@ Requires=docker.service
 [Service]
 ExecStart=/usr/bin/docker run --rm --name vllm \\
     --gpus all \\
+    --runtime=nvidia \\
     -p $vllm_api_port:8000 \\
     -v /models:/models \\
     --shm-size=$vllm_shm_size \\
@@ -459,15 +556,16 @@ Restart=always
 [Install]
 WantedBy=multi-user.target
 EOF
-        systemctl daemon-reload
-        systemctl enable vllm-docker.service
-    "
-    if ! retry_command 3 30 "pct exec $container_id -- bash -c '$service_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+systemctl daemon-reload
+systemctl enable vllm-docker.service
+"
+    if ! pct_exec_with_retry "$container_id" "$service_cmd"; then
         log_error "setup_service: Failed to set up vLLM Docker service in container $container_id"
         return 1
     fi
 
-    log_info "DEBUG setup_service: vLLM Docker service configured successfully in container $container_id"
+    log_info "vLLM Docker service configured successfully in container $container_id"
+    echo "vLLM Docker service configured for container $container_id."
     return 0
 }
 
@@ -477,7 +575,8 @@ validate_final_setup() {
     local checks_passed=0
     local checks_failed=0
 
-    log_info "DEBUG validate_final_setup: Validating final setup for container $container_id..."
+    log_info "Validating final setup for container $container_id..."
+    echo "Validating final setup for container $container_id..."
 
     local status
     status=$(pct status "$container_id" 2>/dev/null | grep 'status' | awk '{print $2}')
@@ -492,11 +591,29 @@ validate_final_setup() {
     local gpu_assignment
     gpu_assignment=$(get_container_config_value "$container_id" "gpu_assignment") || gpu_assignment="none"
     if [[ "$gpu_assignment" != "none" ]]; then
-        if retry_command 3 30 "pct exec $container_id -- nvidia-smi" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+        if pct_exec_with_retry "$container_id" "nvidia-smi"; then
             log_info "validate_final_setup: GPU access verified for container $container_id"
             ((checks_passed++))
         else
             log_error "validate_final_setup: GPU access verification failed for container $container_id"
+            ((checks_failed++))
+        fi
+        # Verify NVIDIA Container Toolkit and Docker GPU access
+        local docker_gpu_check="
+set -e
+if docker run --rm --gpus all --runtime=nvidia nvidia/cuda:12.0-base nvidia-smi >/dev/null 2>&1; then
+    echo '[SUCCESS] Docker GPU access verified'
+    exit 0
+else
+    echo '[ERROR] Docker GPU access verification failed'
+    exit 1
+fi
+"
+        if pct_exec_with_retry "$container_id" "$docker_gpu_check"; then
+            log_info "validate_final_setup: Docker GPU access verified for container $container_id"
+            ((checks_passed++))
+        else
+            log_error "validate_final_setup: Docker GPU access verification failed for container $container_id"
             ((checks_failed++))
         fi
     else
@@ -508,15 +625,16 @@ validate_final_setup() {
     vllm_model=$(get_container_config_value "$container_id" "vllm_model") || vllm_model=""
     if [[ -n "$vllm_model" ]]; then
         local model_check_cmd="
-            if [[ -d \"/models/$vllm_model\" ]]; then
-                echo '[SUCCESS] Model directory exists: /models/$vllm_model'
-                exit 0
-            else
-                echo '[ERROR] Model directory does not exist: /models/$vllm_model'
-                exit 1
-            fi
-        "
-        if retry_command 3 30 "pct exec $container_id -- bash -c '$model_check_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+set -e
+if [[ -d \"/models/$vllm_model\" ]]; then
+    echo '[SUCCESS] Model directory exists: /models/$vllm_model'
+    exit 0
+else
+    echo '[ERROR] Model directory does not exist: /models/$vllm_model'
+    exit 1
+fi
+"
+        if pct_exec_with_retry "$container_id" "$model_check_cmd"; then
             log_info "validate_final_setup: Model directory exists for $vllm_model in container $container_id"
             ((checks_passed++))
         else
@@ -529,15 +647,16 @@ validate_final_setup() {
     fi
 
     local service_check_cmd="
-        if systemctl list-unit-files | grep -q 'vllm-docker.service'; then
-            echo '[SUCCESS] vLLM Docker service is configured'
-            exit 0
-        else
-            echo '[ERROR] vLLM Docker service is not configured'
-            exit 1
-        fi
-    "
-    if retry_command 3 30 "pct exec $container_id -- bash -c '$service_check_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+set -e
+if systemctl list-unit-files | grep -q 'vllm-docker.service'; then
+    echo '[SUCCESS] vLLM Docker service is configured'
+    exit 0
+else
+    echo '[ERROR] vLLM Docker service is not configured'
+    exit 1
+fi
+"
+    if pct_exec_with_retry "$container_id" "$service_check_cmd"; then
         log_info "validate_final_setup: vLLM Docker service is configured in container $container_id"
         ((checks_passed++))
     else
@@ -546,15 +665,16 @@ validate_final_setup() {
     fi
 
     local docker_check_cmd="
-        if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
-            echo '[SUCCESS] Docker is installed and running'
-            exit 0
-        else
-            echo '[ERROR] Docker is not installed or not running'
-            exit 1
-        fi
-    "
-    if retry_command 3 30 "pct exec $container_id -- bash -c '$docker_check_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+set -e
+if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
+    echo '[SUCCESS] Docker is installed and running'
+    exit 0
+else
+    echo '[ERROR] Docker is not installed or not running'
+    exit 1
+fi
+"
+    if pct_exec_with_retry "$container_id" "$docker_check_cmd"; then
         log_info "validate_final_setup: Docker is installed and running in container $container_id"
         ((checks_passed++))
     else
@@ -563,15 +683,16 @@ validate_final_setup() {
     fi
 
     local nvtop_check_cmd="
-        if command -v nvtop >/dev/null 2>&1; then
-            echo '[SUCCESS] nvtop is installed'
-            exit 0
-        else
-            echo '[ERROR] nvtop is not installed'
-            exit 1
-        fi
-    "
-    if retry_command 3 30 "pct exec $container_id -- bash -c '$nvtop_check_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+set -e
+if command -v nvtop >/dev/null 2>&1; then
+    echo '[SUCCESS] nvtop is installed'
+    exit 0
+else
+    echo '[ERROR] nvtop is not installed'
+    exit 1
+fi
+"
+    if pct_exec_with_retry "$container_id" "$nvtop_check_cmd"; then
         log_info "validate_final_setup: nvtop is installed in container $container_id"
         ((checks_passed++))
     else
@@ -584,7 +705,8 @@ validate_final_setup() {
         log_warn "validate_final_setup: Validation completed with $checks_failed failures. Check logs for details."
         return 1
     fi
-    log_info "DEBUG validate_final_setup: All validation checks passed for container $container_id"
+    log_info "All validation checks passed for container $container_id"
+    echo "All validation checks passed for container $container_id."
     return 0
 }
 
@@ -614,24 +736,24 @@ main() {
     echo "==============================================="
     echo "DRDEVSTRAL SETUP FOR CONTAINER $container_id"
     echo "==============================================="
-    log_info "DEBUG Starting drdevstral setup for container $container_id..."
+    log_info "Starting drdevstral setup for container $container_id..."
 
-    log_info "DEBUG Calling validate_dependencies..."
+    log_info "Calling validate_dependencies..."
     validate_dependencies
 
-    log_info "DEBUG Calling validate_container_state..."
+    log_info "Calling validate_container_state..."
     validate_container_state "$container_id"
 
     # Configure GPU passthrough
     local gpu_assignment
     gpu_assignment=$(jq -r ".lxc_configs.\"$container_id\".gpu_assignment // \"none\"" "$PHOENIX_LXC_CONFIG_FILE")
     if [[ -n "$gpu_assignment" && "$gpu_assignment" != "none" ]]; then
-        log_info "DEBUG Configuring GPU passthrough for container $container_id..."
+        log_info "Configuring GPU passthrough for container $container_id..."
         if ! configure_lxc_gpu_passthrough "$container_id" "$gpu_assignment"; then
             log_error "Failed to configure GPU passthrough for container $container_id"
             exit 1
         fi
-        log_info "DEBUG Restarting container $container_id to apply GPU passthrough..."
+        log_info "Restarting container $container_id to apply GPU passthrough..."
         pct stop "$container_id" || true
         sleep 5
         if ! retry_command 3 10 pct start "$container_id"; then
@@ -640,36 +762,37 @@ main() {
         fi
     fi
 
-    log_info "DEBUG Calling validate_container..."
+    log_info "Calling validate_container..."
     validate_container "$container_id"
 
-    log_info "DEBUG Calling show_setup_info..."
+    log_info "Calling show_setup_info..."
     show_setup_info "$container_id"
 
-    log_info "DEBUG Calling setup_container_environment..."
+    log_info "Calling setup_container_environment..."
     if ! setup_container_environment "$container_id"; then
         log_error "phoenix_hypervisor_setup_drdevstral.sh: Container environment setup failed for $container_id"
         exit 1
     fi
 
-    log_info "DEBUG Calling setup_nvidia_drivers_in_container..."
-    if ! setup_nvidia_drivers_in_container "$container_id"; then
-        log_warn "phoenix_hypervisor_setup_drdevstral.sh: NVIDIA driver setup had issues or was skipped for $container_id, continuing with CPU setup"
+    log_info "Calling setup_nvidia_packages..."
+    if ! setup_nvidia_packages "$container_id"; then
+        log_error "phoenix_hypervisor_setup_drdevstral.sh: Failed to install NVIDIA packages for $container_id"
+        exit 1
     fi
 
-    log_info "DEBUG Calling setup_model..."
+    log_info "Calling setup_model..."
     if ! setup_model "$container_id"; then
         log_error "phoenix_hypervisor_setup_drdevstral.sh: Model setup failed for $container_id"
         exit 1
     fi
 
-    log_info "DEBUG Calling setup_service..."
+    log_info "Calling setup_service..."
     if ! setup_service "$container_id"; then
         log_error "phoenix_hypervisor_setup_drdevstral.sh: Service setup failed for $container_id"
         exit 1
     fi
 
-    log_info "DEBUG Calling validate_final_setup..."
+    log_info "Calling validate_final_setup..."
     if ! validate_final_setup "$container_id"; then
         log_warn "phoenix_hypervisor_setup_drdevstral.sh: Final setup validation had warnings for $container_id"
     fi
@@ -678,9 +801,11 @@ main() {
     echo "==============================================="
     echo "DRDEVSTRAL SETUP COMPLETED"
     echo "==============================================="
-    log_info "DEBUG phoenix_hypervisor_setup_drdevstral.sh: drdevstral setup completed successfully for $container_id"
-    log_info "phoenix_hypervisor_setup_drdevstral.sh: You can now start the service with: pct exec $container_id -- systemctl start vllm-docker.service"
-    log_info "phoenix_hypervisor_setup_drdevstral.sh: Check status with: pct exec $container_id -- systemctl status vllm-docker.service"
+    log_info "drdevstral setup completed successfully for $container_id"
+    log_info "You can now start the service with: pct exec $container_id -- systemctl start vllm-docker.service"
+    log_info "Check status with: pct exec $container_id -- systemctl status vllm-docker.service"
+    echo "You can now start the vLLM service with: pct exec $container_id -- systemctl start vllm-docker.service"
+    echo "Check service status with: pct exec $container_id -- systemctl status vllm-docker.service"
     echo "==============================================="
 }
 
