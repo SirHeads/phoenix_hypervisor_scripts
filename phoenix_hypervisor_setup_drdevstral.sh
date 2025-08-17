@@ -1,8 +1,7 @@
-```bash
 #!/bin/bash
 # Container-specific setup script for drdevstral (LXC ID 901)
 # Installs NVIDIA drivers, vLLM, and sets up the AI model
-# Version: 1.7.5
+# Version: 1.7.6
 # Author: Assistant
 
 set -euo pipefail
@@ -22,7 +21,7 @@ else
         if declare -f log_warn > /dev/null 2>&1; then
             log_warn "phoenix_hypervisor_setup_drdevstral.sh: Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh"
         else
-             echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh" >&2
+            echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh" >&2
         fi
     else
         echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Configuration file not found: /usr/local/etc/phoenix_hypervisor_config.sh or ./phoenix_hypervisor_config.sh" >&2
@@ -45,7 +44,7 @@ elif [[ -f "./phoenix_hypervisor_common.sh" ]]; then
     if declare -f log_warn > /dev/null 2>&1; then
         log_warn "phoenix_hypervisor_setup_drdevstral.sh: Sourced common functions from current directory. Prefer standard locations."
     else
-         echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced common functions from current directory. Prefer standard locations." >&2
+        echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced common functions from current directory. Prefer standard locations." >&2
     fi
 else
     echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Common functions file not found in standard locations." >&2
@@ -56,12 +55,12 @@ fi
 if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_lxc_common_nvidia.sh" ]]; then
     source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_lxc_common_nvidia.sh
 elif [[ -f "./phoenix_hypervisor_lxc_common_nvidia.sh" ]]; then
-     source ./phoenix_hypervisor_lxc_common_nvidia.sh
-     if declare -f log_warn > /dev/null 2>&1; then
-         log_warn "phoenix_hypervisor_setup_drdevstral.sh: Sourced LXC NVIDIA functions from current directory. Prefer /usr/local/lib/phoenix_hypervisor/."
-     else
-          echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced LXC NVIDIA functions from current directory. Prefer /usr/local/lib/phoenix_hypervisor/." >&2
-     fi
+    source ./phoenix_hypervisor_lxc_common_nvidia.sh
+    if declare -f log_warn > /dev/null 2>&1; then
+        log_warn "phoenix_hypervisor_setup_drdevstral.sh: Sourced LXC NVIDIA functions from current directory. Prefer /usr/local/lib/phoenix_hypervisor/."
+    else
+        echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced LXC NVIDIA functions from current directory. Prefer /usr/local/lib/phoenix_hypervisor/." >&2
+    fi
 else
     echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Required LXC NVIDIA functions file (phoenix_hypervisor_lxc_common_nvidia.sh) not found." >&2
     exit 1
@@ -81,8 +80,11 @@ validate_container_state() {
     local container_id="$1"
     log_info "Validating container $container_id state..."
     if ! pct status "$container_id" | grep -q "running"; then
-        log_error "Container $container_id is not running"
-        exit 1
+        log_info "Container $container_id is not running, attempting to start..."
+        if ! retry_command 3 10 pct start "$container_id"; then
+            log_error "Failed to start container $container_id"
+            exit 1
+        fi
     fi
     if ! grep -q "lxc.apparmor.profile: unconfined" "/etc/pve/lxc/$container_id.conf"; then
         log_info "Adding AppArmor unconfined profile to container $container_id..."
@@ -93,15 +95,10 @@ validate_container_state() {
         log_info "Restarting container $container_id to apply AppArmor profile..."
         pct stop "$container_id" || true
         sleep 5
-        if ! pct start "$container_id"; then
+        if ! retry_command 3 10 pct start "$container_id"; then
             log_error "Failed to restart container $container_id"
             exit 1
         fi
-        sleep 10
-        if ! pct status "$container_id" | grep -q "running"; then
-            log_error "Container $container_id failed to start after AppArmor profile update"
-            exit 1
-        }
     fi
     log_info "Container $container_id state validated successfully"
 }
@@ -120,12 +117,12 @@ validate_container() {
 
     log_info "DEBUG validate_container: PHOENIX_LXC_CONFIG_FILE=$PHOENIX_LXC_CONFIG_FILE"
     if [[ ! -f "$PHOENIX_LXC_CONFIG_FILE" ]]; then
-         log_error "DEBUG validate_container: Config file does not exist or is not a regular file."
-         return 1
+        log_error "DEBUG validate_container: Config file does not exist or is not a regular file."
+        return 1
     fi
     if [[ ! -r "$PHOENIX_LXC_CONFIG_FILE" ]]; then
-         log_error "DEBUG validate_container: Config file is not readable."
-         return 1
+        log_error "DEBUG validate_container: Config file is not readable."
+        return 1
     fi
 
     log_info "DEBUG validate_container: Fetching config for container $container_id"
@@ -217,7 +214,6 @@ pct_exec_with_retry() {
     local container_id="$1"
     local command="$2"
     local max_attempts=3
-    local attempt=1
     local delay=30
 
     while [[ $attempt -le $max_attempts ]]; do
@@ -295,13 +291,13 @@ show_setup_info() {
 # - Setup Container Environment -
 setup_container_environment() {
     local container_id="$1"
-    log_info "setup_container_environment: Setting up environment for container $container_id..."
+    log_info "DEBUG setup_container_environment: Setting up environment for container $container_id..."
 
     # Start the container if not running
     local status
     status=$(pct status "$container_id" 2>/dev/null | grep 'status' | awk '{print $2}')
     if [[ "$status" != "running" ]]; then
-        log_info "setup_container_environment: Starting container $container_id..."
+        log_info "DEBUG setup_container_environment: Starting container $container_id..."
         if ! pct start "$container_id"; then
             log_error "setup_container_environment: Failed to start container $container_id"
             return 1
@@ -309,12 +305,23 @@ setup_container_environment() {
         sleep 10
     fi
 
+    # Check network connectivity
+    local network_check_cmd="
+        ping -c 4 8.8.8.8 || { echo '[ERROR] Network connectivity check failed'; exit 1; }
+    "
+    if ! retry_command 3 30 "pct exec $container_id -- bash -c '$network_check_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+        log_error "setup_container_environment: Network connectivity check failed for container $container_id"
+        return 1
+    fi
+    log_info "DEBUG setup_container_environment: Network connectivity verified for container $container_id"
+
     # Update package lists and install base dependencies
     local setup_cmd="
         set -e
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -y
-        apt-get install -y python3 python3-pip git curl wget
+        apt-get upgrade -y
+        apt-get install -y python3 python3-pip git curl wget docker.io nvtop
         if apt-cache show python3-huggingface-hub >/dev/null 2>&1; then
             apt-get install -y python3-huggingface-hub
         else
@@ -322,14 +329,15 @@ setup_container_environment() {
             pipx install huggingface_hub
             pipx ensurepath
         fi
-        apt-get install -y docker.io
+        systemctl start docker
+        systemctl enable docker
     "
     if ! retry_command 3 30 "pct exec $container_id -- bash -c '$setup_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
         log_error "setup_container_environment: Failed to install base dependencies in container $container_id"
         return 1
     fi
 
-    log_info "setup_container_environment: Container environment setup completed for $container_id"
+    log_info "DEBUG setup_container_environment: Container environment setup completed for $container_id"
     return 0
 }
 
@@ -339,7 +347,7 @@ setup_nvidia_drivers_in_container() {
     local nvidia_driver_version
     local nvidia_runfile_url
 
-    log_info "setup_nvidia_drivers_in_container: Setting up NVIDIA drivers in container $container_id..."
+    log_info "DEBUG setup_nvidia_drivers_in_container: Setting up NVIDIA drivers in container $container_id..."
 
     nvidia_driver_version=$(jq -r '.nvidia_driver_version // empty' "$PHOENIX_LXC_CONFIG_FILE")
     nvidia_runfile_url=$(jq -r '.nvidia_repo_url // empty' "$PHOENIX_LXC_CONFIG_FILE")
@@ -367,7 +375,7 @@ setup_nvidia_drivers_in_container() {
         return 1
     fi
 
-    log_info "setup_nvidia_drivers_in_container: NVIDIA drivers setup completed for $container_id"
+    log_info "DEBUG setup_nvidia_drivers_in_container: NVIDIA drivers setup completed for $container_id"
     return 0
 }
 
@@ -380,7 +388,7 @@ setup_model() {
         return 1
     }
 
-    log_info "setup_model: Setting up model $vllm_model in container $container_id..."
+    log_info "DEBUG setup_model: Setting up model $vllm_model in container $container_id..."
 
     local hf_token=""
     if [[ -f "$PHOENIX_HF_TOKEN_FILE" ]]; then
@@ -404,7 +412,7 @@ setup_model() {
         return 1
     fi
 
-    log_info "setup_model: Model $vllm_model downloaded successfully in container $container_id"
+    log_info "DEBUG setup_model: Model $vllm_model downloaded successfully in container $container_id"
     return 0
 }
 
@@ -421,7 +429,7 @@ setup_service() {
     local vllm_quantization_config_type=$(get_container_config_value "$container_id" "vllm_quantization_config_type")
     local vllm_api_port=$(get_container_config_value "$container_id" "vllm_api_port")
 
-    log_info "setup_service: Setting up Docker-based vLLM service in container $container_id..."
+    log_info "DEBUG setup_service: Setting up Docker-based vLLM service in container $container_id..."
 
     local service_cmd="
         set -e
@@ -459,7 +467,7 @@ EOF
         return 1
     fi
 
-    log_info "setup_service: vLLM Docker service configured successfully in container $container_id"
+    log_info "DEBUG setup_service: vLLM Docker service configured successfully in container $container_id"
     return 0
 }
 
@@ -469,7 +477,7 @@ validate_final_setup() {
     local checks_passed=0
     local checks_failed=0
 
-    log_info "validate_final_setup: Validating final setup for container $container_id..."
+    log_info "DEBUG validate_final_setup: Validating final setup for container $container_id..."
 
     local status
     status=$(pct status "$container_id" 2>/dev/null | grep 'status' | awk '{print $2}')
@@ -537,12 +545,46 @@ validate_final_setup() {
         ((checks_failed++))
     fi
 
+    local docker_check_cmd="
+        if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
+            echo '[SUCCESS] Docker is installed and running'
+            exit 0
+        else
+            echo '[ERROR] Docker is not installed or not running'
+            exit 1
+        fi
+    "
+    if retry_command 3 30 "pct exec $container_id -- bash -c '$docker_check_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+        log_info "validate_final_setup: Docker is installed and running in container $container_id"
+        ((checks_passed++))
+    else
+        log_error "validate_final_setup: Docker check failed in container $container_id"
+        ((checks_failed++))
+    fi
+
+    local nvtop_check_cmd="
+        if command -v nvtop >/dev/null 2>&1; then
+            echo '[SUCCESS] nvtop is installed'
+            exit 0
+        else
+            echo '[ERROR] nvtop is not installed'
+            exit 1
+        fi
+    "
+    if retry_command 3 30 "pct exec $container_id -- bash -c '$nvtop_check_cmd'" 2>&1 | tee -a "$PHOENIX_LOG_FILE"; then
+        log_info "validate_final_setup: nvtop is installed in container $container_id"
+        ((checks_passed++))
+    else
+        log_error "validate_final_setup: nvtop check failed in container $container_id"
+        ((checks_failed++))
+    fi
+
     log_info "validate_final_setup: Validation summary: $checks_passed passed, $checks_failed failed"
     if [[ $checks_failed -gt 0 ]]; then
         log_warn "validate_final_setup: Validation completed with $checks_failed failures. Check logs for details."
         return 1
     fi
-    log_info "validate_final_setup: All validation checks passed for container $container_id"
+    log_info "DEBUG validate_final_setup: All validation checks passed for container $container_id"
     return 0
 }
 
@@ -572,72 +614,75 @@ main() {
     echo "==============================================="
     echo "DRDEVSTRAL SETUP FOR CONTAINER $container_id"
     echo "==============================================="
-    log_info "Starting drdevstral setup for container $container_id..."
+    log_info "DEBUG Starting drdevstral setup for container $container_id..."
 
+    log_info "DEBUG Calling validate_dependencies..."
     validate_dependencies
+
+    log_info "DEBUG Calling validate_container_state..."
     validate_container_state "$container_id"
+
+    # Configure GPU passthrough
+    local gpu_assignment
+    gpu_assignment=$(jq -r ".lxc_configs.\"$container_id\".gpu_assignment // \"none\"" "$PHOENIX_LXC_CONFIG_FILE")
+    if [[ -n "$gpu_assignment" && "$gpu_assignment" != "none" ]]; then
+        log_info "DEBUG Configuring GPU passthrough for container $container_id..."
+        if ! configure_lxc_gpu_passthrough "$container_id" "$gpu_assignment"; then
+            log_error "Failed to configure GPU passthrough for container $container_id"
+            exit 1
+        fi
+        log_info "DEBUG Restarting container $container_id to apply GPU passthrough..."
+        pct stop "$container_id" || true
+        sleep 5
+        if ! retry_command 3 10 pct start "$container_id"; then
+            log_error "Failed to restart container $container_id after GPU passthrough"
+            exit 1
+        fi
+    fi
+
+    log_info "DEBUG Calling validate_container..."
     validate_container "$container_id"
+
+    log_info "DEBUG Calling show_setup_info..."
     show_setup_info "$container_id"
 
+    log_info "DEBUG Calling setup_container_environment..."
     if ! setup_container_environment "$container_id"; then
-        if declare -f log_error > /dev/null 2>&1; then
-            log_error "phoenix_hypervisor_setup_drdevstral.sh: Container environment setup failed for $container_id"
-        else
-            echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Container environment setup failed for $container_id" >&2
-        fi
+        log_error "phoenix_hypervisor_setup_drdevstral.sh: Container environment setup failed for $container_id"
         exit 1
     fi
 
+    log_info "DEBUG Calling setup_nvidia_drivers_in_container..."
     if ! setup_nvidia_drivers_in_container "$container_id"; then
-        if declare -f log_warn > /dev/null 2>&1; then
-            log_warn "phoenix_hypervisor_setup_drdevstral.sh: NVIDIA driver setup had issues or was skipped for $container_id, continuing with CPU setup"
-        else
-            echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: NVIDIA driver setup had issues or was skipped for $container_id, continuing with CPU setup" >&2
-        fi
+        log_warn "phoenix_hypervisor_setup_drdevstral.sh: NVIDIA driver setup had issues or was skipped for $container_id, continuing with CPU setup"
     fi
 
+    log_info "DEBUG Calling setup_model..."
     if ! setup_model "$container_id"; then
-        if declare -f log_error > /dev/null 2>&1; then
-            log_error "phoenix_hypervisor_setup_drdevstral.sh: Model setup failed for $container_id"
-        else
-            echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Model setup failed for $container_id" >&2
-        fi
+        log_error "phoenix_hypervisor_setup_drdevstral.sh: Model setup failed for $container_id"
         exit 1
     fi
 
+    log_info "DEBUG Calling setup_service..."
     if ! setup_service "$container_id"; then
-        if declare -f log_error > /dev/null 2>&1; then
-            log_error "phoenix_hypervisor_setup_drdevstral.sh: Service setup failed for $container_id"
-        else
-            echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Service setup failed for $container_id" >&2
-        fi
+        log_error "phoenix_hypervisor_setup_drdevstral.sh: Service setup failed for $container_id"
         exit 1
     fi
 
+    log_info "DEBUG Calling validate_final_setup..."
     if ! validate_final_setup "$container_id"; then
-        if declare -f log_warn > /dev/null 2>&1; then
-            log_warn "phoenix_hypervisor_setup_drdevstral.sh: Final setup validation had warnings for $container_id"
-        else
-            echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Final setup validation had warnings for $container_id" >&2
-        fi
+        log_warn "phoenix_hypervisor_setup_drdevstral.sh: Final setup validation had warnings for $container_id"
     fi
 
     echo ""
     echo "==============================================="
     echo "DRDEVSTRAL SETUP COMPLETED"
     echo "==============================================="
-    if declare -f log_info > /dev/null 2>&1; then
-        log_info "phoenix_hypervisor_setup_drdevstral.sh: drdevstral setup completed successfully for container $container_id"
-        log_info "phoenix_hypervisor_setup_drdevstral.sh: You can now start the service with: pct exec $container_id -- systemctl start vllm-docker.service"
-        log_info "phoenix_hypervisor_setup_drdevstral.sh: Check status with: pct exec $container_id -- systemctl status vllm-docker.service"
-    else
-        echo "[INFO] phoenix_hypervisor_setup_drdevstral.sh: drdevstral setup completed successfully for container $container_id"
-        echo "[INFO] phoenix_hypervisor_setup_drdevstral.sh: You can now start the service with: pct exec $container_id -- systemctl start vllm-docker.service"
-        echo "[INFO] phoenix_hypervisor_setup_drdevstral.sh: Check status with: pct exec $container_id -- systemctl status vllm-docker.service"
-    fi
+    log_info "DEBUG phoenix_hypervisor_setup_drdevstral.sh: drdevstral setup completed successfully for $container_id"
+    log_info "phoenix_hypervisor_setup_drdevstral.sh: You can now start the service with: pct exec $container_id -- systemctl start vllm-docker.service"
+    log_info "phoenix_hypervisor_setup_drdevstral.sh: Check status with: pct exec $container_id -- systemctl status vllm-docker.service"
     echo "==============================================="
 }
 
 # Call main function with the passed argument
 main "$1"
-```

@@ -22,7 +22,8 @@
             "vllm_quantization_config_type": "int8",
             "vllm_api_port": 8000,
             "setup_script": "/usr/local/bin/phoenix_hypervisor_setup_drdevstral.sh",
-            "gpu_assignment": "0,1"
+            "gpu_assignment": "0,1",
+            "swap": 512
         }
     }
 }

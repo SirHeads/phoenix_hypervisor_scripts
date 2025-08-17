@@ -87,21 +87,16 @@ fi
 # This is the core action, delegating to the shared library.
 if declare -f create_lxc_container > /dev/null; then
     if create_lxc_container "$container_id" "$container_config"; then
-        # Use log function if available, else echo
-        if declare -f log_info > /dev/null 2>&1; then
-            log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id created and configured successfully."
-        else
-            echo "[INFO] phoenix_hypervisor_create_lxc.sh: Container $container_id created and configured successfully."
+        log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id created and configured successfully."
+        log_info "phoenix_hypervisor_create_lxc.sh: Starting container $container_id..."
+        if ! retry_command 3 10 pct start "$container_id"; then
+            log_error "phoenix_hypervisor_create_lxc.sh: Failed to start container $container_id."
+            exit 1
         fi
+        log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id started successfully."
         exit 0
     else
-        # The function should log its own errors, but we can add a final one here
-        # Use log function if available, else echo
-        if declare -f log_error > /dev/null 2>&1; then
-            log_error "phoenix_hypervisor_create_lxc.sh: Failed to create or configure container $container_id."
-        else
-            echo "[ERROR] phoenix_hypervisor_create_lxc.sh: Failed to create or configure container $container_id." >&2
-        fi
+        log_error "phoenix_hypervisor_create_lxc.sh: Failed to create or configure container $container_id."
         exit 1
     fi
 else

@@ -83,6 +83,10 @@
                         },
                         "gpu_assignment": {
                             "type": "string"
+                        },
+                        "swap": {
+                            "type": "integer",
+                            "description": "Swap memory size in MB for the container"
                         }
                     },
                     "required": [
