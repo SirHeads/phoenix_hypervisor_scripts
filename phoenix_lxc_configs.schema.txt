@@ -1,107 +1,146 @@
 {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "$id": "https://example.com/phoenix_lxc_configs.schema.json",
-    "title": "Phoenix Hypervisor LXC Configuration",
-    "description": "Schema for defining LXC containers and their configurations for the Phoenix Hypervisor",
+    "$schema": "http://json-schema.org/draft-07/schema#",
     "type": "object",
     "properties": {
-        "$schema": {
-            "type": "string"
-        },
         "nvidia_driver_version": {
             "type": "string",
-            "description": "NVIDIA driver version to use for all containers",
+            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
             "default": "580.65.06"
         },
         "nvidia_repo_url": {
             "type": "string",
-            "description": "NVIDIA repository URL for driver installation",
-            "default": "http://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/"
+            "format": "uri",
+            "default": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/"
         },
         "lxc_configs": {
             "type": "object",
-            "patternProperties": {
-                "^[0-9]+$": {
-                    "type": "object",
-                    "properties": {
-                        "name": {
-                            "type": "string"
-                        },
-                        "memory_mb": {
-                            "type": "integer"
-                        },
-                        "cores": {
-                            "type": "integer"
-                        },
-                        "template": {
-                            "type": "string"
-                        },
-                        "storage_pool": {
-                            "type": "string"
-                        },
-                        "storage_size_gb": {
-                            "type": ["integer", "string"]
-                        },
-                        "network_config": {
-                            "type": "string"
-                        },
-                        "features": {
-                            "type": "string"
-                        },
-                        "vllm_model": {
-                            "type": "string"
-                        },
-                        "vllm_tensor_parallel_size": {
-                            "type": "string"
-                        },
-                        "vllm_max_model_len": {
-                            "type": "string"
-                        },
-                        "vllm_kv_cache_dtype": {
-                            "type": "string"
-                        },
-                        "vllm_shm_size": {
-                            "type": "string"
-                        },
-                        "vllm_gpu_count": {
-                            "type": "string"
-                        },
-                        "vllm_quantization": {
-                            "type": "string"
-                        },
-                        "vllm_quantization_config_type": {
-                            "type": "string"
-                        },
-                        "vllm_api_port": {
-                            "type": "integer"
-                        },
-                        "setup_script": {
-                            "type": "string"
-                        },
-                        "gpu_assignment": {
-                            "type": "string"
-                        },
-                        "swap": {
-                            "type": "integer",
-                            "description": "Swap memory size in MB for the container"
-                        }
+            "additionalProperties": {
+                "type": "object",
+                "properties": {
+                    "name": {
+                        "type": "string",
+                        "minLength": 1
                     },
-                    "required": [
-                        "name",
-                        "memory_mb",
-                        "cores",
-                        "template",
-                        "storage_pool",
-                        "storage_size_gb",
-                        "network_config",
-                        "features"
-                    ],
-                    "additionalProperties": false
-                }
-            },
-            "additionalProperties": false
+                    "memory_mb": {
+                        "type": "integer",
+                        "minimum": 512
+                    },
+                    "cores": {
+                        "type": "integer",
+                        "minimum": 1
+                    },
+                    "template": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "storage_pool": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "storage_size_gb": {
+                        "type": "integer",
+                        "minimum": 10
+                    },
+                    "network_config": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "features": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "gpu_assignment": {
+                        "type": "string",
+                        "pattern": "^([0-9]+(,[0-9]+)*|none)$",
+                        "default": "none"
+                    },
+                    "vllm_model": {
+                        "type": "string",
+                        "minLength": 1
+                    },
+                    "vllm_tensor_parallel_size": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 1
+                    },
+                    "vllm_max_model_len": {
+                        "type": "integer",
+                        "minimum": 64,
+                        "default": 128
+                    },
+                    "vllm_kv_cache_dtype": {
+                        "type": "string",
+                        "enum": [
+                            "auto",
+                            "fp8",
+                            "fp16"
+                        ],
+                        "default": "auto"
+                    },
+                    "vllm_shm_size": {
+                        "type": "string",
+                        "pattern": "^[0-9]+[mg]$",
+                        "default": "8g"
+                    },
+                    "vllm_gpu_count": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "default": 1
+                    },
+                    "vllm_api_port": {
+                        "type": "integer",
+                        "minimum": 1024,
+                        "maximum": 65535,
+                        "default": 8000
+                    },
+                    "vllm_gpu_memory_utilization": {
+                        "type": "number",
+                        "minimum": 0.0,
+                        "maximum": 1.0,
+                        "default": 0.8
+                    },
+                    "vllm_dtype": {
+                        "type": "string",
+                        "enum": [
+                            "float16",
+                            "bfloat16",
+                            "float32"
+                        ],
+                        "default": "float16"
+                    },
+                    "vllm_attention_backend": {
+                        "type": "string",
+                        "enum": [
+                            "FLASHINFER",
+                            "XFORMERS",
+                            "TORCH"
+                        ],
+                        "default": "FLASHINFER"
+                    },
+                    "vllm_nccl_so_path": {
+                        "type": "string",
+                        "minLength": 1,
+                        "default": "/root/.config/vllm/nccl/cu13/libnccl.so"
+                    }
+                },
+                "required": [
+                    "name",
+                    "memory_mb",
+                    "cores",
+                    "template",
+                    "storage_pool",
+                    "storage_size_gb",
+                    "network_config",
+                    "features",
+                    "vllm_model",
+                    "vllm_api_port"
+                ]
+            }
         }
     },
-    "required": ["lxc_configs"],
-    "additionalProperties": false
+    "required": [
+        "nvidia_driver_version",
+        "nvidia_repo_url",
+        "lxc_configs"
+    ]
 }

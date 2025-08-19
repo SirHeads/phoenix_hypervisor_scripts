@@ -1,29 +1,29 @@
 {
     "$schema": "/usr/local/etc/phoenix_lxc_configs.schema.json",
     "nvidia_driver_version": "580.65.06",
-    "nvidia_repo_url": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/",
+    "nvidia_repo_url": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/  ",
     "lxc_configs": {
         "901": {
-            "name": "drdevstral",
+            "name": "vllmQwen25C-7B",
             "memory_mb": 32768,
             "cores": 8,
             "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
             "storage_pool": "lxc-disks",
-            "storage_size_gb": "64",
+            "storage_size_gb": 64,
             "network_config": "10.0.0.111/24,10.0.0.1,8.8.8.8",
             "features": "nesting=1,keyctl=1",
-            "vllm_model": "mistralai/Mistral-7B-Instruct-v0.2",
-            "vllm_tensor_parallel_size": "2",
-            "vllm_max_model_len": "16384",
-            "vllm_kv_cache_dtype": "fp8",
-            "vllm_shm_size": "10.24gb",
-            "vllm_gpu_count": "2",
-            "vllm_quantization": "bitsandbytes",
-            "vllm_quantization_config_type": "int8",
-            "vllm_api_port": 8000,
-            "setup_script": "/usr/local/bin/phoenix_hypervisor_setup_drdevstral.sh",
             "gpu_assignment": "0,1",
-            "swap": 512
+            "vllm_model": "/models/Qwen/Qwen2.5-Coder-7B-Instruct",
+            "vllm_tensor_parallel_size": 2,
+            "vllm_max_model_len": 128,
+            "vllm_kv_cache_dtype": "fp8",
+            "vllm_shm_size": "8g",
+            "vllm_gpu_count": 2,
+            "vllm_api_port": 8000,
+            "vllm_gpu_memory_utilization": 0.8,
+            "vllm_dtype": "float16",
+            "vllm_attention_backend": "FLASHINFER",
+            "vllm_nccl_so_path": "/usr/lib/x86_64-linux-gnu/libnccl.so"
         }
     }
 }

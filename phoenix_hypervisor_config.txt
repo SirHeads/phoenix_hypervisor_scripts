@@ -1,7 +1,7 @@
 #!/bin/bash
 # Configuration file for Phoenix Hypervisor
 # Defines essential file paths and default settings
-# Version: 1.7.4
+# Version: 1.8.0
 # Author: Assistant
 
 # --- Core Paths ---
@@ -58,6 +58,31 @@ export DEFAULT_GPU_ASSIGNMENT="${DEFAULT_GPU_ASSIGNMENT:-}"
 # Key: LXC ID, Value: Comma-separated GPU indices (e.g., "0", "1", "0,1")
 # Declaring it here ensures it exists. Initialization can happen dynamically or from JSON.
 declare -gA PHOENIX_GPU_ASSIGNMENTS
+
+# --- Default vLLM Configuration ---
+# Default vLLM Docker image tag
+export DEFAULT_VLLM_IMAGE="${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13}"
+
+# Default vLLM maximum model length
+export DEFAULT_VLLM_MAX_MODEL_LEN="${DEFAULT_VLLM_MAX_MODEL_LEN:-128}"
+
+# Default vLLM shared memory size
+export DEFAULT_VLLM_SHM_SIZE="${DEFAULT_VLLM_SHM_SIZE:-8g}"
+
+# Default vLLM GPU memory utilization (0.0 to 1.0)
+export DEFAULT_VLLM_GPU_MEMORY_UTILIZATION="${DEFAULT_VLLM_GPU_MEMORY_UTILIZATION:-0.8}"
+
+# Default vLLM data type
+export DEFAULT_VLLM_DTYPE="${DEFAULT_VLLM_DTYPE:-float16}"
+
+# Default vLLM attention backend
+export DEFAULT_VLLM_ATTENTION_BACKEND="${DEFAULT_VLLM_ATTENTION_BACKEND:-FLASHINFER}"
+
+# Default vLLM NCCL shared object path
+export DEFAULT_VLLM_NCCL_SO_PATH="${DEFAULT_VLLM_NCCL_SO_PATH:-/root/.config/vllm/nccl/cu13/libnccl.so}"
+
+# Default vLLM disable custom all-reduce
+export DEFAULT_VLLM_DISABLE_CUSTOM_ALL_REDUCE="${DEFAULT_VLLM_DISABLE_CUSTOM_ALL_REDUCE:-true}"
 
 # --- Security and Debugging Flags ---
 # Rollback on failure flag (set to "true" to enable)
