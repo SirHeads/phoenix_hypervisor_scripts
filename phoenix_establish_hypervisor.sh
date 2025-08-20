@@ -1,7 +1,7 @@
 #!/bin/bash
 # Main script to establish Phoenix Hypervisor
 # Creates and configures LXC containers based on phoenix_lxc_configs.json
-# Version: 1.7.10 (Improved Directory Handling)
+# Version: 1.7.11 (Added support for container ID 902)
 # Author: Assistant
 
 set -euo pipefail
@@ -150,6 +150,18 @@ create_containers() {
                 fi
                 exit 1
             fi
+        # --- NEW: Specific setup for container ID 902 ---
+        elif [[ "$id" == "902" ]]; then
+            log_info "Setting up llamacpp container $id..."
+            if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_llamacpp.sh "$id"; then
+                log_error "Failed to set up llamacpp container $id."
+                if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
+                    log_info "Rolling back by destroying container $id..."
+                    /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
+                fi
+                exit 1
+            fi
+        # --- END NEW ---
         fi
         log_info "Container $id created and configured successfully."
     done

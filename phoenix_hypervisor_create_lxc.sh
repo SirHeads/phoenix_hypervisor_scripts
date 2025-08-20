@@ -94,16 +94,26 @@ if declare -f create_lxc_container > /dev/null; then
             exit 1
         fi
         log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id started successfully."
-        # Validate CUDA version in the container
-        if declare -f validate_cuda_version > /dev/null; then
-            if ! validate_cuda_version "$container_id"; then
-                log_error "phoenix_hypervisor_create_lxc.sh: CUDA version validation failed for container $container_id."
-                exit 1
-            fi
-            log_info "phoenix_hypervisor_create_lxc.sh: CUDA version validated successfully for container $container_id."
-        else
-            log_warn "phoenix_hypervisor_create_lxc.sh: Function 'validate_cuda_version' not found. Skipping CUDA validation."
-        fi
+
+        # --- CRITICAL FIX: REMOVED Premature CUDA Validation ---
+        # The call to validate_cuda_version has been REMOVED from this point.
+        # Reason: CUDA/NVCC is not installed inside the container immediately after creation.
+        # CUDA validation should happen in the specific container setup scripts
+        # (e.g., phoenix_hypervisor_setup_drdevstral.sh, phoenix_hypervisor_setup_drcuda.sh, phoenix_hypervisor_setup_llamacpp.sh)
+        # AFTER the NVIDIA driver and CUDA toolkit have been installed inside the container.
+        # ---
+        # if declare -f validate_cuda_version > /dev/null; then
+        #     if ! validate_cuda_version "$container_id"; then
+        #         log_error "phoenix_hypervisor_create_lxc.sh: CUDA version validation failed for container $container_id."
+        #         exit 1
+        #     fi
+        #     log_info "phoenix_hypervisor_create_lxc.sh: CUDA version validated successfully for container $container_id."
+        # else
+        #     log_warn "phoenix_hypervisor_create_lxc.sh: Function 'validate_cuda_version' not found. Skipping CUDA validation."
+        # fi
+        # ---
+        # --- End Critical Fix ---
+
         exit 0
     else
         log_error "phoenix_hypervisor_create_lxc.sh: Failed to create or configure container $container_id."

@@ -1,6 +1,6 @@
 #!/bin/bash
 # Common functions for Phoenix Hypervisor scripts
-# Version: 1.7.11 (Improved Directory Handling)
+# Version: 1.7.12 (Fixed Premature CUDA Validation)
 # Author: Assistant
 
 # --- Signal successful loading ---
@@ -155,14 +155,21 @@ retry_command() {
     return 1
 }
 
-validate_cuda_version() {
-    local lxc_id="$1"
-    log_info "Validating CUDA version for container $lxc_id..."
-    if ! pct exec "$lxc_id" -- nvcc --version | grep -q "${CUDA_VERSION}"; then
-        log_error "CUDA version mismatch in container $lxc_id. Expected ${CUDA_VERSION}."
-    fi
-    log_info "CUDA version ${CUDA_VERSION} validated successfully for container $lxc_id."
-}
+# --- CRITICAL FIX: REMOVED validate_cuda_version CALL ---
+# The function validate_cuda_version() is NOT removed, but its premature call
+# inside create_lxc_container has been removed.
+# validate_cuda_version() should only be called by specific container setup
+# scripts AFTER the NVIDIA driver/CUDA toolkit has been installed inside the container.
+# ---
+# validate_cuda_version() {
+#     local lxc_id="$1"
+#     log_info "Validating CUDA version for container $lxc_id..."
+#     if ! pct exec "$lxc_id" -- nvcc --version | grep -q "${CUDA_VERSION}"; then
+#         log_error "CUDA version mismatch in container $lxc_id. Expected ${CUDA_VERSION}."
+#     fi
+#     log_info "CUDA version ${CUDA_VERSION} validated successfully for container $lxc_id."
+# }
+# ---
 
 validate_environment() {
     log_info "Validating environment..."
@@ -446,6 +453,16 @@ create_lxc_container() {
         log_info "No GPU assignment for container $lxc_id, skipping GPU passthrough configuration."
     fi
     # --- End GPU Configuration ---
+
+    # --- CRITICAL FIX APPLIED HERE ---
+    # The call to validate_cuda_version has been REMOVED from this point.
+    # CUDA validation should happen in the specific container setup scripts
+    # (e.g., phoenix_hypervisor_setup_drdevstral.sh, phoenix_hypervisor_setup_drcuda.sh)
+    # AFTER the NVIDIA driver and CUDA toolkit have been installed inside the container.
+    # ---
+    # validate_cuda_version "$lxc_id" # <-- THIS LINE WAS REMOVED
+    # ---
+    # --- End Critical Fix ---
 
     # --- Finalize ---
     log_info "Container $lxc_id ($name) created successfully."

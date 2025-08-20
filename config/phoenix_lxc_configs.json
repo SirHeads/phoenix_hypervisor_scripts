@@ -1,13 +1,13 @@
 {
     "$schema": "/usr/local/etc/phoenix_lxc_configs.schema.json",
-    "nvidia_driver_version": "575.57.08",
-    "nvidia_repo_url": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/",
+    "nvidia_driver_version": "580.76.05",
+    "nvidia_repo_url": "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/",
     "lxc_configs": {
         "901": {
             "name": "vllmQwen25C-7B",
             "memory_mb": 32768,
             "cores": 8,
-            "template": "/fastData/shared-iso/template/cache/ubuntu-25.04-standard_25.04-1.1_amd64.tar.zst",
+            "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
             "storage_pool": "lxc-disks",
             "storage_size_gb": 64,
             "network_config": "10.0.0.111/24,10.0.0.1,8.8.8.8",
@@ -29,7 +29,7 @@
             "name": "DrCuda",
             "memory_mb": 32768,
             "cores": 8,
-            "template": "/fastData/shared-iso/template/cache/ubuntu-25.04-standard_25.04-1.1_amd64.tar.zst",
+            "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
             "storage_pool": "lxc-disks",
             "storage_size_gb": 20,
             "network_config": "10.0.0.110/24,10.0.0.1,8.8.8.8",
@@ -46,6 +46,17 @@
             "vllm_dtype": "float16",
             "vllm_attention_backend": "TORCH",
             "vllm_nccl_so_path": "/usr/lib/x86_64-linux-gnu/libnccl.so"
+        },
+        "902": {
+            "name": "llamacpp",
+            "memory_mb": 32768,
+            "cores": 8,
+            "template": "/fastData/shared-iso/template/cache/ubuntu-24.10-standard_24.10-1_amd64.tar.zst",
+            "storage_pool": "lxc-disks",
+            "storage_size_gb": 64,
+            "network_config": "10.0.0.112/24,10.0.0.1,8.8.8.8",
+            "features": "nesting=1,keyctl=1",
+            "gpu_assignment": "0,1"
         }
     }
 }

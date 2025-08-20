@@ -3,10 +3,10 @@
 # phoenix_hypervisor_setup_drdevstral.sh
 #
 # Container-specific setup script for drdevstral (LXC ID 901)
-# Installs NVIDIA drivers, toolkit, Docker, vLLM, and sets up the AI model service.
+# Installs NVIDIA drivers (580.76.05 via runfile), toolkit (12.8), Docker, vLLM, and sets up the AI model service.
 # This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
 #
-# Version: 1.9.0 (Refactored to use common libraries)
+# Version: 1.10.0 (Updated for Driver 580.76.05, CUDA 12.8, Refactored NVIDIA Setup)
 # Author: Assistant
 
 set -euo pipefail
@@ -24,7 +24,7 @@ fi
 
 CONTAINER_ID="$1"
 if [[ "$CONTAINER_ID" != "901" ]]; then
-    echo "[ERROR] This script is designed for container ID 901, got $container_id" >&2
+    echo "[ERROR] This script is designed for container ID 901, got $CONTAINER_ID" >&2
     exit 1
 fi
 
@@ -306,49 +306,66 @@ validate_container_state() {
     fi
 }
 
-# 3. Setup NVIDIA Packages (adapted from original)
+# 3. Setup NVIDIA Packages (UPDATED for project requirements)
 setup_nvidia_packages() {
     local lxc_id="$1"
-    log_info "setup_nvidia_packages: Installing NVIDIA components in container $lxc_id..."
+    log_info "setup_nvidia_packages: Installing NVIDIA components (Driver 580.76.05, CUDA 12.8) in container $lxc_id..."
 
-    # Install NVIDIA driver via repository (preferred method)
-    log_info "setup_nvidia_packages: Installing NVIDIA driver via repository..."
-    if ! setup_nvidia_repo_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA driver via repository in container $lxc_id."
+    # --- NEW: Install NVIDIA driver 580.76.05 via runfile (no kernel module) ---
+    log_info "setup_nvidia_packages: Installing NVIDIA driver 580.76.05 via runfile (no kernel module)..."
+    if ! install_nvidia_driver_in_container_via_runfile "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install NVIDIA driver via runfile in container $lxc_id."
     fi
 
-    # Install NVIDIA userland libraries
-    log_info "setup_nvidia_packages: Installing NVIDIA userland libraries..."
-    if ! install_nvidia_userland_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA userland in container $lxc_id."
+    # --- NEW: Install CUDA Toolkit 12.8 ---
+    log_info "setup_nvidia_packages: Installing CUDA Toolkit 12.8..."
+    if ! install_cuda_toolkit_12_8_in_container "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install CUDA Toolkit 12.8 in container $lxc_id."
     fi
 
-    # Install NVIDIA Container Toolkit (nvidia-docker2)
+    # --- Install NVIDIA Container Toolkit (nvidia-docker2) ---
     log_info "setup_nvidia_packages: Installing NVIDIA Container Toolkit..."
     if ! install_nvidia_toolkit_in_container "$lxc_id"; then
         log_error "setup_nvidia_packages: Failed to install NVIDIA toolkit in container $lxc_id."
     fi
 
-    # Configure Docker to use NVIDIA runtime
+    # --- Configure Docker to use NVIDIA runtime ---
     log_info "setup_nvidia_packages: Configuring Docker NVIDIA runtime..."
     if ! configure_docker_nvidia_runtime "$lxc_id"; then
         log_error "setup_nvidia_packages: Failed to configure Docker NVIDIA runtime in container $lxc_id."
     fi
 
-    # Verify basic GPU access inside the container
+    # --- Verify basic GPU access inside the container ---
     log_info "setup_nvidia_packages: Verifying basic GPU access in container $lxc_id..."
     if ! verify_lxc_gpu_access_in_container "$lxc_id"; then
         log_error "setup_nvidia_packages: Basic GPU access verification failed in container $lxc_id."
     fi
 
-    # Install NCCL library for multi-GPU communication
-    log_info "setup_nvidia_packages: Installing NCCL library..."
-    if ! install_nccl_library_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NCCL library in container $lxc_id."
+    # --- Verify CUDA Toolkit installation (nvcc) ---
+    log_info "setup_nvidia_packages: Verifying CUDA Toolkit installation (nvcc) in container $lxc_id..."
+    local nvcc_check_cmd="set -e
+if command -v nvcc >/dev/null 2>&1; then
+    nvcc_version=\$(nvcc --version | grep 'release' | awk '{print \$5}' | sed 's/,//')
+    echo \"[SUCCESS] nvcc found, version: \$nvcc_version\"
+    exit 0
+else
+    echo '[ERROR] nvcc not found'
+    exit 1
+fi"
+
+    # Use pct_exec_with_retry if available
+    local exec_func="pct exec"
+    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
+        exec_func="pct_exec_with_retry"
     fi
 
-    log_info "setup_nvidia_packages: NVIDIA components installed and configured successfully in container $lxc_id."
+    if ! $exec_func "$lxc_id" -- bash -c "$nvcc_check_cmd"; then
+        log_error "setup_nvidia_packages: CUDA Toolkit verification (nvcc) failed in container $lxc_id."
+    fi
+
+    log_info "setup_nvidia_packages: NVIDIA components (Driver 580.76.05, CUDA 12.8) installed and verified successfully in container $lxc_id."
 }
+
 
 # 4. Setup Model (adapted from original)
 setup_model() {
@@ -722,7 +739,7 @@ main() {
     # 2. Validate Container State (Create if needed, Start, Network, GPU Passthrough)
     validate_container_state "$lxc_id"
 
-    # 3. Setup NVIDIA Packages (Driver, Userland, Toolkit, Docker Runtime, NCCL)
+    # 3. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA 12.8, Toolkit, Docker Runtime)
     setup_nvidia_packages "$lxc_id"
 
     # 4. Install Docker CE

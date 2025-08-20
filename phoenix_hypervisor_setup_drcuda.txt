@@ -2,10 +2,10 @@
 
 # phoenix_hypervisor_setup_drcuda.sh
 #
-# Sets up the DrCuda container (ID 900) with Docker, NVIDIA support, and a PyTorch environment.
+# Sets up the DrCuda container (ID 900) with Docker, NVIDIA support (Driver 580.76.05, CUDA 12.8), and a PyTorch environment.
 # This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
 #
-# Version: 1.1.0 (Refactored to use common libraries)
+# Version: 1.2.0 (Updated for Driver 580.76.05, CUDA 12.8, PyTorch CUDA 12.8)
 # Author: Assistant
 
 set -euo pipefail
@@ -259,32 +259,56 @@ validate_container_state() {
     fi
 
     # Check and Configure GPU Passthrough
-    # Get GPU assignment from the global config (as DrCuda might not have it in its specific section)
-    # Or, we can assume it's configured correctly by the main orchestrator or create script.
-    # For now, let's assume it's handled by the create script or already configured.
-    # A more robust check would involve parsing the main config file for container 900's assignment.
-    # Placeholder for potential future enhancement:
-    # local gpu_assignment=$(get_gpu_assignment "$lxc_id") # This would need a helper function
-    # if [[ -n "$gpu_assignment" && "$gpu_assignment" != "none" ]]; then ...
-    # For now, we assume it's set up correctly.
-    log_info "validate_container_state: Assuming GPU passthrough is configured for container $lxc_id (as per main config)."
-}
-
-# 3. Setup NVIDIA Packages (adapted from original drcuda and drdevstral logic)
-setup_nvidia_packages() {
-    local lxc_id="$1"
-    log_info "setup_nvidia_packages: Installing NVIDIA components in container $lxc_id..."
-
-    # Install NVIDIA driver via repository (preferred method, consistent with drdevstral)
-    log_info "setup_nvidia_packages: Installing NVIDIA driver via repository..."
-    if ! setup_nvidia_repo_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA driver via repository in container $lxc_id."
+    # Get GPU assignment from the main config
+    local gpu_assignment
+    gpu_assignment=$(get_gpu_assignment "$lxc_id")
+    if [[ "$gpu_assignment" == "none" || -z "$gpu_assignment" ]]; then
+        log_info "validate_container_state: No GPU assignment found for container $lxc_id. Skipping GPU passthrough."
+        return 0
     fi
 
-    # Install NVIDIA userland libraries
-    log_info "setup_nvidia_packages: Installing NVIDIA userland libraries..."
-    if ! install_nvidia_userland_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA userland in container $lxc_id."
+    # Validate GPU assignment format
+    if ! validate_gpu_assignment "$lxc_id" "$gpu_assignment"; then
+        log_error "validate_container_state: Invalid GPU assignment for container $lxc_id: $gpu_assignment"
+    fi
+
+    # Check if GPU passthrough is already configured by looking for a common entry
+    local config_file="/etc/pve/lxc/${lxc_id}.conf"
+    local gpu_configured
+    gpu_configured=$(pct config "$lxc_id" | grep -c "lxc.cgroup2.devices.allow: c 195" || true)
+
+    if [[ "$gpu_configured" -gt 0 ]]; then
+        log_info "validate_container_state: GPU passthrough already configured for container $lxc_id."
+    else
+        log_info "validate_container_state: Configuring GPU passthrough for container $lxc_id (GPUs: $gpu_assignment)..."
+        if ! configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
+            log_error "validate_container_state: Failed to configure GPU passthrough for container $lxc_id."
+        fi
+        log_info "validate_container_state: GPU passthrough configured. Restarting container $lxc_id to apply changes..."
+        pct stop "$lxc_id" || true
+        sleep 5
+        if ! retry_command 3 10 pct start "$lxc_id"; then
+            log_error "validate_container_state: Failed to restart container $lxc_id after GPU passthrough configuration."
+        fi
+        log_info "validate_container_state: Container $lxc_id restarted with GPU passthrough."
+    fi
+}
+
+# 3. Setup NVIDIA Packages (using NEW project-required functions)
+setup_nvidia_packages() {
+    local lxc_id="$1"
+    log_info "setup_nvidia_packages: Installing NVIDIA components (Driver 580.76.05, CUDA 12.8) in container $lxc_id..."
+
+    # Install NVIDIA driver 580.76.05 via runfile (NEW FUNCTION)
+    log_info "setup_nvidia_packages: Installing NVIDIA driver 580.76.05 via runfile (no kernel module)..."
+    if ! install_nvidia_driver_in_container_via_runfile "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install NVIDIA driver via runfile in container $lxc_id."
+    fi
+
+    # Install CUDA Toolkit 12.8 (NEW FUNCTION)
+    log_info "setup_nvidia_packages: Installing CUDA Toolkit 12.8..."
+    if ! install_cuda_toolkit_12_8_in_container "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install CUDA Toolkit 12.8 in container $lxc_id."
     fi
 
     # Install NVIDIA Container Toolkit (nvidia-docker2)
@@ -305,7 +329,29 @@ setup_nvidia_packages() {
         log_error "setup_nvidia_packages: Basic GPU access verification failed in container $lxc_id."
     fi
 
-    log_info "setup_nvidia_packages: NVIDIA components installed and configured successfully in container $lxc_id."
+    # Verify CUDA Toolkit installation (nvcc)
+    log_info "setup_nvidia_packages: Verifying CUDA Toolkit installation (nvcc) in container $lxc_id..."
+    local nvcc_check_cmd="set -e
+if command -v nvcc >/dev/null 2>&1; then
+    nvcc_version=\$(nvcc --version | grep 'release' | awk '{print \$5}' | sed 's/,//')
+    echo \"[SUCCESS] nvcc found, version: \$nvcc_version\"
+    exit 0
+else
+    echo '[ERROR] nvcc not found'
+    exit 1
+fi"
+
+    # Use pct_exec_with_retry if available
+    local exec_func="pct exec"
+    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
+        exec_func="pct_exec_with_retry"
+    fi
+
+    if ! $exec_func "$lxc_id" -- bash -c "$nvcc_check_cmd"; then
+        log_error "setup_nvidia_packages: CUDA Toolkit verification (nvcc) failed in container $lxc_id."
+    fi
+
+    log_info "setup_nvidia_packages: NVIDIA components (Driver 580.76.05, CUDA 12.8) installed and verified successfully in container $lxc_id."
 }
 
 # 4. Install Docker CE (using common function)
@@ -320,28 +366,32 @@ install_docker_in_container() {
     log_info "install_docker_in_container: Docker CE installed successfully in container $lxc_id."
 }
 
-# 5. Build PyTorch Docker Image (from original drcuda, adapted)
+# 5. Build PyTorch Docker Image (Updated for CUDA 12.8)
 build_pytorch_docker_image() {
     local lxc_id="$1"
     log_info "build_pytorch_docker_image: Building PyTorch Docker image in container $lxc_id..."
 
-    local image_tag="pytorch-cuda:12.9" # Using CUDA 12.9 as per config and original script
+    # Updated for CUDA 12.8
+    local image_tag="pytorch-cuda:12.8"
     local dockerfile_path="/root/pytorch_dockerfile"
 
     # Define the Dockerfile content directly as a string
-    # Using CUDA 12.9 PyTorch image as an example, matching config and original script
-    local dockerfile_content="FROM nvidia/cuda:12.9.0-base-ubuntu24.04
+    # Using CUDA 12.8 PyTorch image as an example
+    # Note: PyTorch's cu124 index URL is often used for CUDA 12.8 compatible builds.
+    # Alternatively, a generic wheel or the closest available (cu129) might work.
+    local dockerfile_content='FROM nvidia/cuda:12.8.0-base-ubuntu24.04
 
 # Install additional tools if needed
 RUN apt-get update && apt-get install -y --no-install-recommends \
     python3 python3-pip \
     && rm -rf /var/lib/apt/lists/*
 
-# Install PyTorch for CUDA 12.9 (matching the base image)
-RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu129
+# Install PyTorch for CUDA 12.4/12.8 (using cu124 index which is often compatible)
+# Check https://download.pytorch.org/whl/cu124 or https://download.pytorch.org/whl/torch_stable.html for latest
+RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124
 
 # Set a default command (can be overridden)
-CMD [\"bash\"]"
+CMD ["bash"]'
 
     # Write the Dockerfile content to a file inside the container
     local write_dockerfile_cmd="set -e
@@ -400,8 +450,8 @@ fi"
     fi
 
     # --- Check GPU Access via Docker ---
-    # Use a standard CUDA base image for testing (matching the PyTorch image base)
-    if verify_docker_gpu_access_in_container "$lxc_id" "nvidia/cuda:12.9.0-base-ubuntu24.04"; then
+    # Use a standard CUDA base image for testing (matching the PyTorch image base updated for CUDA 12.8)
+    if verify_docker_gpu_access_in_container "$lxc_id" "nvidia/cuda:12.8.0-base-ubuntu24.04"; then
         log_info "validate_final_setup: Docker GPU access verified for container $lxc_id"
         ((checks_passed++)) || true
     else
@@ -428,11 +478,13 @@ show_setup_info() {
     echo "==============================================="
     echo "DR CUDA SETUP COMPLETED FOR CONTAINER $lxc_id"
     echo "==============================================="
-    echo "PyTorch Docker Image: pytorch-cuda:12.9 (built inside container)"
+    # Updated image tag
+    echo "PyTorch Docker Image: pytorch-cuda:12.8 (built inside container)"
     echo ""
     echo "You can now run PyTorch jobs using Docker inside the container."
     echo "Example command to test:"
-    echo "  pct exec $lxc_id -- docker run --rm --gpus all pytorch-cuda:12.9 python3 -c \"import torch; print(torch.cuda.is_available())\""
+    # Updated example command
+    echo "  pct exec $lxc_id -- docker run --rm --gpus all pytorch-cuda:12.8 python3 -c \"import torch; print(torch.cuda.is_available())\""
     echo ""
     echo "To enter the container:"
     echo "  pct enter $lxc_id"
@@ -454,13 +506,13 @@ main() {
     # 2. Validate Container State (Create if needed, Start, Network, GPU Passthrough)
     validate_container_state "$lxc_id"
 
-    # 3. Setup NVIDIA Packages (Driver, Userland, Toolkit, Docker Runtime)
+    # 3. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA 12.8, Toolkit, Docker Runtime)
     setup_nvidia_packages "$lxc_id"
 
     # 4. Install Docker CE
     install_docker_in_container "$lxc_id"
 
-    # 5. Build PyTorch Docker Image
+    # 5. Build PyTorch Docker Image (Updated for CUDA 12.8)
     build_pytorch_docker_image "$lxc_id"
 
     # 6. Validate Final Setup

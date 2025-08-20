@@ -5,12 +5,12 @@
         "nvidia_driver_version": {
             "type": "string",
             "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-            "default": "575.57.08"
+            "default": "580.76.05"
         },
         "nvidia_repo_url": {
             "type": "string",
             "format": "uri",
-            "default": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/"
+            "default": "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/"
         },
         "lxc_configs": {
             "type": "object",
@@ -131,11 +131,17 @@
                     "storage_pool",
                     "storage_size_gb",
                     "network_config",
-                    "features",
-                    "vllm_model",
-                    "vllm_api_port"
+                    "features"
+                    // Removed vllm_model and vllm_api_port from required as they are not needed for all container types (e.g., llamacpp)
                 ]
             }
+            // Optional: Add patternProperties for stricter key validation (e.g., keys must be numeric strings)
+            // "patternProperties": {
+            //   "^[0-9]+$": {
+            //     "type": "object"
+            //     // ... (properties definition can be repeated here or rely on additionalProperties)
+            //   }
+            // }
         }
     },
     "required": [

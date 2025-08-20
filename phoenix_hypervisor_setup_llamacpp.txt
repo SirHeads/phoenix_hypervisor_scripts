@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 
-# phoenix_hypervisor_setup_drcuda.sh
+# phoenix_hypervisor_setup_llamacpp.sh
 #
-# Sets up the DrCuda container (ID 900) with Docker, NVIDIA support (Driver 580.76.05, CUDA 12.8), and a PyTorch environment.
+# Sets up the llamacpp container (ID 902) with NVIDIA support (Driver 580.76.05, CUDA 12.8) and builds llama.cpp.
 # This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
 #
-# Version: 1.2.0 (Updated for Driver 580.76.05, CUDA 12.8, PyTorch CUDA 12.8)
+# Version: 1.0.0 (Initial for Project Requirements)
 # Author: Assistant
 
 set -euo pipefail
@@ -22,8 +22,8 @@ if [[ $# -ne 1 ]]; then
 fi
 
 CONTAINER_ID="$1"
-if [[ "$CONTAINER_ID" != "900" ]]; then
-    echo "[ERROR] This script is designed for container ID 900, got $CONTAINER_ID" >&2
+if [[ "$CONTAINER_ID" != "902" ]]; then
+    echo "[ERROR] This script is designed for container ID 902, got $CONTAINER_ID" >&2
     exit 1
 fi
 
@@ -68,7 +68,7 @@ for common_path in \
         source "$common_path"
         if declare -F log_info >/dev/null 2>&1; then
             PHOENIX_COMMON_LOADED=1
-            log_info "phoenix_hypervisor_setup_drcuda.sh: Sourced common functions from $common_path."
+            log_info "phoenix_hypervisor_setup_llamacpp.sh: Sourced common functions from $common_path."
             break
         else
             echo "[WARN] Sourced $common_path, but common functions not found. Trying next location."
@@ -97,7 +97,7 @@ for nvidia_path in \
         source "$nvidia_path"
         if declare -F install_nvidia_driver_in_container_via_runfile >/dev/null 2>&1; then
             PHOENIX_NVIDIA_LOADED=1
-            log_info "phoenix_hypervisor_setup_drcuda.sh: Sourced NVIDIA LXC common functions from $nvidia_path."
+            log_info "phoenix_hypervisor_setup_llamacpp.sh: Sourced NVIDIA LXC common functions from $nvidia_path."
             break
         else
             log_warn "Sourced $nvidia_path, but NVIDIA functions not found. Trying next location."
@@ -120,7 +120,7 @@ for base_path in \
         source "$base_path"
         if declare -F pct_exec_with_retry >/dev/null 2>&1; then
             PHOENIX_BASE_LOADED=1
-            log_info "phoenix_hypervisor_setup_drcuda.sh: Sourced Base LXC common functions from $base_path."
+            log_info "phoenix_hypervisor_setup_llamacpp.sh: Sourced Base LXC common functions from $base_path."
             break
         else
             log_warn "Sourced $base_path, but Base LXC functions not found. Trying next location."
@@ -142,7 +142,7 @@ for docker_path in \
         source "$docker_path"
         if declare -F install_docker_ce_in_container >/dev/null 2>&1; then
             PHOENIX_DOCKER_LOADED=1
-            log_info "phoenix_hypervisor_setup_drcuda.sh: Sourced Docker LXC common functions from $docker_path."
+            log_info "phoenix_hypervisor_setup_llamacpp.sh: Sourced Docker LXC common functions from $docker_path."
             break
         else
             log_warn "Sourced $docker_path, but Docker LXC functions not found. Trying next location."
@@ -150,8 +150,9 @@ for docker_path in \
     fi
 done
 
+# Loading Docker lib is optional for this script if Docker isn't used directly
 if [[ $PHOENIX_DOCKER_LOADED -ne 1 ]]; then
-    log_error "Failed to load phoenix_hypervisor_lxc_common_docker.sh. Cannot proceed with Docker operations."
+    log_warn "Failed to load phoenix_hypervisor_lxc_common_docker.sh. This might be OK if not needed."
 fi
 
 # Source Validation LXC Common Functions
@@ -164,7 +165,7 @@ for validation_path in \
         source "$validation_path"
         if declare -F validate_container_exists >/dev/null 2>&1; then
             PHOENIX_VALIDATION_LOADED=1
-            log_info "phoenix_hypervisor_setup_drcuda.sh: Sourced Validation LXC common functions from $validation_path."
+            log_info "phoenix_hypervisor_setup_llamacpp.sh: Sourced Validation LXC common functions from $validation_path."
             break
         else
             log_warn "Sourced $validation_path, but Validation LXC functions not found. Trying next location."
@@ -186,7 +187,7 @@ for systemd_path in \
         source "$systemd_path"
         if declare -F create_systemd_service_in_container >/dev/null 2>&1; then
             PHOENIX_SYSTEMD_LOADED=1
-            log_info "phoenix_hypervisor_setup_drcuda.sh: Sourced Systemd LXC common functions from $systemd_path."
+            log_info "phoenix_hypervisor_setup_llamacpp.sh: Sourced Systemd LXC common functions from $systemd_path."
             break
         else
             log_warn "Sourced $systemd_path, but Systemd LXC functions not found. Trying next location."
@@ -223,6 +224,7 @@ validate_container_state() {
     if ! validate_container_exists "$lxc_id"; then
         log_info "validate_container_state: Container $lxc_id does not exist. Calling phoenix_hypervisor_create_lxc.sh..."
         # Delegate creation to the standard script
+        # Handle potential premature CUDA validation failure gracefully
         if ! "$PHOENIX_BIN_DIR/phoenix_hypervisor_create_lxc.sh" "$lxc_id"; then
              # Check if the failure was due to the premature CUDA validation in create_lxc.sh
              # We expect it to fail here, so we check if the container was actually created and started.
@@ -259,7 +261,7 @@ validate_container_state() {
     fi
 
     # Check and Configure GPU Passthrough
-    # Get GPU assignment from the main config
+    # Get GPU assignment from config
     local gpu_assignment
     gpu_assignment=$(get_gpu_assignment "$lxc_id")
     if [[ "$gpu_assignment" == "none" || -z "$gpu_assignment" ]]; then
@@ -268,8 +270,8 @@ validate_container_state() {
     fi
 
     # Validate GPU assignment format
-    if ! validate_gpu_assignment "$lxc_id" "$gpu_assignment"; then
-        log_error "validate_container_state: Invalid GPU assignment for container $lxc_id: $gpu_assignment"
+    if ! validate_gpu_assignment_format "$gpu_assignment"; then
+        log_error "validate_container_state: Invalid GPU assignment format for container $lxc_id: $gpu_assignment"
     fi
 
     # Check if GPU passthrough is already configured by looking for a common entry
@@ -294,33 +296,59 @@ validate_container_state() {
     fi
 }
 
-# 3. Setup NVIDIA Packages (using NEW project-required functions)
+# 3. Install Build Dependencies and Tools in Container
+install_build_dependencies() {
+    local lxc_id="$1"
+    log_info "install_build_dependencies: Installing build tools and dependencies in container $lxc_id..."
+
+    local install_cmd="set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y --fix-missing
+apt-get install -y git build-essential cmake curl python3 python3-pip wget
+# Install CUDA development toolkit 12.8 (assuming common function exists)
+# This step might be moved to after NVIDIA driver installation if needed
+echo '[SUCCESS] Build dependencies installed.'
+"
+
+    # Use pct_exec_with_retry if available
+    local exec_func="pct exec"
+    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
+        exec_func="pct_exec_with_retry"
+    fi
+
+    if ! $exec_func "$lxc_id" -- bash -c "$install_cmd"; then
+        log_error "install_build_dependencies: Failed to install build dependencies in container $lxc_id."
+    fi
+
+    log_info "install_build_dependencies: Build tools and dependencies installed successfully in container $lxc_id."
+}
+
+
+# 4. Setup NVIDIA Packages (Driver via Runfile, CUDA Toolkit 12.8)
 setup_nvidia_packages() {
     local lxc_id="$1"
     log_info "setup_nvidia_packages: Installing NVIDIA components (Driver 580.76.05, CUDA 12.8) in container $lxc_id..."
 
-    # Install NVIDIA driver 580.76.05 via runfile (NEW FUNCTION)
+    # Install NVIDIA driver via runfile (NEW FUNCTION)
     log_info "setup_nvidia_packages: Installing NVIDIA driver 580.76.05 via runfile (no kernel module)..."
-    if ! install_nvidia_driver_in_container_via_runfile "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA driver via runfile in container $lxc_id."
+    # Ensure the new function name is used
+    if declare -F install_nvidia_driver_in_container_via_runfile >/dev/null 2>&1; then
+        if ! install_nvidia_driver_in_container_via_runfile "$lxc_id"; then
+            log_error "setup_nvidia_packages: Failed to install NVIDIA driver via runfile in container $lxc_id."
+        fi
+    else
+        log_error "setup_nvidia_packages: Required function 'install_nvidia_driver_in_container_via_runfile' not found. Please update phoenix_hypervisor_lxc_common_nvidia.sh."
     fi
 
     # Install CUDA Toolkit 12.8 (NEW FUNCTION)
     log_info "setup_nvidia_packages: Installing CUDA Toolkit 12.8..."
-    if ! install_cuda_toolkit_12_8_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install CUDA Toolkit 12.8 in container $lxc_id."
-    fi
-
-    # Install NVIDIA Container Toolkit (nvidia-docker2)
-    log_info "setup_nvidia_packages: Installing NVIDIA Container Toolkit..."
-    if ! install_nvidia_toolkit_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA toolkit in container $lxc_id."
-    fi
-
-    # Configure Docker to use NVIDIA runtime
-    log_info "setup_nvidia_packages: Configuring Docker NVIDIA runtime..."
-    if ! configure_docker_nvidia_runtime "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to configure Docker NVIDIA runtime in container $lxc_id."
+    # Ensure the new function name is used
+    if declare -F install_cuda_toolkit_12_8_in_container >/dev/null 2>&1; then
+        if ! install_cuda_toolkit_12_8_in_container "$lxc_id"; then
+            log_error "setup_nvidia_packages: Failed to install CUDA Toolkit 12.8 in container $lxc_id."
+        fi
+    else
+        log_error "setup_nvidia_packages: Required function 'install_cuda_toolkit_12_8_in_container' not found. Please update phoenix_hypervisor_lxc_common_nvidia.sh."
     fi
 
     # Verify basic GPU access inside the container
@@ -354,67 +382,86 @@ fi"
     log_info "setup_nvidia_packages: NVIDIA components (Driver 580.76.05, CUDA 12.8) installed and verified successfully in container $lxc_id."
 }
 
-# 4. Install Docker CE (using common function)
-install_docker_in_container() {
-    local lxc_id="$1"
-    log_info "install_docker_in_container: Installing Docker CE in container $lxc_id..."
 
-    if ! install_docker_ce_in_container "$lxc_id"; then
-        log_error "install_docker_in_container: Failed to install Docker CE in container $lxc_id."
+# 5. Build llama.cpp in Container
+build_llama_cpp() {
+    local lxc_id="$1"
+    log_info "build_llama_cpp: Building llama.cpp in container $lxc_id..."
+
+    local build_cmd="set -e
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
+
+# Create a working directory
+mkdir -p /opt/ai
+cd /opt/ai
+
+# Clone the llama.cpp repository
+echo '[INFO] Cloning llama.cpp repository...'
+git clone https://github.com/ggml-org/llama.cpp
+cd llama.cpp
+
+# Create build directory and configure with CUDA and CURL support
+echo '[INFO] Configuring build with CUDA and CURL support...'
+cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=ON
+
+# Build the project
+echo '[INFO] Building llama.cpp (this may take a while)...'
+cmake --build build --config Release -j \$(nproc)
+
+echo '[SUCCESS] llama.cpp built successfully.'
+"
+
+    # Use pct_exec_with_retry if available
+    local exec_func="pct exec"
+    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
+        exec_func="pct_exec_with_retry"
     fi
 
-    log_info "install_docker_in_container: Docker CE installed successfully in container $lxc_id."
+     # Note: Building can take a long time, consider increasing retry delays or attempts if needed.
+    if ! $exec_func "$lxc_id" -- bash -c "$build_cmd"; then
+        log_error "build_llama_cpp: Failed to build llama.cpp in container $lxc_id."
+    fi
+
+    log_info "build_llama_cpp: llama.cpp built successfully in container $lxc_id."
 }
 
-# 5. Build PyTorch Docker Image (Updated for CUDA 12.8)
-build_pytorch_docker_image() {
+# 6. Install Python Bindings (llama-cpp-python) in Container
+install_python_bindings() {
     local lxc_id="$1"
-    log_info "build_pytorch_docker_image: Building PyTorch Docker image in container $lxc_id..."
+    log_info "install_python_bindings: Installing llama-cpp-python in container $lxc_id..."
 
-    # Updated for CUDA 12.8
-    local image_tag="pytorch-cuda:12.8"
-    local dockerfile_path="/root/pytorch_dockerfile"
+    local install_cmd="set -e
+export LC_ALL=C.UTF-8
+export LANG=C.UTF-8
 
-    # Define the Dockerfile content directly as a string
-    # Using CUDA 12.8 PyTorch image as an example
-    # Note: PyTorch's cu124 index URL is often used for CUDA 12.8 compatible builds.
-    # Alternatively, a generic wheel or the closest available (cu129) might work.
-    local dockerfile_content='FROM nvidia/cuda:12.8.0-base-ubuntu24.04
+# Update pip
+pip3 install --upgrade pip
 
-# Install additional tools if needed
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip \
-    && rm -rf /var/lib/apt/lists/*
+# Install llama-cpp-python with CUDA support
+# Note: CUDA autodetection usually works, but CMAKE_ARGS can force it if needed
+echo '[INFO] Installing llama-cpp-python with CUDA support...'
+# CMAKE_ARGS=\"-DGGML_CUDA=on\" pip3 install llama-cpp-python # Alternative if auto-detect fails
+pip3 install llama-cpp-python
 
-# Install PyTorch for CUDA 12.4/12.8 (using cu124 index which is often compatible)
-# Check https://download.pytorch.org/whl/cu124 or https://download.pytorch.org/whl/torch_stable.html for latest
-RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+echo '[SUCCESS] llama-cpp-python installed.'
+"
 
-# Set a default command (can be overridden)
-CMD ["bash"]'
-
-    # Write the Dockerfile content to a file inside the container
-    local write_dockerfile_cmd="set -e
-mkdir -p /root/pytorch_build
-cat << 'EOF_DOCKERFILE' > $dockerfile_path
-$dockerfile_content
-EOF_DOCKERFILE
-echo '[INFO] Dockerfile written to $dockerfile_path'"
-
-    if ! pct_exec_with_retry "$lxc_id" "$write_dockerfile_cmd"; then
-        log_error "build_pytorch_docker_image: Failed to write Dockerfile in container $lxc_id."
+    # Use pct_exec_with_retry if available
+    local exec_func="pct exec"
+    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
+        exec_func="pct_exec_with_retry"
     fi
 
-    # Build the Docker image inside the container using the written Dockerfile
-    # Using the function from the Docker common library
-    if ! build_docker_image_in_container "$lxc_id" "$dockerfile_path" "$image_tag"; then
-        log_error "build_pytorch_docker_image: Failed to build PyTorch Docker image in container $lxc_id."
+    if ! $exec_func "$lxc_id" -- bash -c "$install_cmd"; then
+        log_error "install_python_bindings: Failed to install llama-cpp-python in container $lxc_id."
     fi
 
-    log_info "build_pytorch_docker_image: PyTorch Docker image built successfully in container $lxc_id."
+    log_info "install_python_bindings: llama-cpp-python installed successfully in container $lxc_id."
 }
 
-# 6. Final Validation (adapted from drdevstral)
+
+# 7. Final Validation
 validate_final_setup() {
     local lxc_id="$1"
     local checks_passed=0
@@ -423,39 +470,99 @@ validate_final_setup() {
     log_info "validate_final_setup: Validating final setup for container $lxc_id..."
     echo "Validating final setup for container $lxc_id..."
 
-    # --- Check Container Status ---
-    if validate_container_running "$lxc_id"; then
-        log_info "validate_final_setup: Container $lxc_id is running"
-        ((checks_passed++)) || true
+    # --- Check Container Status (using common function if available) ---
+    if declare -F validate_container_running >/dev/null 2>&1; then
+        if validate_container_running "$lxc_id"; then
+            log_info "validate_final_setup: Container $lxc_id is running"
+            ((checks_passed++)) || true
+        else
+            log_error "validate_final_setup: Container $lxc_id is not running"
+            ((checks_failed++)) || true
+        fi
     else
-        log_error "validate_final_setup: Container $lxc_id is not running"
-        ((checks_failed++)) || true
+        # Fallback
+        local status
+        status=$(pct status "$lxc_id" 2>/dev/null | grep 'status' | awk '{print $2}')
+        if [[ "$status" == "running" ]]; then
+            log_info "validate_final_setup: Container $lxc_id is running"
+            ((checks_passed++)) || true
+        else
+            log_error "validate_final_setup: Container $lxc_id is not running"
+            ((checks_failed++)) || true
+        fi
     fi
 
-    # --- Check Docker Status ---
-    local docker_check_cmd="set -e
-if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
-    echo '[SUCCESS] Docker is installed and running'
+    # --- Check GPU Access via nvidia-smi ---
+    local nvidia_smi_check="set -e
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo '[SUCCESS] nvidia-smi command successful'
     exit 0
 else
-    echo '[ERROR] Docker is not installed or not running'
+    echo '[ERROR] nvidia-smi command failed'
     exit 1
 fi"
-    if pct_exec_with_retry "$lxc_id" "$docker_check_cmd"; then
-        log_info "validate_final_setup: Docker is installed and running in container $lxc_id"
+    # Use pct_exec_with_retry if available
+    local exec_func="pct exec"
+    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
+        exec_func="pct_exec_with_retry"
+    fi
+    if $exec_func "$lxc_id" -- bash -c "$nvidia_smi_check"; then
+        log_info "validate_final_setup: nvidia-smi check passed in container $lxc_id"
         ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: Docker check failed in container $lxc_id"
+        log_error "validate_final_setup: nvidia-smi check failed in container $lxc_id"
         ((checks_failed++)) || true
     fi
 
-    # --- Check GPU Access via Docker ---
-    # Use a standard CUDA base image for testing (matching the PyTorch image base updated for CUDA 12.8)
-    if verify_docker_gpu_access_in_container "$lxc_id" "nvidia/cuda:12.8.0-base-ubuntu24.04"; then
-        log_info "validate_final_setup: Docker GPU access verified for container $lxc_id"
+    # --- Check CUDA Toolkit (nvcc) ---
+    local nvcc_check="set -e
+if command -v nvcc >/dev/null 2>&1; then
+    nvcc_version=\$(nvcc --version | grep 'release' | awk '{print \$5}' | sed 's/,//')
+    echo \"[SUCCESS] nvcc found, version: \$nvcc_version\"
+    exit 0
+else
+    echo '[ERROR] nvcc not found'
+    exit 1
+fi"
+    if $exec_func "$lxc_id" -- bash -c "$nvcc_check"; then
+        log_info "validate_final_setup: nvcc check passed in container $lxc_id"
         ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: Docker GPU access verification failed for container $lxc_id"
+        log_error "validate_final_setup: nvcc check failed in container $lxc_id"
+        ((checks_failed++)) || true
+    fi
+
+    # --- Check llama.cpp Binary ---
+    local llama_binary_check="set -e
+if [[ -f '/opt/ai/llama.cpp/build/bin/llama-cli' ]]; then
+    echo '[SUCCESS] llama-cli binary found'
+    exit 0
+else
+    echo '[ERROR] llama-cli binary not found'
+    exit 1
+fi"
+    if $exec_func "$lxc_id" -- bash -c "$llama_binary_check"; then
+        log_info "validate_final_setup: llama-cli binary check passed in container $lxc_id"
+        ((checks_passed++)) || true
+    else
+        log_error "validate_final_setup: llama-cli binary check failed in container $lxc_id"
+        ((checks_failed++)) || true
+    fi
+
+    # --- Check Python Bindings ---
+    local python_check="set -e
+if python3 -c 'import llama_cpp; print(\"llama_cpp imported successfully\")' >/dev/null 2>&1; then
+    echo '[SUCCESS] llama_cpp Python module imported'
+    exit 0
+else
+    echo '[ERROR] Failed to import llama_cpp Python module'
+    exit 1
+fi"
+    if $exec_func "$lxc_id" -- bash -c "$python_check"; then
+        log_info "validate_final_setup: Python bindings check passed in container $lxc_id"
+        ((checks_passed++)) || true
+    else
+        log_error "validate_final_setup: Python bindings check failed in container $lxc_id"
         ((checks_failed++)) || true
     fi
 
@@ -470,24 +577,24 @@ fi"
     return 0
 }
 
-# 7. Show Setup Information (adapted from drdevstral)
+# 8. Show Setup Information
 show_setup_info() {
     local lxc_id="$1"
     log_info "show_setup_info: Displaying setup information for container $lxc_id..."
     echo ""
     echo "==============================================="
-    echo "DR CUDA SETUP COMPLETED FOR CONTAINER $lxc_id"
+    echo "LLAMACPP SETUP COMPLETED FOR CONTAINER $lxc_id"
     echo "==============================================="
-    # Updated image tag
-    echo "PyTorch Docker Image: pytorch-cuda:12.8 (built inside container)"
-    echo ""
-    echo "You can now run PyTorch jobs using Docker inside the container."
-    echo "Example command to test:"
-    # Updated example command
-    echo "  pct exec $lxc_id -- docker run --rm --gpus all pytorch-cuda:12.8 python3 -c \"import torch; print(torch.cuda.is_available())\""
+    echo "llama.cpp is built in /opt/ai/llama.cpp/build"
+    echo "llama-cli binary is at /opt/ai/llama.cpp/build/bin/llama-cli"
+    echo "Python bindings (llama-cpp-python) are installed."
     echo ""
     echo "To enter the container:"
     echo "  pct enter $lxc_id"
+    echo "To run llama-cli (example):"
+    echo "  pct exec $lxc_id -- /opt/ai/llama.cpp/build/bin/llama-cli -m <path_to_model.gguf> -p \"Hello world\""
+    echo "To use Python bindings (example):"
+    echo "  pct exec $lxc_id -- python3 -c \"from llama_cpp import Llama; print('Llama imported')\""
     echo "==============================================="
 }
 
@@ -497,7 +604,7 @@ main() {
     local lxc_id="$1"
 
     log_info "==============================================="
-    log_info "STARTING PHOENIX HYPERVISOR DR CUDA SETUP FOR CONTAINER $lxc_id"
+    log_info "STARTING PHOENIX HYPERVISOR LLAMACPP SETUP FOR CONTAINER $lxc_id"
     log_info "==============================================="
 
     # 1. Validate Dependencies
@@ -506,25 +613,28 @@ main() {
     # 2. Validate Container State (Create if needed, Start, Network, GPU Passthrough)
     validate_container_state "$lxc_id"
 
-    # 3. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA 12.8, Toolkit, Docker Runtime)
+    # 3. Install Build Dependencies
+    install_build_dependencies "$lxc_id"
+
+    # 4. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA Toolkit 12.8)
     setup_nvidia_packages "$lxc_id"
 
-    # 4. Install Docker CE
-    install_docker_in_container "$lxc_id"
+    # 5. Build llama.cpp
+    build_llama_cpp "$lxc_id"
 
-    # 5. Build PyTorch Docker Image (Updated for CUDA 12.8)
-    build_pytorch_docker_image "$lxc_id"
+    # 6. Install Python Bindings (llama-cpp-python)
+    install_python_bindings "$lxc_id"
 
-    # 6. Validate Final Setup
+    # 7. Validate Final Setup
     if ! validate_final_setup "$lxc_id"; then
         log_warn "Final validation had some failures, but setup may still be usable. Please review logs."
     fi
 
-    # 7. Show Setup Information
+    # 8. Show Setup Information
     show_setup_info "$lxc_id"
 
     log_info "==============================================="
-    log_info "PHOENIX HYPERVISOR DR CUDA SETUP FOR CONTAINER $lxc_id COMPLETED SUCCESSFULLY"
+    log_info "PHOENIX HYPERVISOR LLAMACPP SETUP FOR CONTAINER $lxc_id COMPLETED SUCCESSFULLY"
     log_info "==============================================="
 }
 
