@@ -1,6 +1,6 @@
 #!/bin/bash
 # Common functions for Phoenix Hypervisor scripts
-# Version: 1.7.11
+# Version: 1.7.11 (Improved Directory Handling)
 # Author: Assistant
 
 # --- Signal successful loading ---
@@ -12,43 +12,106 @@ setup_logging() {
     local log_file="$log_dir/phoenix_hypervisor.log"
     local debug_log="$log_dir/phoenix_hypervisor_debug.log"
 
-    # Ensure log directory exists and is writable
-    if ! mkdir -p "$log_dir" 2>/dev/null; then
-        echo "[ERROR] Failed to create log directory: $log_dir" >&2
-        exit 1
+    # --- Robust Directory Creation ---
+    if [[ ! -d "$log_dir" ]]; then
+        log_info "Log directory '$log_dir' does not exist. Attempting to create..."
+        # Use mkdir -p and check the exit status directly
+        if ! mkdir -p "$log_dir"; then
+            echo "[ERROR] setup_logging: Failed to create log directory '$log_dir'. Check permissions for parent directory '$(dirname "$log_dir")'." >&2
+            # Fallback to a writable location or exit
+            # Option 1: Fallback (Example - you might adjust this)
+            # log_dir="/tmp/phoenix_hypervisor_logs"
+            # log_file="$log_dir/phoenix_hypervisor.log"
+            # debug_log="$log_dir/phoenix_hypervisor_debug.log"
+            # mkdir -p "$log_dir" || { echo "[ERROR] setup_logging: Cannot create fallback log directory '$log_dir' either. Exiting."; exit 1; }
+            # Option 2: Exit (Stricter)
+            exit 1
+        fi
+        # Set ownership (optional, adjust user/group as needed, might require root)
+        # chown root:root "$log_dir" 2>/dev/null || echo "[WARN] setup_logging: Could not set ownership for '$log_dir'."
+        # Set directory permissions
+        chmod 755 "$log_dir" || echo "[WARN] setup_logging: Could not set permissions (755) for '$log_dir'."
+        log_info "Log directory '$log_dir' created successfully."
+    else
+        log_info "Log directory '$log_dir' already exists."
     fi
-    if ! touch "$log_file" "$debug_log" 2>/dev/null; then
-        echo "[ERROR] Failed to create log files: $log_file or $debug_log" >&2
-        exit 1
-    fi
-    if ! chmod 644 "$log_file" "$debug_log" 2>/dev/null; then
-        echo "[ERROR] Failed to set permissions on log files: $log_file or $debug_log" >&2
-        exit 1
-    fi
+
+    # --- Robust File Creation and Permission Setting ---
+    for logfile in "$log_file" "$debug_log"; do
+        if [[ ! -f "$logfile" ]]; then
+            log_info "Log file '$logfile' does not exist. Attempting to create..."
+            # Touch the file and check the exit status
+            if ! touch "$logfile"; then
+                echo "[ERROR] setup_logging: Failed to create log file '$logfile'. Check permissions for directory '$log_dir'." >&2
+                exit 1
+            fi
+            # Set file permissions
+            if ! chmod 644 "$logfile"; then
+                echo "[WARN] setup_logging: Failed to set permissions (644) on log file '$logfile'." >&2
+                # Depending on requirements, you might want to exit 1 here.
+            fi
+             # Set ownership (optional, adjust user/group as needed, might require root)
+            # chown root:root "$logfile" 2>/dev/null || echo "[WARN] setup_logging: Could not set ownership for '$logfile'."
+            log_info "Log file '$logfile' created successfully."
+        else
+             log_info "Log file '$logfile' already exists."
+             # Ensure permissions are correct even if file exists
+             if ! chmod 644 "$logfile" 2>/dev/null; then
+                 echo "[WARN] setup_logging: Could not set/verify permissions (644) for existing log file '$logfile'." >&2
+             fi
+        fi
+    done
+
+    # --- Check Writability ---
+    # Check if log files are writable after creation/permission setting
     if ! [ -w "$log_file" ] || ! [ -w "$debug_log" ]; then
-        echo "[ERROR] Log files are not writable: $log_file or $debug_log" >&2
+        echo "[ERROR] setup_logging: Log files are not writable: '$log_file' or '$debug_log'. Check ownership and permissions for directory '$log_dir' and the files themselves." >&2
         exit 1
     fi
+    log_info "Log files are confirmed writable."
 
-    # Initialize file descriptors with error handling
+    # --- Initialize File Descriptors ---
+    # Close FDs if they were previously opened (defensive)
+    exec 3>&- 2>/dev/null || true
+    exec 4>&- 2>/dev/null || true
+    exec 5>&- 2>/dev/null || true
+
+    # Initialize file descriptors with explicit error checking
     if ! exec 3>>"$log_file"; then
-        echo "[ERROR] Failed to open log file: $log_file" >&2
+        echo "[ERROR] setup_logging: Failed to open main log file descriptor (fd 3) for '$log_file'." >&2
         exit 1
     fi
-    if ! exec 4>>"$debug_log"; then
-        echo "[ERROR] Failed to open debug log file: $debug_log" >&2
-        exit 1
-    fi
-    if ! exec 5>&2; then
-        echo "[ERROR] Failed to redirect stderr" >&2
-        exit 1
-    fi
-    if ! exec 2>>"$debug_log"; then
-        echo "[ERROR] Failed to redirect stderr to debug log: $debug_log" >&2
-        exit 1
-    fi
+    log_info "Main log file descriptor (fd 3) opened for '$log_file'."
 
+    if ! exec 4>>"$debug_log"; then
+        echo "[ERROR] setup_logging: Failed to open debug log file descriptor (fd 4) for '$debug_log'." >&2
+        exec 3>&- # Close fd 3 if fd 4 fails
+        exit 1
+    fi
+    log_info "Debug log file descriptor (fd 4) opened for '$debug_log'."
+
+    # Redirect script's stderr (fd 2) to the debug log (fd 4)
+    # Save original stderr to fd 5 first
+    if ! exec 5>&2; then
+        echo "[ERROR] setup_logging: Failed to save original stderr to file descriptor 5." >&2
+        exec 3>&- # Close fd 3
+        exec 4>&- # Close fd 4
+        exit 1
+    fi
+    log_info "Original stderr saved to file descriptor 5."
+
+    if ! exec 2>&4; then
+        echo "[ERROR] setup_logging: Failed to redirect script's stderr (fd 2) to debug log '$debug_log'." >&2
+        exec 3>&- # Close fd 3
+        exec 4>&- # Close fd 4
+        exec 5>&- # Close fd 5
+        exit 1
+    fi
+    log_info "Script's stderr redirected to debug log (fd 4)."
+
+    # Log successful initialization to the main log file (fd 3)
     echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] Logging initialized to $log_file and debug to $debug_log" >&3
+    log_info "Logging system fully initialized."
 }
 
 log_info() {
@@ -56,6 +119,7 @@ log_info() {
     if [[ -e /proc/self/fd/3 ]]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $message" >&3
     else
+        # Fallback to stderr if fd 3 is not available (e.g., before setup_logging or on error)
         echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $message" >&2
     fi
 }
@@ -65,6 +129,7 @@ log_warn() {
     if [[ -e /proc/self/fd/4 ]]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $message" >&4
     else
+        # Fallback to stderr if fd 4 is not available
         echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $message" >&2
     fi
 }
@@ -74,6 +139,7 @@ log_error() {
     if [[ -e /proc/self/fd/4 ]]; then
         echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $message" >&4
     else
+        # Fallback to stderr if fd 4 is not available (critical, as this is where errors should go)
         echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $message" >&2
     fi
     exit 1
@@ -152,6 +218,7 @@ load_hypervisor_config() {
         return 1
     fi
 
+    # Ensure LXC_CONFIGS is a global associative array
     if ! declare -p LXC_CONFIGS >/dev/null 2>&1; then
         declare -gA LXC_CONFIGS
     elif [[ "$(declare -p LXC_CONFIGS)" != "declare -A"* ]]; then
@@ -160,30 +227,35 @@ load_hypervisor_config() {
     fi
 
     local container_ids
+    # Parse container IDs, sending potential jq errors to the debug log (fd 4)
     if ! container_ids=$(jq -r '.lxc_configs | keys[]' "$PHOENIX_LXC_CONFIG_FILE" 2>&4); then
         log_error "load_hypervisor_config: Failed to parse container IDs from $PHOENIX_LXC_CONFIG_FILE"
-        log_error "load_hypervisor_config: jq output: $container_ids"
+        # The actual jq error should be in the debug log due to 2>&4 redirection above
         return 1
     fi
 
+    # Check if any configurations were found
     if [[ -z "$container_ids" ]]; then
         log_warn "load_hypervisor_config: No container configurations found in $PHOENIX_LXC_CONFIG_FILE"
-        return 0
+        return 0 # Not an error, just a warning
     fi
 
     local count=0
+    # Iterate through the parsed IDs
     while IFS= read -r id; do
+        # Ensure the ID is not empty (defensive check)
         if [[ -n "$id" ]]; then
             local config_output
-            config_output=$(jq -c '.lxc_configs["'$id'"]' "$PHOENIX_LXC_CONFIG_FILE" 2>&4)
-            if [[ $? -ne 0 ]]; then
-                log_error "load_hypervisor_config: Failed to load config for container ID $id: $config_output"
-                return 1
-            fi
+            # Extract the specific container config, sending jq errors to debug log
+             if ! config_output=$(jq -c '.lxc_configs["'$id'"]' "$PHOENIX_LXC_CONFIG_FILE" 2>&4); then
+                 log_error "load_hypervisor_config: Failed to load config for container ID $id"
+                 return 1
+             fi
+            # Store the config in the global associative array
             LXC_CONFIGS["$id"]="$config_output"
             ((count++))
         fi
-    done <<< "$container_ids"
+    done <<< "$container_ids" # Use here-string for the loop
 
     log_info "load_hypervisor_config: Loaded $count LXC configurations"
     return 0
@@ -192,17 +264,23 @@ load_hypervisor_config() {
 # --- GPU Assignment Handling ---
 get_gpu_assignment() {
     local container_id="$1"
+    # Validate input
     if [[ -z "$container_id" ]]; then
         log_error "get_gpu_assignment: Container ID is required"
         return 1
     fi
 
+    # Check if the global LXC_CONFIGS array is loaded and contains the key
     if declare -p LXC_CONFIGS >/dev/null 2>&1 && [[ -n "${LXC_CONFIGS[$container_id]:-}" ]]; then
+        # Extract gpu_assignment from the loaded config in the array
         echo "$LXC_CONFIGS[$container_id]" | jq -r '.gpu_assignment // "none"'
     else
+        # Fallback: If LXC_CONFIGS is not loaded or key is missing,
+        # directly query the JSON file using jq (slower but works independently)
         if [[ -f "$PHOENIX_LXC_CONFIG_FILE" ]] && command -v jq >/dev/null; then
             jq -r ".lxc_configs.\"$container_id\".gpu_assignment // \"none\"" "$PHOENIX_LXC_CONFIG_FILE"
         else
+            # If jq or file is missing, default to "none"
             echo "none"
         fi
     fi
@@ -212,10 +290,12 @@ validate_gpu_assignment() {
     local container_id="$1"
     local gpu_assignment="$2"
 
+    # If no assignment or explicitly "none", it's valid
     if [[ -z "$gpu_assignment" || "$gpu_assignment" == "none" ]]; then
         return 0
     fi
 
+    # Validate the format: comma-separated numbers (e.g., "0", "1", "0,1")
     if [[ ! "$gpu_assignment" =~ ^[0-9]+(,[0-9]+)*$ ]]; then
         log_error "validate_gpu_assignment: Invalid GPU assignment format for container $container_id: '$gpu_assignment'. Expected comma-separated GPU indices (e.g., '0', '1', '0,1') or 'none'."
         return 1
@@ -229,16 +309,19 @@ create_lxc_container() {
     local lxc_id="$1"
     local container_config="$2"
 
+    # Validate required inputs
     if [[ -z "$lxc_id" || -z "$container_config" ]]; then
         log_error "create_lxc_container: Container ID and configuration are required"
         return 1
     fi
 
+    # Validate the provided configuration JSON
     if ! validate_container_config "$lxc_id" "$container_config"; then
         log_error "create_lxc_container: Configuration validation failed for container $lxc_id"
         return 1
     fi
 
+    # --- Extract configuration parameters using jq ---
     local name
     name=$(echo "$container_config" | jq -r '.name')
     local memory_mb
@@ -257,23 +340,32 @@ create_lxc_container() {
     features=$(echo "$container_config" | jq -r '.features')
     local gpu_assignment
     gpu_assignment=$(echo "$container_config" | jq -r '.gpu_assignment // "none"')
+    # --- End Extract Parameters ---
 
+    # --- Parse Network Configuration ---
     local ip_cidr gateway dns
+    # Split the network_config string by commas
     IFS=',' read -r ip_cidr gateway dns <<< "$network_config"
 
+    # Validate IP/CIDR format (basic regex)
     if [[ ! "$ip_cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
         log_error "Invalid IP/CIDR format in network_config: $ip_cidr"
         return 1
     fi
+    # Validate Gateway format (basic regex)
     if [[ ! "$gateway" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         log_error "Invalid Gateway format in network_config: $gateway"
         return 1
     fi
+    # Validate DNS format (basic regex)
     if [[ ! "$dns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
         log_error "Invalid DNS format in network_config: $dns"
         return 1
     fi
+    # --- End Parse Network ---
 
+    # --- Validate Required Fields (Double-check after jq parsing) ---
+    # Although validate_container_config checks 'name', checking again here is defensive.
     if [[ -z "$name" || "$name" == "null" ]]; then
         log_error "create_lxc_container: Missing 'name' for container $lxc_id"
         return 1
@@ -306,10 +398,14 @@ create_lxc_container() {
         log_error "create_lxc_container: Missing 'features' for container $lxc_id"
         return 1
     fi
+    # --- End Validate Fields ---
 
+    # Prepare storage size argument for pct (just the number, unit assumed GB)
     local storage_size="${storage_size_gb}"
 
+    # --- Create the LXC Container ---
     log_info "Creating container $lxc_id ($name)..."
+    # Use retry_command to attempt container creation
     if ! retry_command 3 10 pct create "$lxc_id" "$template" \
         --hostname "$name" \
         --memory "$memory_mb" \
@@ -322,24 +418,35 @@ create_lxc_container() {
         log_error "Failed to create LXC container $lxc_id"
         return 1
     fi
+    # --- End Create Container ---
 
+    # --- Configure GPU Passthrough (if assigned) ---
+    # Check if a GPU assignment exists and is not "none"
     if [[ -n "$gpu_assignment" && "$gpu_assignment" != "none" ]]; then
         log_info "Configuring GPU passthrough for container $lxc_id (GPUs: $gpu_assignment)..."
+        # Check if the NVIDIA configuration function is available
         if declare -f configure_lxc_gpu_passthrough >/dev/null 2>&1; then
+            # Call the function to configure GPU passthrough
             if ! configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
+                # Log a warning but don't fail the entire container creation
                 log_warn "Failed to configure GPU passthrough for container $lxc_id. Continuing with container creation."
+                # Depending on requirements, you might want to return 1 here to fail.
             else
                 log_info "GPU passthrough configured successfully for container $lxc_id"
             fi
         else
+            # Warn if the function isn't found (e.g., NVIDIA lib not sourced)
             log_warn "GPU passthrough function 'configure_lxc_gpu_passthrough' not found. Skipping GPU setup."
         fi
     else
         log_info "No GPU assignment for container $lxc_id, skipping GPU passthrough configuration."
     fi
+    # --- End GPU Configuration ---
 
+    # --- Finalize ---
     log_info "Container $lxc_id ($name) created successfully."
     return 0
+    # --- End Finalize ---
 }
 
 # Initialize logging

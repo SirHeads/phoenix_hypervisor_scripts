@@ -45,10 +45,10 @@ export DEFAULT_LXC_FEATURES="${DEFAULT_LXC_FEATURES:-nesting=1}"
 
 # --- Default NVIDIA Configuration ---
 # NVIDIA driver version to use across all containers
-export NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-580.65.06}"
+export NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-575.57.08}"
 
 # NVIDIA runfile URL for driver installation in containers
-export NVIDIA_RUNFILE_URL="${NVIDIA_RUNFILE_URL:-http://us.download.nvidia.com/XFree86/Linux-x86_64/580.65.06/NVIDIA-Linux-x86_64-580.65.06.run}"
+export NVIDIA_RUNFILE_URL="${NVIDIA_RUNFILE_URL:-http://us.download.nvidia.com/XFree86/Linux-x86_64/575.57.08/NVIDIA-Linux-x86_64-575.57.08.run}"
 
 # Default GPU assignment for containers (empty = no GPUs, "0" = GPU 0, "0,1" = both GPUs)
 # This is a fallback, specific assignments should be in the JSON config or PHOENIX_GPU_ASSIGNMENTS

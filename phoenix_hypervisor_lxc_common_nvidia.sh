@@ -463,6 +463,7 @@ configure_lxc_gpu_passthrough() {
 
     log_info "Adding GPU passthrough entries to $config_file for GPUs: $gpu_indices"
 
+    # --- Cleanup existing GPU-related entries ---
     sed -i '/^lxc\.cgroup2\.devices\.allow: c 195/d' "$config_file"
     sed -i '/^lxc\.cgroup2\.devices\.allow: c 235/d' "$config_file"
     sed -i '/^lxc\.cgroup2\.devices\.allow: c 236/d' "$config_file"
@@ -473,40 +474,90 @@ configure_lxc_gpu_passthrough() {
     sed -i '/^swap: /d' "$config_file"
     sed -i '/^lxc\.autodev:/d' "$config_file"
     sed -i '/^lxc\.mount\.auto:/d' "$config_file"
+    # --- End Cleanup ---
 
+    # --- Add essential static devices ---
+    # DRI devices (often needed for graphics/CUDA)
     echo "dev0: /dev/dri/card0,gid=44" >> "$config_file"
     echo "dev1: /dev/dri/renderD128,gid=104" >> "$config_file"
     local dev_index=2
+    # --- End Static Devices ---
+
+    # --- Add GPU-specific devices dynamically ---
     IFS=',' read -ra INDICES <<< "$gpu_indices"
     for index in "${INDICES[@]}"; do
         if ! [[ "$index" =~ ^[0-9]+$ ]]; then
             log_error "configure_lxc_gpu_passthrough: Invalid GPU index: $index (must be numeric)"
             return 1
         fi
+        # Add the core NVIDIA device node for the GPU
         echo "dev$dev_index: /dev/nvidia$index" >> "$config_file"
         ((dev_index++))
     done
-    echo "dev$dev_index: /dev/nvidia-caps/nvidia-cap1" >> "$config_file"
-    ((dev_index++))
-    echo "dev$dev_index: /dev/nvidia-caps/nvidia-cap2" >> "$config_file"
-    ((dev_index++))
-    echo "dev$dev_index: /dev/nvidiactl" >> "$config_file"
-    ((dev_index++))
-    echo "dev$dev_index: /dev/nvidia-modeset" >> "$config_file"
-    ((dev_index++))
-    echo "dev$dev_index: /dev/nvidia-uvm-tools" >> "$config_file"
-    ((dev_index++))
-    echo "dev$dev_index: /dev/nvidia-uvm" >> "$config_file"
 
+    # Add common NVIDIA capability devices if they exist on the host
+    # Check and add nvidia-caps devices
+    if [[ -e "/dev/nvidia-caps/nvidia-cap1" ]]; then
+        echo "dev$dev_index: /dev/nvidia-caps/nvidia-cap1" >> "$config_file"
+        ((dev_index++))
+    else
+        log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-caps/nvidia-cap1 not found on host, skipping."
+    fi
+
+    if [[ -e "/dev/nvidia-caps/nvidia-cap2" ]]; then
+        echo "dev$dev_index: /dev/nvidia-caps/nvidia-cap2" >> "$config_file"
+        ((dev_index++))
+    else
+        log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-caps/nvidia-cap2 not found on host, skipping."
+    fi
+
+    # Add core control devices if they exist on the host
+    if [[ -e "/dev/nvidiactl" ]]; then
+        echo "dev$dev_index: /dev/nvidiactl" >> "$config_file"
+        ((dev_index++))
+    else
+        log_error "configure_lxc_gpu_passthrough: Critical device /dev/nvidiactl not found on host!"
+        # This is likely a critical error, but we'll warn and continue for robustness
+    fi
+
+    # --- MODIFICATION: Check for nvidia-modeset existence ---
+    if [[ -e "/dev/nvidia-modeset" ]]; then
+        echo "dev$dev_index: /dev/nvidia-modeset" >> "$config_file"
+        ((dev_index++))
+        log_info "configure_lxc_gpu_passthrough: Added /dev/nvidia-modeset to container config."
+    else
+        log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-modeset not found on host, skipping passthrough for this device."
+        # Do not add the line if the device doesn't exist
+    fi
+    # --- END MODIFICATION ---
+
+    # Add UVM devices if they exist on the host
+    if [[ -e "/dev/nvidia-uvm-tools" ]]; then
+        echo "dev$dev_index: /dev/nvidia-uvm-tools" >> "$config_file"
+        ((dev_index++))
+    else
+        log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-uvm-tools not found on host, skipping."
+    fi
+
+    if [[ -e "/dev/nvidia-uvm" ]]; then
+        echo "dev$dev_index: /dev/nvidia-uvm" >> "$config_file"
+        ((dev_index++))
+    else
+        log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-uvm not found on host, skipping."
+    fi
+    # --- End GPU-specific Devices ---
+
+    # --- Add final LXC configuration options ---
     echo "lxc.cgroup2.devices.allow: a" >> "$config_file"
-    echo "lxc.cap.drop:" >> "$config_file"
+    echo "lxc.cap.drop:" >> "$config_file" # Explicitly drop no capabilities, might need adjustment
     echo "swap: 512" >> "$config_file"
     echo "lxc.autodev: 1" >> "$config_file"
     echo "lxc.mount.auto: sys:rw" >> "$config_file"
+    # --- End Final Options ---
 
     chmod u-w "$config_file"
 
-    log_info "GPU passthrough configured for container $lxc_id (GPUs: $gpu_indices)"
+    log_info "GPU passthrough configuration updated for container $lxc_id (GPUs: $gpu_indices)"
     return 0
 }
 
