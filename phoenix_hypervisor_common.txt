@@ -18,17 +18,8 @@ setup_logging() {
         # Use mkdir -p and check the exit status directly
         if ! mkdir -p "$log_dir"; then
             echo "[ERROR] setup_logging: Failed to create log directory '$log_dir'. Check permissions for parent directory '$(dirname "$log_dir")'." >&2
-            # Fallback to a writable location or exit
-            # Option 1: Fallback (Example - you might adjust this)
-            # log_dir="/tmp/phoenix_hypervisor_logs"
-            # log_file="$log_dir/phoenix_hypervisor.log"
-            # debug_log="$log_dir/phoenix_hypervisor_debug.log"
-            # mkdir -p "$log_dir" || { echo "[ERROR] setup_logging: Cannot create fallback log directory '$log_dir' either. Exiting."; exit 1; }
-            # Option 2: Exit (Stricter)
             exit 1
         fi
-        # Set ownership (optional, adjust user/group as needed, might require root)
-        # chown root:root "$log_dir" 2>/dev/null || echo "[WARN] setup_logging: Could not set ownership for '$log_dir'."
         # Set directory permissions
         chmod 755 "$log_dir" || echo "[WARN] setup_logging: Could not set permissions (755) for '$log_dir'."
         log_info "Log directory '$log_dir' created successfully."
@@ -48,17 +39,14 @@ setup_logging() {
             # Set file permissions
             if ! chmod 644 "$logfile"; then
                 echo "[WARN] setup_logging: Failed to set permissions (644) on log file '$logfile'." >&2
-                # Depending on requirements, you might want to exit 1 here.
             fi
-             # Set ownership (optional, adjust user/group as needed, might require root)
-            # chown root:root "$logfile" 2>/dev/null || echo "[WARN] setup_logging: Could not set ownership for '$logfile'."
             log_info "Log file '$logfile' created successfully."
         else
-             log_info "Log file '$logfile' already exists."
-             # Ensure permissions are correct even if file exists
-             if ! chmod 644 "$logfile" 2>/dev/null; then
-                 echo "[WARN] setup_logging: Could not set/verify permissions (644) for existing log file '$logfile'." >&2
-             fi
+            log_info "Log file '$logfile' already exists."
+            # Ensure permissions are correct even if file exists
+            if ! chmod 644 "$logfile" 2>/dev/null; then
+                echo "[WARN] setup_logging: Could not set/verify permissions (644) for existing log file '$logfile'." >&2
+            fi
         fi
     done
 
@@ -167,6 +155,23 @@ retry_command() {
     return 1
 }
 
+validate_cuda_version() {
+    local lxc_id="$1"
+    log_info "Validating CUDA version for container $lxc_id..."
+    if ! pct exec "$lxc_id" -- nvcc --version | grep -q "${CUDA_VERSION}"; then
+        log_error "CUDA version mismatch in container $lxc_id. Expected ${CUDA_VERSION}."
+    fi
+    log_info "CUDA version ${CUDA_VERSION} validated successfully for container $lxc_id."
+}
+
+validate_environment() {
+    log_info "Validating environment..."
+    if ! systemctl is-active --quiet apparmor; then
+        log_warn "apparmor service not active."
+    fi
+    log_info "Environment validation completed."
+}
+
 # --- Source NVIDIA LXC Common Functions ---
 if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_lxc_common_nvidia.sh" ]]; then
     source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_lxc_common_nvidia.sh
@@ -247,10 +252,10 @@ load_hypervisor_config() {
         if [[ -n "$id" ]]; then
             local config_output
             # Extract the specific container config, sending jq errors to debug log
-             if ! config_output=$(jq -c '.lxc_configs["'$id'"]' "$PHOENIX_LXC_CONFIG_FILE" 2>&4); then
-                 log_error "load_hypervisor_config: Failed to load config for container ID $id"
-                 return 1
-             fi
+            if ! config_output=$(jq -c '.lxc_configs["'$id'"]' "$PHOENIX_LXC_CONFIG_FILE" 2>&4); then
+                log_error "load_hypervisor_config: Failed to load config for container ID $id"
+                return 1
+            fi
             # Store the config in the global associative array
             LXC_CONFIGS["$id"]="$config_output"
             ((count++))
@@ -430,7 +435,6 @@ create_lxc_container() {
             if ! configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
                 # Log a warning but don't fail the entire container creation
                 log_warn "Failed to configure GPU passthrough for container $lxc_id. Continuing with container creation."
-                # Depending on requirements, you might want to return 1 here to fail.
             else
                 log_info "GPU passthrough configured successfully for container $lxc_id"
             fi

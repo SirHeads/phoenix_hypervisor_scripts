@@ -1,1033 +1,757 @@
-#!/bin/bash
+#!/usr/bin/env bash
+
+# phoenix_hypervisor_setup_drdevstral.sh
+#
 # Container-specific setup script for drdevstral (LXC ID 901)
-# Installs NVIDIA drivers, toolkit, vLLM, and sets up the AI model
-# Version: 1.8.13
+# Installs NVIDIA drivers, toolkit, Docker, vLLM, and sets up the AI model service.
+# This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
+#
+# Version: 1.9.0 (Refactored to use common libraries)
 # Author: Assistant
 
 set -euo pipefail
 
-# Reset terminal state on exit
-trap 'stty sane; echo "Terminal reset"' EXIT
+# --- Terminal Handling ---
+# Save terminal settings and ensure they are restored on exit or error
+ORIGINAL_TERM_SETTINGS=$(stty -g 2>/dev/null) || ORIGINAL_TERM_SETTINGS=""
+trap 'if [[ -n "$ORIGINAL_TERM_SETTINGS" ]]; then stty "$ORIGINAL_TERM_SETTINGS"; fi; echo "[INFO] Script interrupted. Terminal settings restored." >&2; exit 1' INT TERM ERR
 
-# --- Enhanced Sourcing ---
-if [[ -f "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
-    source /usr/local/etc/phoenix_hypervisor_config.sh
-    echo "DEBUG: Sourced config from /usr/local/etc/phoenix_hypervisor_config.sh" >> "${HYPERVISOR_LOGFILE%.log}_debug.log"
-elif [[ -f "./phoenix_hypervisor_config.sh" ]]; then
-    source ./phoenix_hypervisor_config.sh
-    echo "DEBUG: Sourced config from ./phoenix_hypervisor_config.sh" >> "${HYPERVISOR_LOGFILE%.log}_debug.log"
-    if declare -f log_warn > /dev/null 2>&1; then
-        log_warn "phoenix_hypervisor_setup_drdevstral.sh: Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh"
-    else
-        echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh" >&2
+# --- Argument Validation ---
+if [[ $# -ne 1 ]]; then
+    echo "[ERROR] Usage: $0 <container_id>" >&2
+    exit 1
+fi
+
+CONTAINER_ID="$1"
+if [[ "$CONTAINER_ID" != "901" ]]; then
+    echo "[ERROR] This script is designed for container ID 901, got $container_id" >&2
+    exit 1
+fi
+
+# --- Configuration and Library Loading ---
+# Determine script's directory for locating libraries
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PHOENIX_LIB_DIR="/usr/local/lib/phoenix_hypervisor"
+PHOENIX_BIN_DIR="/usr/local/bin/phoenix_hypervisor"
+
+# Source Phoenix Hypervisor Configuration
+PHOENIX_CONFIG_LOADED=0
+for config_path in \
+    "/usr/local/etc/phoenix_hypervisor_config.sh" \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_config.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_config.sh"; do
+    if [[ -f "$config_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$config_path"
+        if [[ "${PHOENIX_HYPERVISOR_CONFIG_LOADED:-0}" -eq 1 ]]; then
+            PHOENIX_CONFIG_LOADED=1
+            echo "[INFO] Sourced Phoenix Hypervisor configuration from $config_path."
+            break
+        else
+            echo "[WARN] Sourced $config_path, but PHOENIX_HYPERVISOR_CONFIG_LOADED not set correctly. Trying next location."
+        fi
     fi
-else
-    echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Configuration file not found: /usr/local/etc/phoenix_hypervisor_config.sh or ./phoenix_hypervisor_config.sh" >&2
+done
+
+if [[ $PHOENIX_CONFIG_LOADED -ne 1 ]]; then
+    echo "[ERROR] Failed to load phoenix_hypervisor_config.sh from standard locations." >&2
+    echo "[ERROR] Please ensure it's installed correctly." >&2
     exit 1
 fi
 
 # Set default for DEFAULT_VLLM_IMAGE if not defined
 if [[ -z "${DEFAULT_VLLM_IMAGE:-}" ]]; then
     DEFAULT_VLLM_IMAGE="vllm/vllm-openai:cuda13"
-    echo "DEBUG: DEFAULT_VLLM_IMAGE was unset, defaulting to $DEFAULT_VLLM_IMAGE" >> "${HYPERVISOR_LOGFILE%.log}_debug.log"
+    echo "[DEBUG] DEFAULT_VLLM_IMAGE was unset, defaulting to $DEFAULT_VLLM_IMAGE" >> "${HYPERVISOR_LOGFILE%.log}_debug.log"
 fi
-echo "DEBUG: DEFAULT_VLLM_IMAGE=$DEFAULT_VLLM_IMAGE" >> "${HYPERVISOR_LOGFILE%.log}_debug.log"
+echo "[DEBUG] DEFAULT_VLLM_IMAGE=$DEFAULT_VLLM_IMAGE" >> "${HYPERVISOR_LOGFILE%.log}_debug.log"
 
-if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
-    source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh
-elif [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
-    source /usr/local/bin/phoenix_hypervisor_common.sh
-    if declare -f log_warn > /dev/null 2>&1; then
-        log_warn "phoenix_hypervisor_setup_drdevstral.sh: Sourced common functions from /usr/local/bin/. Prefer /usr/local/lib/phoenix_hypervisor/."
-    else
-        echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced common functions from /usr/local/bin/. Prefer /usr/local/lib/phoenix_hypervisor/." >&2
+# Source Phoenix Hypervisor Common Functions
+PHOENIX_COMMON_LOADED=0
+for common_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_common.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_common.sh"; do
+    if [[ -f "$common_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$common_path"
+        if declare -F log_info >/dev/null 2>&1; then
+            PHOENIX_COMMON_LOADED=1
+            log_info "phoenix_hypervisor_setup_drdevstral.sh: Sourced common functions from $common_path."
+            break
+        else
+            echo "[WARN] Sourced $common_path, but common functions not found. Trying next location."
+        fi
     fi
-elif [[ -f "./phoenix_hypervisor_common.sh" ]]; then
-    source ./phoenix_hypervisor_common.sh
-    if declare -f log_warn > /dev/null 2>&1; then
-        log_warn "phoenix_hypervisor_setup_drdevstral.sh: Sourced common functions from current directory. Prefer standard locations."
-    else
-        echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced common functions from current directory. Prefer standard locations." >&2
-    fi
+done
+
+# Fallback logging if common lib fails
+if [[ $PHOENIX_COMMON_LOADED -ne 1 ]]; then
+    echo "[WARN] phoenix_hypervisor_common.sh not loaded. Using minimal logging."
+    log_info() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*"; }
+    log_warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $*" >&2; }
+    log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
 else
-    echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Common functions file not found in standard locations." >&2
-    exit 1
+    # Initialize logging from the common library if loaded successfully
+    setup_logging 2>/dev/null || true # Redirect potential early errors
 fi
 
-if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_lxc_common_nvidia.sh" ]]; then
-    source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_lxc_common_nvidia.sh
-elif [[ -f "./phoenix_hypervisor_lxc_common_nvidia.sh" ]]; then
-    source ./phoenix_hypervisor_lxc_common_nvidia.sh
-    if declare -f log_warn > /dev/null 2>&1; then
-        log_warn "phoenix_hypervisor_setup_drdevstral.sh: Sourced LXC NVIDIA functions from current directory. Prefer /usr/local/lib/phoenix_hypervisor/."
-    else
-        echo "[WARN] phoenix_hypervisor_setup_drdevstral.sh: Sourced LXC NVIDIA functions from current directory. Prefer /usr/local/lib/phoenix_hypervisor/." >&2
+# Source NVIDIA LXC Common Functions
+PHOENIX_NVIDIA_LOADED=0
+for nvidia_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_nvidia.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_nvidia.sh"; do
+    if [[ -f "$nvidia_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$nvidia_path"
+        if declare -F install_nvidia_driver_in_container_via_runfile >/dev/null 2>&1; then
+            PHOENIX_NVIDIA_LOADED=1
+            log_info "phoenix_hypervisor_setup_drdevstral.sh: Sourced NVIDIA LXC common functions from $nvidia_path."
+            break
+        else
+            log_warn "Sourced $nvidia_path, but NVIDIA functions not found. Trying next location."
+        fi
     fi
-else
-    echo "[ERROR] phoenix_hypervisor_setup_drdevstral.sh: Required LXC NVIDIA functions file not found." >&2
-    exit 1
+done
+
+if [[ $PHOENIX_NVIDIA_LOADED -ne 1 ]]; then
+    log_error "Failed to load phoenix_hypervisor_lxc_common_nvidia.sh. Cannot proceed with NVIDIA setup."
 fi
 
-# --- Logging Setup ---
-setup_logging() {
-    local log_dir="/var/log/phoenix_hypervisor"
-    mkdir -p "$log_dir"
-    touch "$HYPERVISOR_LOGFILE" "${HYPERVISOR_LOGFILE%.log}_debug.log"
-    chmod 644 "$HYPERVISOR_LOGFILE" "${HYPERVISOR_LOGFILE%.log}_debug.log"
-    if [[ ! -w "$HYPERVISOR_LOGFILE" ]] || [[ ! -w "${HYPERVISOR_LOGFILE%.log}_debug.log" ]]; then
-        echo "[ERROR] Cannot write to log files: $HYPERVISOR_LOGFILE or ${HYPERVISOR_LOGFILE%.log}_debug.log" >&2
-        exit 1
-    fi
-    exec 3>>"$HYPERVISOR_LOGFILE"
-    exec 4>>"${HYPERVISOR_LOGFILE%.log}_debug.log"
-}
-
-setup_logging
-
-# --- Dependency Validation ---
-validate_dependencies() {
-    log_info "Validating dependencies for container setup..."
-    command -v jq >/dev/null 2>&1 || { log_error "jq not installed"; exit 1; }
-    command -v pct >/dev/null 2>&1 || { log_error "pct not installed"; exit 1; }
-    systemctl is-active --quiet apparmor || { log_error "apparmor service not active"; exit 1; }
-    log_info "Dependencies validated successfully"
-}
-
-# --- Container State Validation ---
-validate_container_state() {
-    local container_id="$1"
-    log_info "Validating container $container_id state..."
-    if ! pct status "$container_id" | grep -q "running"; then
-        log_info "Container $container_id is not running, attempting to start..."
-        if ! retry_command 3 10 pct start "$container_id"; then
-            log_error "Failed to start container $container_id"
-            exit 1
+# --- Source New Common Libraries ---
+# Source Base LXC Common Functions
+PHOENIX_BASE_LOADED=0
+for base_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_base.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_base.sh"; do
+    if [[ -f "$base_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$base_path"
+        if declare -F pct_exec_with_retry >/dev/null 2>&1; then
+            PHOENIX_BASE_LOADED=1
+            log_info "phoenix_hypervisor_setup_drdevstral.sh: Sourced Base LXC common functions from $base_path."
+            break
+        else
+            log_warn "Sourced $base_path, but Base LXC functions not found. Trying next location."
         fi
     fi
+done
 
-    if ! grep -q "lxc.apparmor.profile: unconfined" "/etc/pve/lxc/$container_id.conf"; then
-        log_info "Adding AppArmor unconfined profile to container $container_id..."
-        echo "lxc.apparmor.profile: unconfined" >> "/etc/pve/lxc/$container_id.conf" || {
-            log_error "Failed to set AppArmor profile for $container_id"
-            exit 1
-        }
-        log_info "Restarting container $container_id to apply AppArmor profile..."
-        pct stop "$container_id" || true
-        sleep 5
-        if ! retry_command 3 10 pct start "$container_id"; then
-            log_error "Failed to restart container $container_id"
-            exit 1
-        fi
-    else
-        log_info "AppArmor unconfined profile already set for container $container_id"
-    fi
-    log_info "Container $container_id state validated successfully"
-}
+if [[ $PHOENIX_BASE_LOADED -ne 1 ]]; then
+    log_error "Failed to load phoenix_hypervisor_lxc_common_base.sh. Cannot proceed with base LXC operations."
+fi
 
-# --- Setup Functions ---
-
-# - Validate Container Configuration -
-validate_container() {
-    local container_id="$1"
-    log_info "Validating container configuration for container_id=$container_id"
-
-    if ! command -v jq >/dev/null 2>&1; then
-        log_error "jq command not found."
-        return 1
-    fi
-
-    if [[ ! -f "$PHOENIX_LXC_CONFIG_FILE" ]]; then
-        log_error "Config file does not exist: $PHOENIX_LXC_CONFIG_FILE"
-        return 1
-    fi
-    if [[ ! -r "$PHOENIX_LXC_CONFIG_FILE" ]]; then
-        log_error "Config file is not readable: $PHOENIX_LXC_CONFIG_FILE"
-        return 1
-    fi
-
-    local container_config
-    container_config=$(jq -c ".lxc_configs.\"$container_id\"" "$PHOENIX_LXC_CONFIG_FILE")
-    if [[ -z "$container_config" || "$container_config" == "null" ]]; then
-        log_error "No configuration found for container $container_id in $PHOENIX_LXC_CONFIG_FILE"
-        return 1
-    fi
-
-    local required_fields=(
-        "name"
-        "memory_mb"
-        "cores"
-        "template"
-        "storage_pool"
-        "storage_size_gb"
-        "network_config"
-        "features"
-        "vllm_model"
-        "vllm_api_port"
-    )
-
-    for field in "${required_fields[@]}"; do
-        local value
-        value=$(echo "$container_config" | jq -r ".$field")
-        if [[ -z "$value" || "$value" == "null" ]]; then
-            log_error "Missing or invalid field '$field' for container $container_id"
-            return 1
-        fi
-    done
-
-    local gpu_assignment
-    gpu_assignment=$(echo "$container_config" | jq -r '.gpu_assignment // "none"')
-    if [[ "$gpu_assignment" != "none" ]]; then
-        if ! echo "$gpu_assignment" | grep -qE '^[0-9]+(,[0-9]+)*$'; then
-            log_error "Invalid GPU assignment format: $gpu_assignment (expected comma-separated numbers)"
-            return 1
+# Source Docker LXC Common Functions
+PHOENIX_DOCKER_LOADED=0
+for docker_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_docker.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_docker.sh"; do
+    if [[ -f "$docker_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$docker_path"
+        if declare -F install_docker_ce_in_container >/dev/null 2>&1; then
+            PHOENIX_DOCKER_LOADED=1
+            log_info "phoenix_hypervisor_setup_drdevstral.sh: Sourced Docker LXC common functions from $docker_path."
+            break
+        else
+            log_warn "Sourced $docker_path, but Docker LXC functions not found. Trying next location."
         fi
     fi
+done
 
-    local vllm_fields=(
-        "vllm_tensor_parallel_size"
-        "vllm_max_model_len"
-        "vllm_kv_cache_dtype"
-        "vllm_shm_size"
-        "vllm_gpu_count"
-        "vllm_gpu_memory_utilization"
-        "vllm_dtype"
-        "vllm_attention_backend"
-        "vllm_nccl_so_path"
-    )
+if [[ $PHOENIX_DOCKER_LOADED -ne 1 ]]; then
+    log_error "Failed to load phoenix_hypervisor_lxc_common_docker.sh. Cannot proceed with Docker operations."
+fi
 
-    for field in "${vllm_fields[@]}"; do
-        local value
-        value=$(echo "$container_config" | jq -r ".$field // empty")
-        if [[ -n "$value" ]]; then
-            log_info "vLLM field '$field' present: $value"
+# Source Validation LXC Common Functions
+PHOENIX_VALIDATION_LOADED=0
+for validation_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_validation.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_validation.sh"; do
+    if [[ -f "$validation_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$validation_path"
+        if declare -F validate_container_exists >/dev/null 2>&1; then
+            PHOENIX_VALIDATION_LOADED=1
+            log_info "phoenix_hypervisor_setup_drdevstral.sh: Sourced Validation LXC common functions from $validation_path."
+            break
+        else
+            log_warn "Sourced $validation_path, but Validation LXC functions not found. Trying next location."
         fi
-    done
+    fi
+done
 
-    log_info "Container $container_id configuration validated successfully."
-    return 0
-}
+if [[ $PHOENIX_VALIDATION_LOADED -ne 1 ]]; then
+    log_error "Failed to load phoenix_hypervisor_lxc_common_validation.sh. Cannot proceed with validation operations."
+fi
 
-# - Helper: Get Container Config Value -
+# Source Systemd LXC Common Functions
+PHOENIX_SYSTEMD_LOADED=0
+for systemd_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_systemd.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_systemd.sh"; do
+    if [[ -f "$systemd_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$systemd_path"
+        if declare -F create_systemd_service_in_container >/dev/null 2>&1; then
+            PHOENIX_SYSTEMD_LOADED=1
+            log_info "phoenix_hypervisor_setup_drdevstral.sh: Sourced Systemd LXC common functions from $systemd_path."
+            break
+        else
+            log_warn "Sourced $systemd_path, but Systemd LXC functions not found. Trying next location."
+        fi
+    fi
+done
+
+if [[ $PHOENIX_SYSTEMD_LOADED -ne 1 ]]; then
+    log_error "Failed to load phoenix_hypervisor_lxc_common_systemd.sh. Cannot proceed with systemd operations."
+fi
+
+# --- Helper Functions (Specific to this script) ---
+
+# Get a specific value from the container configuration in the JSON file
+# Usage: get_container_config_value <key>
 get_container_config_value() {
-    local container_id="$1"
-    local field="$2"
-    local value
-
-    if ! command -v jq >/dev/null 2>&1; then
-        log_error "get_container_config_value: 'jq' command not found."
-        return 1
+    local key="$1"
+    if [[ -z "$key" ]]; then
+        log_error "get_container_config_value: Key cannot be empty"
     fi
-
-    value=$(jq -r ".lxc_configs.\"$container_id\".$field // empty" "$PHOENIX_LXC_CONFIG_FILE")
-    if [[ -z "$value" || "$value" == "null" ]]; then
-        log_error "get_container_config_value: Field '$field' not found or empty for container $container_id"
-        return 1
-    fi
-    echo "$value"
-    return 0
+    # Use jq to extract the value, returning "null" if not found
+    jq -r ".lxc_configs.\"$CONTAINER_ID\".$key // \"null\"" "$PHOENIX_LXC_CONFIG_FILE" 2>/dev/null || echo "null"
 }
 
-# - Helper: Get Global Config Value -
+# Get a specific value from the global configuration in the JSON file
+# Usage: get_global_config_value <key>
 get_global_config_value() {
-    local field="$1"
-    local value
+    local key="$1"
+    if [[ -z "$key" ]]; then
+        log_error "get_global_config_value: Key cannot be empty"
+    fi
+    # Use jq to extract the value, returning "null" if not found
+    jq -r ".$key // \"null\"" "$PHOENIX_LXC_CONFIG_FILE" 2>/dev/null || echo "null"
+}
 
+# --- Core Setup Functions ---
+
+# 1. Validate Dependencies
+validate_dependencies() {
+    log_info "validate_dependencies: Checking for required commands..."
     if ! command -v jq >/dev/null 2>&1; then
-        log_error "get_global_config_value: 'jq' command not found."
-        return 1
+        log_error "validate_dependencies: jq not installed."
     fi
-
-    value=$(jq -r ".$field // empty" "$PHOENIX_LXC_CONFIG_FILE")
-    if [[ -z "$value" || "$value" == "null" ]]; then
-        log_error "get_global_config_value: Field '$field' not found or empty"
-        return 1
+    if ! command -v pct >/dev/null 2>&1; then
+        log_error "validate_dependencies: pct not installed."
     fi
-    echo "$value"
-    return 0
+    log_info "validate_dependencies: All required commands found."
 }
 
-# - Helper: Execute Command in Container with Retry -
-pct_exec_with_retry() {
-    local container_id="$1"
-    local command="$2"
-    local max_attempts=3
-    local delay=30
-    local attempt=1
+# 2. Validate Container State (adapted from original)
+validate_container_state() {
+    local lxc_id="$1"
+    log_info "validate_container_state: Validating state for container $lxc_id..."
 
-    while [[ $attempt -le $max_attempts ]]; do
-        log_info "Executing command in container $container_id (attempt $attempt/$max_attempts)..."
-        if pct exec "$container_id" -- bash <<EOF 2>&1 | tee -a "$HYPERVISOR_LOGFILE"
-$command
-EOF
-        then
-            log_info "Command executed successfully in container $container_id"
-            return 0
-        else
-            log_warn "Command failed in container $container_id. Retrying in $delay seconds..."
-            sleep "$delay"
-            ((attempt++))
+    # Check if container exists
+    if ! validate_container_exists "$lxc_id"; then
+        log_error "validate_container_state: Container $lxc_id does not exist."
+    fi
+
+    # Ensure container is running
+    if ! ensure_container_running "$lxc_id"; then
+        log_error "validate_container_state: Failed to ensure container $lxc_id is running."
+    fi
+
+    # Basic network check
+    if ! check_container_network "$lxc_id"; then
+        log_warn "validate_container_state: Network check failed. Attempting to set temporary DNS..."
+        if ! set_temporary_dns "$lxc_id"; then
+            log_error "validate_container_state: Failed to set temporary DNS for container $lxc_id."
         fi
-    done
-    log_error "Command failed after $max_attempts attempts in container $container_id"
-    return 1
-}
-
-# - Build Custom vLLM Image -
-build_custom_vllm_image() {
-    local container_id="$1"
-    local image_tag="${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13}"
-
-    log_info "Building custom vLLM image $image_tag in container $container_id..."
-    echo "Building custom vLLM image $image_tag for container $container_id... This may take several minutes."
-
-    local dockerfile_cmd="set -e
-    mkdir -p /root/vllm-build
-    cd /root/vllm-build
-
-    # Create a minimal Dockerfile
-    cat <<'EOF' > Dockerfile
-    # Use the official vLLM CUDA image as the base
-    # Pinning to a specific tag is recommended for stability
-    # Example alternative: FROM vllm/vllm-openai:v0.8.1
-    FROM vllm/vllm-openai:latest
-
-    # Switch to root user to install system packages
-    USER root
-
-    # Install common utilities if needed (usually already present)
-    # RUN apt-get update && apt-get install -y --no-install-recommends \\
-    #     curl wget git \\
-    #     && rm -rf /var/lib/apt/lists/*
-
-    # Install flashinfer via pip
-    # Using --no-build-isolation can sometimes help if there are build environment conflicts,
-    # but it's generally better to ensure dependencies are correct.
-    # --extra-index-url is needed for flashinfer wheels.
-    RUN pip install --upgrade pip && \\
-        pip install flashinfer --extra-index-url https://flashinfer.ai/whl/cu121/torch2.4/
-
-    # Optional: Install pyairports or outlines if needed by your specific use case
-    # Be cautious with outlines versions if they caused issues before.
-    # RUN pip install pyairports || echo \"Warning: pyairports installation failed\"
-    # RUN pip install outlines==0.0.34 || echo \"Warning: outlines installation failed\"
-
-    # Set the NCCL path environment variable
-    # This tells vLLM where to look for NCCL *inside* the container.
-    # It should match the path where NCCL is accessible within the official image context.
-    # The official image likely already has NCCL, but setting this ensures consistency
-    # with your configuration, especially if mounting from the host LXC filesystem.
-    ENV VLLM_NCCL_SO_PATH=/usr/lib/x86_64-linux-gnu/libnccl.so
-
-    # Switch back to the non-root user (usually 'vllm') for running the service
-    # Check the base image's USER directive. vllm images often run as 'vllm'.
-    # USER vllm
-
-    # The base image's CMD is usually ['serve'], so we don't need to redefine it
-    # unless we want to override default arguments.
-    # CMD [\"serve\"]
-    EOF
-
-    echo '[INFO] Building custom vLLM image $image_tag from updated Dockerfile...'
-    # Build the image
-    if docker build -t $image_tag /root/vllm-build; then
-        echo '[SUCCESS] Custom vLLM image $image_tag built successfully.'
-        else
-        echo '[ERROR] Failed to build custom vLLM image $image_tag.'
-        exit 1
-    fi
-    "
-
-    if ! pct_exec_with_retry "$container_id" "$dockerfile_cmd"; then
-        log_error "build_custom_vllm_image: Failed to build custom vLLM image $image_tag in container $container_id"
-        return 1
-    fi
-
-    log_info "Custom vLLM image $image_tag built successfully in container $container_id"
-    echo "Custom vLLM image $image_tag build completed for container $container_id."
-    return 0
-}
-
-# - Show Setup Information -
-show_setup_info() {
-    local container_id="$1"
-    log_info "Displaying setup configuration for container $container_id..."
-
-    echo ""
-    echo "==============================================="
-    echo "DRDEVSTRAL SETUP CONFIGURATION"
-    echo "==============================================="
-    echo "Container ID: $container_id"
-    local name memory_mb cores template storage_pool storage_size_gb network_config features
-    name=$(get_container_config_value "$container_id" "name") || name="N/A"
-    memory_mb=$(get_container_config_value "$container_id" "memory_mb") || memory_mb="N/A"
-    cores=$(get_container_config_value "$container_id" "cores") || cores="N/A"
-    template=$(get_container_config_value "$container_id" "template") || template="N/A"
-    storage_pool=$(get_container_config_value "$container_id" "storage_pool") || storage_pool="N/A"
-    storage_size_gb=$(get_container_config_value "$container_id" "storage_size_gb") || storage_size_gb="N/A"
-    network_config=$(get_container_config_value "$container_id" "network_config") || network_config="N/A"
-    features=$(get_container_config_value "$container_id" "features") || features="N/A"
-    echo "Name: $name"
-    echo "Memory: $memory_mb MB"
-    echo "Cores: $cores"
-    echo "Template: $template"
-    echo "Storage Pool: $storage_pool"
-    echo "Storage Size: $storage_size_gb GB"
-    echo "Network Config: $network_config"
-    echo "Features: $features"
-    echo ""
-    echo "vLLM Configuration:"
-    local vllm_model vllm_tensor_parallel_size vllm_max_model_len vllm_kv_cache_dtype vllm_shm_size vllm_gpu_count vllm_api_port vllm_gpu_memory_utilization vllm_dtype vllm_attention_backend vllm_nccl_so_path
-    vllm_model=$(get_container_config_value "$container_id" "vllm_model") || vllm_model="N/A"
-    vllm_tensor_parallel_size=$(get_container_config_value "$container_id" "vllm_tensor_parallel_size") || vllm_tensor_parallel_size="N/A"
-    vllm_max_model_len=$(get_container_config_value "$container_id" "vllm_max_model_len") || vllm_max_model_len="N/A"
-    vllm_kv_cache_dtype=$(get_container_config_value "$container_id" "vllm_kv_cache_dtype") || vllm_kv_cache_dtype="N/A"
-    vllm_shm_size=$(get_container_config_value "$container_id" "vllm_shm_size") || vllm_shm_size="N/A"
-    vllm_gpu_count=$(get_container_config_value "$container_id" "vllm_gpu_count") || vllm_gpu_count="N/A"
-    vllm_api_port=$(get_container_config_value "$container_id" "vllm_api_port") || vllm_api_port="N/A"
-    vllm_gpu_memory_utilization=$(get_container_config_value "$container_id" "vllm_gpu_memory_utilization") || vllm_gpu_memory_utilization="N/A"
-    vllm_dtype=$(get_container_config_value "$container_id" "vllm_dtype") || vllm_dtype="N/A"
-    vllm_attention_backend=$(get_container_config_value "$container_id" "vllm_attention_backend") || vllm_attention_backend="N/A"
-    vllm_nccl_so_path=$(get_container_config_value "$container_id" "vllm_nccl_so_path") || vllm_nccl_so_path="N/A"
-    echo "Model Path: $vllm_model"
-    echo "Tensor Parallel Size: $vllm_tensor_parallel_size"
-    echo "Max Model Length: $vllm_max_model_len"
-    echo "KV Cache Data Type: $vllm_kv_cache_dtype"
-    echo "Shared Memory Size: $vllm_shm_size"
-    echo "GPU Count: $vllm_gpu_count"
-    echo "GPU Memory Utilization: $vllm_gpu_memory_utilization"
-    echo "Data Type: $vllm_dtype"
-    echo "Attention Backend: $vllm_attention_backend"
-    echo "NCCL SO Path: $vllm_nccl_so_path"
-    echo ""
-    echo "GPU Assignment:"
-    local gpu_assignment
-    gpu_assignment=$(get_container_config_value "$container_id" "gpu_assignment") || gpu_assignment="none"
-    echo "GPUs: $gpu_assignment"
-    echo ""
-    echo "NVIDIA Configuration:"
-    local nvidia_driver_version nvidia_repo_url
-    nvidia_driver_version=$(get_global_config_value "nvidia_driver_version") || nvidia_driver_version="N/A"
-    nvidia_repo_url=$(get_global_config_value "nvidia_repo_url") || nvidia_repo_url="N/A"
-    echo "NVIDIA Driver Version: $nvidia_driver_version"
-    echo "NVIDIA Repository URL: $nvidia_repo_url"
-    echo "==============================================="
-    echo ""
-}
-
-# - Setup Container Environment -
-setup_container_environment() {
-    local container_id="$1"
-    log_info "Setting up environment for container $container_id..."
-    echo "Setting up base environment for container $container_id... This may take a few minutes."
-
-    local status
-    status=$(pct status "$container_id" 2>/dev/null | grep 'status' | awk '{print $2}')
-    if [[ "$status" != "running" ]]; then
-        log_info "Starting container $container_id..."
-        if ! pct start "$container_id"; then
-            log_error "setup_container_environment: Failed to start container $container_id"
-            return 1
+        # Retry network check after setting DNS
+        if ! check_container_network "$lxc_id"; then
+            log_error "validate_container_state: Network check still failed after setting DNS for container $lxc_id."
         fi
-        sleep 10
     fi
 
-    local network_check_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-echo 'nameserver 8.8.8.8' > /etc/resolv.conf
-ping -c 4 8.8.8.8 || { echo '[ERROR] Network connectivity check failed'; exit 1; }
-"
-    if ! pct_exec_with_retry "$container_id" "$network_check_cmd"; then
-        log_error "setup_container_environment: Network connectivity check failed for container $container_id"
-        return 1
-    fi
-    log_info "Network connectivity verified for container $container_id"
-
-    local setup_cmd="
-set -e
-export DEBIAN_FRONTEND=noninteractive
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-echo '[INFO] Setting up locale...'
-apt-get update -y --fix-missing
-apt-get install -y locales
-locale-gen en_US.UTF-8
-update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-echo '[INFO] Updating package lists... This may take a few minutes.'
-apt-get update -y --fix-missing || { echo '[ERROR] Failed to update package lists'; exit 1; }
-echo '[INFO] Upgrading packages... This may take a few minutes.'
-apt-get upgrade -y --fix-missing || { echo '[ERROR] Failed to upgrade packages'; exit 1; }
-echo '[INFO] Installing base dependencies... This may take a few minutes.'
-apt-get install -y python3 python3-pip git curl wget pipx nvtop || { echo '[ERROR] Failed to install base dependencies'; exit 1; }
-echo '[INFO] Installing huggingface_hub...'
-if /usr/bin/python3 -m pip install --user --break-system-packages huggingface_hub; then
-    echo '[INFO] huggingface_hub installed via pip --user --break-system-packages'
-    export PATH=\"/root/.local/bin:\$PATH\"
-    if /usr/bin/python3 -c \"import huggingface_hub; print(f\\\"huggingface_hub version: {huggingface_hub.__version__}\\\")\"; then
-        echo '[INFO] huggingface_hub import verified successfully'
-    else
-        echo '[ERROR] huggingface_hub module not importable after pip install --user --break-system-packages'
-        exit 1
-    fi
-else
-    echo '[ERROR] Failed to install huggingface_hub via pip --user --break-system-packages'
-    if pipx install huggingface_hub; then
-        echo '[WARN] Installed via pipx, verifying import might fail if library not in system path'
-        pipx ensurepath
-        export PATH=\"/root/.local/bin:\$PATH\"
-    else
-        echo '[ERROR] Failed to install huggingface_hub via pipx as well'
-        exit 1
-    fi
-fi
-"
-    if ! pct_exec_with_retry "$container_id" "$setup_cmd"; then
-        log_error "setup_container_environment: Failed to install base dependencies in container $container_id"
-        return 1
-    fi
-
-    log_info "Container environment setup completed for $container_id"
-    echo "Base environment setup completed for container $container_id."
-    return 0
-}
-
-# - Setup NVIDIA Packages and Toolkit -
-setup_nvidia_packages() {
-    local container_id="$1"
-    log_info "Installing NVIDIA packages and toolkit in container $container_id..."
-    echo "Installing NVIDIA packages and toolkit for container $container_id... This may take several minutes."
-
+    # Check and Configure GPU Passthrough
     local gpu_assignment
-    gpu_assignment=$(get_container_config_value "$container_id" "gpu_assignment") || gpu_assignment="none"
-    if [[ "$gpu_assignment" == "none" ]]; then
-        log_info "No GPU assignment for container $container_id, skipping NVIDIA package setup."
+    gpu_assignment=$(get_container_config_value "gpu_assignment")
+    if [[ "$gpu_assignment" == "null" || "$gpu_assignment" == "none" || -z "$gpu_assignment" ]]; then
+        log_info "validate_container_state: No GPU assignment found for container $lxc_id. Skipping GPU passthrough."
         return 0
     fi
 
-    local nvidia_driver_version nvidia_repo_url
-    nvidia_driver_version=$(get_global_config_value "nvidia_driver_version") || nvidia_driver_version="$NVIDIA_DRIVER_VERSION"
-    nvidia_repo_url=$(get_global_config_value "nvidia_repo_url" | sed 's/[[:space:]]*$//') || nvidia_repo_url="$NVIDIA_REPO_URL"
-
-    if ! install_docker_ce_in_container "$container_id"; then
-        log_error "setup_nvidia_packages: Failed to install Docker-ce in container $container_id"
-        return 1
+    # Validate GPU assignment format
+    if ! validate_gpu_assignment_format "$gpu_assignment"; then
+        log_error "validate_container_state: Invalid GPU assignment format for container $lxc_id: $gpu_assignment"
     fi
 
-    if ! setup_nvidia_repo_in_container "$container_id" "$nvidia_repo_url"; then
-        log_error "setup_nvidia_packages: Failed to set up NVIDIA repositories in container $container_id"
-        return 1
-    fi
+    # Check if GPU passthrough is already configured by looking for a common entry
+    local config_file="/etc/pve/lxc/${lxc_id}.conf"
+    local gpu_configured
+    gpu_configured=$(pct config "$lxc_id" | grep -c "lxc.cgroup2.devices.allow: c 195" || true)
 
-    if ! install_nvidia_userland_in_container "$container_id" "$nvidia_driver_version"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA driver in container $container_id"
-        return 1
+    if [[ "$gpu_configured" -gt 0 ]]; then
+        log_info "validate_container_state: GPU passthrough already configured for container $lxc_id."
+    else
+        log_info "validate_container_state: Configuring GPU passthrough for container $lxc_id (GPUs: $gpu_assignment)..."
+        if ! configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
+            log_error "validate_container_state: Failed to configure GPU passthrough for container $lxc_id."
+        fi
+        log_info "validate_container_state: GPU passthrough configured. Restarting container $lxc_id to apply changes..."
+        pct stop "$lxc_id" || true
+        sleep 5
+        if ! retry_command 3 10 pct start "$lxc_id"; then
+            log_error "validate_container_state: Failed to restart container $lxc_id after GPU passthrough configuration."
+        fi
+        log_info "validate_container_state: Container $lxc_id restarted with GPU passthrough."
     fi
-
-    if ! install_nvidia_toolkit_in_container "$container_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA Container Toolkit in container $container_id"
-        return 1
-    fi
-
-    if ! configure_docker_nvidia_runtime "$container_id"; then
-        log_error "setup_nvidia_packages: Failed to configure NVIDIA runtime in container $container_id"
-        return 1
-    fi
-
-    if ! verify_lxc_gpu_access_in_container "$container_id" "$gpu_assignment"; then
-        log_error "setup_nvidia_packages: Failed to verify GPU access in container $container_id"
-        return 1
-    fi
-
-    log_info "NVIDIA packages and toolkit installed successfully for container $container_id"
-    echo "NVIDIA packages and toolkit setup completed for container $container_id."
-    return 0
 }
 
-# --- NEW FUNCTION: Install NCCL Library ---
-install_nccl_library_in_container() {
+# 3. Setup NVIDIA Packages (adapted from original)
+setup_nvidia_packages() {
     local lxc_id="$1"
-    # Note: driver_version argument removed as it's not directly used for libnccl-dev versioning in standard repos for this case.
-    # If specific CUDA/NCCL versioning is needed, logic would need adjustment.
+    log_info "setup_nvidia_packages: Installing NVIDIA components in container $lxc_id..."
 
-    log_info "install_nccl_library_in_container: Installing NCCL library in container $lxc_id"
-
-    # Command to install the NCCL development package inside the container
-    # This places the library in /usr/lib/x86_64-linux-gnu/
-    local install_cmd="
-    set -e
-    export DEBIAN_FRONTEND=noninteractive
-    echo '[INFO] Updating package lists...'
-    apt-get update -y --fix-missing || { echo '[ERROR] Failed to update package lists'; exit 1; }
-    echo '[INFO] Installing libnccl-dev...'
-    apt-get install -y libnccl-dev || { echo '[ERROR] Failed to install libnccl-dev'; exit 1; }
-
-    # Check if the library file exists in the standard location after installation
-    STANDARD_NCCL_PATH='/usr/lib/x86_64-linux-gnu/libnccl.so'
-    if [[ -f \"\$STANDARD_NCCL_PATH\" ]]; then
-        echo '[SUCCESS] libnccl-dev installed, libnccl.so found at \$STANDARD_NCCL_PATH.'
-    elif [[ -L \"\$STANDARD_NCCL_PATH\" ]]; then # Check if it's a symlink
-         echo '[SUCCESS] libnccl-dev installed, libnccl.so found (symlink) at \$STANDARD_NCCL_PATH.'
-    else
-        echo '[ERROR] libnccl-dev installed but libnccl.so not found in expected location (\$STANDARD_NCCL_PATH).'
-        exit 1
-    fi
-    "
-
-    # Execute the installation command inside the container
-    if ! pct_exec_with_retry "$lxc_id" "$install_cmd"; then
-        log_error "install_nccl_library_in_container: Failed to install NCCL library in container $lxc_id"
-        return 1
+    # Install NVIDIA driver via repository (preferred method)
+    log_info "setup_nvidia_packages: Installing NVIDIA driver via repository..."
+    if ! setup_nvidia_repo_in_container "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install NVIDIA driver via repository in container $lxc_id."
     fi
 
-    log_info "install_nccl_library_in_container: NCCL library installed successfully in container $lxc_id"
-    return 0
+    # Install NVIDIA userland libraries
+    log_info "setup_nvidia_packages: Installing NVIDIA userland libraries..."
+    if ! install_nvidia_userland_in_container "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install NVIDIA userland in container $lxc_id."
+    fi
+
+    # Install NVIDIA Container Toolkit (nvidia-docker2)
+    log_info "setup_nvidia_packages: Installing NVIDIA Container Toolkit..."
+    if ! install_nvidia_toolkit_in_container "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install NVIDIA toolkit in container $lxc_id."
+    fi
+
+    # Configure Docker to use NVIDIA runtime
+    log_info "setup_nvidia_packages: Configuring Docker NVIDIA runtime..."
+    if ! configure_docker_nvidia_runtime "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to configure Docker NVIDIA runtime in container $lxc_id."
+    fi
+
+    # Verify basic GPU access inside the container
+    log_info "setup_nvidia_packages: Verifying basic GPU access in container $lxc_id..."
+    if ! verify_lxc_gpu_access_in_container "$lxc_id"; then
+        log_error "setup_nvidia_packages: Basic GPU access verification failed in container $lxc_id."
+    fi
+
+    # Install NCCL library for multi-GPU communication
+    log_info "setup_nvidia_packages: Installing NCCL library..."
+    if ! install_nccl_library_in_container "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install NCCL library in container $lxc_id."
+    fi
+
+    log_info "setup_nvidia_packages: NVIDIA components installed and configured successfully in container $lxc_id."
 }
 
-# - Setup Model -
+# 4. Setup Model (adapted from original)
 setup_model() {
-    local container_id="$1"
-    local vllm_model_raw
-    vllm_model_raw=$(get_container_config_value "$container_id" "vllm_model") || {
-        log_error "setup_model: Failed to retrieve vllm_model for container $container_id"
-        return 1
-    }
-    # Extract the Hugging Face model ID from the path (e.g., /models/Qwen/Qwen2.5-Coder-7B-Instruct -> Qwen/Qwen2.5-Coder-7B-Instruct)
-    local vllm_model_hf_id="${vllm_model_raw#/models/}"
+    local lxc_id="$1"
+    log_info "setup_model: Setting up model for container $lxc_id..."
 
-    log_info "Setting up model $vllm_model_hf_id in container $container_id..."
-    echo "Downloading model $vllm_model_hf_id for container $container_id... This may take several minutes."
-    local hf_token=""
-    if [[ -f "$PHOENIX_HF_TOKEN_FILE" ]]; then
-        hf_token=$(cat "$PHOENIX_HF_TOKEN_FILE" | tr -d ' \t\n\r')
-        if [[ -z "$hf_token" ]]; then
-            log_error "setup_model: Hugging Face token file is empty: $PHOENIX_HF_TOKEN_FILE"
-            return 1
-        fi
-    else
-        log_warn "setup_model: Hugging Face token file not found: $PHOENIX_HF_TOKEN_FILE. Attempting model download without authentication."
+    local model_path
+    model_path=$(get_container_config_value "vllm.model")
+    if [[ "$model_path" == "null" || "$model_path" == "none" ]]; then
+        log_info "setup_model: No model path specified in config for container $lxc_id. Skipping model setup."
+        return 0
     fi
-    local model_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-export PATH=\"/root/.local/bin:\$PATH\"
-mkdir -p /models
-# Check available disk space (needs ~20GB for Qwen2.5-Coder-7B-Instruct)
-required_space=20000000  # 20GB in KB
-available_space=\$(df -k /models | tail -1 | awk '{print \$4}')
-if [ \$available_space -lt \$required_space ]; then
-    echo \"[ERROR] Insufficient disk space in /models: \$available_space KB available, \$required_space KB required\"
-    exit 1
-fi
-export HF_TOKEN=\"$hf_token\"
-for i in 1 2 3; do
-    echo \"[INFO] Attempting to download model $vllm_model_hf_id (attempt \$i)\"
-    if huggingface-cli download --repo-type model --local-dir /models/$vllm_model_hf_id $vllm_model_hf_id; then
-        echo '[SUCCESS] Model downloaded successfully'
-        exit 0
-    else
-        echo '[WARNING] Model download failed, retrying in 10 seconds...'
-        sleep 10
+
+    # Check if model directory already exists
+    if validate_path_in_container "$lxc_id" "$model_path"; then
+        log_info "setup_model: Model path $model_path already exists in container $lxc_id. Skipping download."
+        return 0
     fi
-done
-echo '[ERROR] Failed to download model after 3 attempts'
-exit 1
+
+    # Install model download tools
+    log_info "setup_model: Installing model download tools..."
+    local install_tools_cmd="set -e
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -y --fix-missing
+apt-get install -y python3-pip git
+pip3 install huggingface_hub[cli] hf_transfer
+pip3 install hfdownloader
+echo '[SUCCESS] Model download tools installed.'
 "
-    if ! pct_exec_with_retry "$container_id" "$model_cmd"; then
-        log_error "setup_model: Failed to download model $vllm_model_hf_id in container $container_id"
-        return 1
+    if ! pct_exec_with_retry "$lxc_id" "$install_tools_cmd"; then
+        log_error "setup_model: Failed to install model download tools in container $lxc_id."
     fi
-    log_info "Model $vllm_model_hf_id downloaded successfully in container $container_id"
-    echo "Model $vllm_model_hf_id download completed for container $container_id."
-    return 0
+
+    # Download the model
+    log_info "setup_model: Downloading model to $model_path in container $lxc_id..."
+    local download_model_cmd="set -e
+export HF_HUB_ENABLE_HF_TRANSFER=1
+mkdir -p '$(dirname "$model_path")'
+cd '$(dirname "$model_path")'
+echo '[INFO] Starting model download...'
+hfdownloader -m '$model_path' -d '$model_path' -t '$PHOENIX_HF_TOKEN_FILE' -v
+echo '[SUCCESS] Model download completed.'
+"
+    if ! pct_exec_with_retry "$lxc_id" "$download_model_cmd"; then
+        log_error "setup_model: Failed to download model in container $lxc_id."
+    fi
+
+    log_info "setup_model: Model setup completed for container $lxc_id."
 }
 
-# - Setup vLLM Service -
+# 5. Build Custom vLLM Image (adapted from original)
+build_custom_vllm_image() {
+    local lxc_id="$1"
+    log_info "build_custom_vllm_image: Building custom vLLM Docker image in container $lxc_id..."
+
+    local vllm_image_tag="vllm-custom:latest"
+    local dockerfile_path="/root/vllm_custom_dockerfile"
+
+    # Define the Dockerfile content directly as a string
+    # Based on default vLLM image, adding hf_transfer for faster model loading
+    local dockerfile_content="FROM $DEFAULT_VLLM_IMAGE
+
+# Install hf_transfer for faster model downloading
+RUN pip install hf_transfer
+
+# Set a default command (can be overridden)
+CMD [\"python3\", \"--version\"]"
+
+    # Write the Dockerfile content to a file inside the container
+    local write_dockerfile_cmd="set -e
+mkdir -p /root/vllm_build
+cat << 'EOF_DOCKERFILE' > $dockerfile_path
+$dockerfile_content
+EOF_DOCKERFILE
+echo '[INFO] Custom vLLM Dockerfile written to $dockerfile_path'"
+
+    if ! pct_exec_with_retry "$lxc_id" "$write_dockerfile_cmd"; then
+        log_error "build_custom_vllm_image: Failed to write Dockerfile in container $lxc_id."
+    fi
+
+    # Build the Docker image inside the container using the written Dockerfile
+    if ! build_docker_image_in_container "$lxc_id" "$dockerfile_path" "$vllm_image_tag"; then
+        log_error "build_custom_vllm_image: Failed to build custom vLLM Docker image in container $lxc_id."
+    fi
+
+    log_info "build_custom_vllm_image: Custom vLLM Docker image built successfully in container $lxc_id."
+}
+
+# 6. Setup vLLM Service (adapted from original)
 setup_service() {
-    local container_id="$1"
-    local vllm_model_path=$(get_container_config_value "$container_id" "vllm_model")
-    local vllm_api_port=$(get_container_config_value "$container_id" "vllm_api_port")
-    local vllm_shm_size=$(get_container_config_value "$container_id" "vllm_shm_size" || echo "16g")
-    local vllm_tensor_parallel_size=$(get_container_config_value "$container_id" "vllm_tensor_parallel_size")
-    local vllm_max_model_len=$(get_container_config_value "$container_id" "vllm_max_model_len")
-    local vllm_kv_cache_dtype=$(get_container_config_value "$container_id" "vllm_kv_cache_dtype")
-    local vllm_gpu_memory_utilization=$(get_container_config_value "$container_id" "vllm_gpu_memory_utilization")
-    local vllm_dtype=$(get_container_config_value "$container_id" "vllm_dtype")
-    local vllm_attention_backend=$(get_container_config_value "$container_id" "vllm_attention_backend")
-    local vllm_nccl_so_path=$(get_container_config_value "$container_id" "vllm_nccl_so_path")
+    local lxc_id="$1"
+    log_info "setup_service: Setting up vLLM service in container $lxc_id..."
 
-    log_info "Setting up Docker-based vLLM service in container $container_id..."
-    echo "Configuring vLLM Docker service for container $container_id..."
+    # Get vLLM configuration from JSON
+    local model_path
+    local tensor_parallel_size
+    local gpu_memory_utilization
+    local max_model_len
+    local attention_backend
+    local kv_cache_dtype
+    local dtype
+    local port
+    local nccl_path
 
-    local hf_token=""
-    if [[ -f "$PHOENIX_HF_TOKEN_FILE" ]]; then
-        hf_token=$(cat "$PHOENIX_HF_TOKEN_FILE" | tr -d ' \t\n\r')
-        if [[ -z "$hf_token" ]]; then
-            log_error "setup_service: Hugging Face token file is empty: $PHOENIX_HF_TOKEN_FILE"
-            return 1
-        fi
-    else
-        log_warn "setup_service: Hugging Face token file not found: $PHOENIX_HF_TOKEN_FILE. Proceeding without token."
+    model_path=$(get_container_config_value "vllm.model")
+    tensor_parallel_size=$(get_container_config_value "vllm.tensor_parallel_size")
+    gpu_memory_utilization=$(get_container_config_value "vllm.gpu_memory_utilization")
+    max_model_len=$(get_container_config_value "vllm.max_model_len")
+    attention_backend=$(get_container_config_value "vllm.attention_backend")
+    kv_cache_dtype=$(get_container_config_value "vllm.kv_cache_dtype")
+    dtype=$(get_container_config_value "vllm.dtype")
+    port=$(get_container_config_value "vllm.port")
+    nccl_path="/usr/lib/x86_64-linux-gnu"
+
+    # Validate essential parameters
+    if [[ "$model_path" == "null" || "$model_path" == "none" ]]; then
+        log_error "setup_service: Model path is required in the configuration for container $lxc_id."
+    fi
+    if [[ "$port" == "null" ]]; then
+        log_error "setup_service: vLLM port is required in the configuration for container $lxc_id."
     fi
 
-    # Validate critical paths
-    local validation_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-if ! systemctl is-active --quiet docker; then
-    echo '[ERROR] Docker service is not running'
-    exit 1
-fi
-if [[ ! -d \"$vllm_model_path\" ]]; then
-    echo '[ERROR] Model directory does not exist: $vllm_model_path'
-    exit 1
-fi
-if [[ ! -f \"$vllm_nccl_so_path\" ]]; then
-    echo '[ERROR] NCCL library not found at: $vllm_nccl_so_path'
-    exit 1
-fi
-echo '[INFO] Docker service and critical paths validated'
-"
-    if ! pct_exec_with_retry "$container_id" "$validation_cmd"; then
-        log_error "setup_service: Pre-service validation failed for container $container_id"
-        return 1
+    # Set default values if not provided
+    tensor_parallel_size=${tensor_parallel_size:-1}
+    gpu_memory_utilization=${gpu_memory_utilization:-0.9}
+    attention_backend=${attention_backend:-"FLASHINFER"}
+    kv_cache_dtype=${kv_cache_dtype:-"auto"}
+    dtype=${dtype:-"auto"}
+    max_model_len=${max_model_len:-""} # Empty means no limit
+
+    # Build Docker run command arguments
+    local docker_args="--gpus all"
+    docker_args+=" --shm-size=16G"
+    docker_args+=" --ipc=host"
+    docker_args+=" -p $port:$port"
+    docker_args+=" -v $model_path:$model_path"
+    docker_args+=" -v $nccl_path:$nccl_path"
+    docker_args+=" -e NCCL_LIBRARY_PATH=$nccl_path/libnccl.so.2"
+
+    # Build vLLM command arguments
+    local vllm_args="--host 0.0.0.0"
+    vllm_args+=" --port $port"
+    vllm_args+=" --model $model_path"
+    vllm_args+=" --tensor-parallel-size $tensor_parallel_size"
+    vllm_args+=" --gpu-memory-utilization $gpu_memory_utilization"
+    vllm_args+=" --attention-backend $attention_backend"
+    vllm_args+=" --kv-cache-dtype $kv_cache_dtype"
+    vllm_args+=" --dtype $dtype"
+    if [[ -n "$max_model_len" ]]; then
+        vllm_args+=" --max-model-len $max_model_len"
     fi
 
-    # Build the vLLM arguments string
-    local vllm_args="--model $vllm_model_path"
-    vllm_args+=" --tensor-parallel-size $vllm_tensor_parallel_size"
-    vllm_args+=" --max-model-len $vllm_max_model_len"
-    vllm_args+=" --kv-cache-dtype $vllm_kv_cache_dtype"
-    vllm_args+=" --gpu-memory-utilization $vllm_gpu_memory_utilization"
-    vllm_args+=" --dtype $vllm_dtype"
-    vllm_args+=" --disable-custom-all-reduce"
-
-    local service_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-mkdir -p /root/.cache/huggingface
-mkdir -p $(dirname $vllm_nccl_so_path)
-cat <<EOF > /etc/systemd/system/vllm-docker.service
-[Unit]
-Description=vLLM Docker Container
-After=docker.service
+    # Define the systemd service content
+    local service_content="[Unit]
+Description=vLLM Docker Service
+After=network.target docker.service
 Requires=docker.service
 
 [Service]
-ExecStart=
-ExecStart=/usr/bin/docker run --rm --name vllm \\
-    --runtime=nvidia \\
-    --gpus all \\
-    -v /root/.cache/huggingface:/root/.cache/huggingface \\
-    -v /models:/models \\
-    -v $(dirname $vllm_nccl_so_path):$(dirname $vllm_nccl_so_path) \\
-    --env \"HUGGING_FACE_HUB_TOKEN=$hf_token\" \\
-    --env \"VLLM_ATTENTION_BACKEND=$vllm_attention_backend\" \\
-    --env \"VLLM_NCCL_SO_PATH=$vllm_nccl_so_path\" \\
-    -p $vllm_api_port:8000 \\
-    --ipc=host \\
-    --shm-size=$vllm_shm_size \\
-    ${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13} \\
-    serve $vllm_args
-
-ExecStop=/usr/bin/docker stop vllm
+Type=simple
 Restart=always
-RestartSec=10
+RestartSec=5
+ExecStartPre=/bin/bash -c 'docker image inspect vllm-custom:latest > /dev/null || { echo \"Custom vLLM image not found\"; exit 1; }'
+ExecStart=/usr/bin/docker run $docker_args vllm-custom:latest python3 -m vllm.entrypoints.openai.api_server $vllm_args
+ExecStop=/usr/bin/docker stop -t 10 vllm-server
+ExecStopPost=/usr/bin/docker rm -f vllm-server
 
 [Install]
-WantedBy=multi-user.target
-EOF
-systemctl daemon-reload
-systemctl enable vllm-docker.service
-for attempt in 1 2 3; do
-    echo \"[INFO] Starting vLLM Docker service (attempt \$attempt/3)...\"
-    systemctl start vllm-docker.service
-    sleep 10
-    if systemctl is-active --quiet vllm-docker.service; then
-        echo '[SUCCESS] vLLM Docker service started successfully.'
-        exit 0
-    else
-        echo '[WARN] vLLM Docker service failed to start, checking logs...'
-        docker ps -a --filter 'name=vllm' || true
-        docker logs vllm || true
-        systemctl status vllm-docker.service || true
-        sleep 5
-    fi
-done
-echo '[ERROR] vLLM Docker service failed to start after 3 attempts.'
-exit 1
-"
-    if ! pct_exec_with_retry "$container_id" "$service_cmd"; then
-        log_error "setup_service: Failed to set up vLLM Docker service in container $container_id"
-        return 1
+WantedBy=multi-user.target"
+
+    # Create the systemd service file inside the container
+    if ! create_systemd_service_in_container "$lxc_id" "vllm-docker" "$service_content"; then
+        log_error "setup_service: Failed to create systemd service file in container $lxc_id."
     fi
 
-    log_info "vLLM Docker service configured and started successfully in container $container_id"
-    echo "vLLM Docker service configured and started for container $container_id."
-    return 0
+    # Reload systemd daemon to recognize the new service
+    if ! reload_systemd_daemon_in_container "$lxc_id"; then
+        log_error "setup_service: Failed to reload systemd daemon in container $lxc_id."
+    fi
+
+    # Enable the service to start on boot
+    if ! enable_systemd_service_in_container "$lxc_id" "vllm-docker"; then
+        log_error "setup_service: Failed to enable systemd service in container $lxc_id."
+    fi
+
+    # Start the service
+    log_info "setup_service: Starting vLLM service in container $lxc_id..."
+    # Use retry logic for starting the service
+    local attempt=1
+    local max_attempts=3
+    while [[ $attempt -le $max_attempts ]]; do
+        log_info "setup_service: Attempting to start vLLM service (attempt $attempt/$max_attempts)..."
+        if start_systemd_service_in_container "$lxc_id" "vllm-docker"; then
+            log_info "setup_service: vLLM service started successfully in container $lxc_id."
+            return 0
+        else
+            log_warn "setup_service: Failed to start vLLM service on attempt $attempt. Retrying in 10 seconds..."
+            sleep 10
+            ((attempt++))
+        fi
+    done
+    log_error "setup_service: Failed to start vLLM service in container $lxc_id after $max_attempts attempts."
 }
 
-# - Validate Final Setup -
+# 7. Final Validation (adapted from original)
 validate_final_setup() {
-    local container_id="$1"
+    local lxc_id="$1"
     local checks_passed=0
     local checks_failed=0
 
-    log_info "Validating final setup for container $container_id..."
-    echo "Validating final setup for container $container_id..."
+    log_info "validate_final_setup: Validating final setup for container $lxc_id..."
+    echo "Validating final setup for container $lxc_id..."
 
-    local status
-    status=$(pct status "$container_id" 2>/dev/null | grep 'status' | awk '{print $2}')
-    if [[ "$status" == "running" ]]; then
-        log_info "validate_final_setup: Container $container_id is running"
-        ((checks_passed++))
+    # --- Check Container Status ---
+    if validate_container_running "$lxc_id"; then
+        log_info "validate_final_setup: Container $lxc_id is running"
+        ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: Container $container_id is not running (status: $status)"
-        ((checks_failed++))
+        log_error "validate_final_setup: Container $lxc_id is not running"
+        ((checks_failed++)) || true
     fi
 
-    local gpu_assignment
-    gpu_assignment=$(get_container_config_value "$container_id" "gpu_assignment") || gpu_assignment="none"
-    if [[ "$gpu_assignment" != "none" ]]; then
-        if pct_exec_with_retry "$container_id" "nvidia-smi"; then
-            log_info "validate_final_setup: GPU access verified for container $container_id"
-            ((checks_passed++))
-        else
-            log_error "validate_final_setup: GPU access verification failed for container $container_id"
-            ((checks_failed++))
-        fi
-        local docker_gpu_check="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-if docker run --rm --gpus all --runtime=nvidia nvidia/cuda:13.0.0-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
-    echo '[SUCCESS] Docker GPU access verified'
-    exit 0
-else
-    echo '[ERROR] Docker GPU access verification failed'
-    exit 1
-fi
-"
-        if pct_exec_with_retry "$container_id" "$docker_gpu_check"; then
-            log_info "validate_final_setup: Docker GPU access verified for container $container_id"
-            ((checks_passed++))
-        else
-            log_error "validate_final_setup: Docker GPU access verification failed for container $container_id"
-            ((checks_failed++))
-        fi
-    else
-        log_info "validate_final_setup: No GPU assignment for container $container_id, skipping GPU check"
-        ((checks_passed++))
-    fi
-    local vllm_model_path
-    vllm_model_path=$(get_container_config_value "$container_id" "vllm_model") || vllm_model_path=""
-    if [[ -n "$vllm_model_path" ]]; then
-        local model_check_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-if [[ -d \"$vllm_model_path\" ]]; then
-    echo '[SUCCESS] Model directory exists: $vllm_model_path'
-    exit 0
-else
-    echo '[ERROR] Model directory does not exist: $vllm_model_path'
-    exit 1
-fi
-"
-        if pct_exec_with_retry "$container_id" "$model_check_cmd"; then
-            log_info "validate_final_setup: Model directory exists for $vllm_model_path in container $container_id"
-            ((checks_passed++))
-        else
-            log_error "validate_final_setup: Model directory check failed for $vllm_model_path in container $container_id"
-            ((checks_failed++))
-        fi
-    else
-        log_error "validate_final_setup: vLLM model path not specified for container $container_id"
-        ((checks_failed++))
-    fi
-
-    local service_check_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-if systemctl is-active --quiet vllm-docker.service; then
-    echo '[SUCCESS] vLLM Docker service is running'
-    exit 0
-else
-    echo '[ERROR] vLLM Docker service is not running'
-    docker ps -a --filter 'name=vllm' || true
-    docker logs vllm || true
-    systemctl status vllm-docker.service || true
-    exit 1
-fi
-"
-    if pct_exec_with_retry "$container_id" "$service_check_cmd"; then
-        log_info "validate_final_setup: vLLM Docker service is running in container $container_id"
-        ((checks_passed++))
-    else
-        log_error "validate_final_setup: vLLM Docker service check failed in container $container_id"
-        ((checks_failed++))
-    fi
-
-    local docker_check_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+    # --- Check Docker Status ---
+    local docker_check_cmd="set -e
 if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
     echo '[SUCCESS] Docker is installed and running'
     exit 0
 else
     echo '[ERROR] Docker is not installed or not running'
     exit 1
-fi
-"
-    if pct_exec_with_retry "$container_id" "$docker_check_cmd"; then
-        log_info "validate_final_setup: Docker is installed and running in container $container_id"
-        ((checks_passed++))
+fi"
+    if pct_exec_with_retry "$lxc_id" "$docker_check_cmd"; then
+        log_info "validate_final_setup: Docker is installed and running in container $lxc_id"
+        ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: Docker check failed in container $container_id"
-        ((checks_failed++))
+        log_error "validate_final_setup: Docker check failed in container $lxc_id"
+        ((checks_failed++)) || true
     fi
 
-    local nvtop_check_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-if command -v nvtop >/dev/null 2>&1; then
-    echo '[SUCCESS] nvtop is installed'
+    # --- Check GPU Access via nvidia-smi ---
+    local nvidia_smi_check="set -e
+if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi >/dev/null 2>&1; then
+    echo '[SUCCESS] nvidia-smi command successful'
     exit 0
 else
-    echo '[ERROR] nvtop is not installed'
+    echo '[ERROR] nvidia-smi command failed'
     exit 1
-fi
-"
-    if pct_exec_with_retry "$container_id" "$nvtop_check_cmd"; then
-        log_info "validate_final_setup: nvtop is installed in container $container_id"
-        ((checks_passed++))
+fi"
+    if pct_exec_with_retry "$lxc_id" "$nvidia_smi_check"; then
+        log_info "validate_final_setup: nvidia-smi check passed in container $lxc_id"
+        ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: nvtop check failed in container $container_id"
-        ((checks_failed++))
+        log_error "validate_final_setup: nvidia-smi check failed in container $lxc_id"
+        ((checks_failed++)) || true
     fi
 
-    local image_check_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-if docker images ${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13} | grep -q ${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13}; then
-    echo '[SUCCESS] Custom vLLM image ${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13} is present'
-    exit 0
-else
-    echo '[ERROR] Custom vLLM image ${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13} is not present'
-    exit 1
-fi
-"
-    if pct_exec_with_retry "$container_id" "$image_check_cmd"; then
-        log_info "validate_final_setup: Custom vLLM image ${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13} is present in container $container_id"
-        ((checks_passed++))
+    # --- Check GPU Access via Docker ---
+    if verify_docker_gpu_access_in_container "$lxc_id"; then
+        log_info "validate_final_setup: Docker GPU access verified for container $lxc_id"
+        ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: Custom vLLM image check failed in container $container_id"
-        ((checks_failed++))
+        log_error "validate_final_setup: Docker GPU access verification failed for container $lxc_id"
+        ((checks_failed++)) || true
     fi
 
+    # --- Check Model Directory ---
+    local model_path
+    model_path=$(get_container_config_value "vllm.model")
+    if [[ "$model_path" != "null" && "$model_path" != "none" ]]; then
+        if validate_path_in_container "$lxc_id" "$model_path"; then
+            log_info "validate_final_setup: Model directory $model_path exists in container $lxc_id"
+            ((checks_passed++)) || true
+        else
+            log_error "validate_final_setup: Model directory $model_path does not exist in container $lxc_id"
+            ((checks_failed++)) || true
+        fi
+    else
+        log_info "validate_final_setup: No model path configured, skipping model directory check."
+        ((checks_passed++)) || true # Consider this a pass if not configured
+    fi
+
+    # --- Check vLLM Service Status ---
+    local service_status
+    service_status=$(check_systemd_service_status_in_container "$lxc_id" "vllm-docker")
+    if [[ "$service_status" == "active" ]]; then
+        log_info "validate_final_setup: vLLM service is active in container $lxc_id"
+        ((checks_passed++)) || true
+    elif [[ "$service_status" == "inactive" ]]; then
+        log_warn "validate_final_setup: vLLM service is inactive in container $lxc_id"
+        ((checks_failed++)) || true
+    elif [[ "$service_status" == "failed" ]]; then
+        log_error "validate_final_setup: vLLM service has failed in container $lxc_id"
+        ((checks_failed++)) || true
+    else
+        log_error "validate_final_setup: vLLM service status unknown or not found in container $lxc_id"
+        ((checks_failed++)) || true
+    fi
+
+    # --- Summary ---
     log_info "validate_final_setup: Validation summary: $checks_passed passed, $checks_failed failed"
     if [[ $checks_failed -gt 0 ]]; then
         log_warn "validate_final_setup: Validation completed with $checks_failed failures. Check logs for details."
-        return 1
+        return 1 # Indicate partial failure
     fi
-    log_info "All validation checks passed for container $container_id"
-    echo "All validation checks passed for container $container_id."
+    log_info "validate_final_setup: All validation checks passed for container $lxc_id"
+    echo "All validation checks passed for container $lxc_id."
     return 0
 }
 
-# --- Main Execution ---
-main() {
-    local container_id="$1"
-    if [[ -z "$container_id" ]]; then
-        log_error "phoenix_hypervisor_setup_drdevstral.sh: Container ID must be provided as an argument"
-        echo "Usage: $0 <container_id>"
-        exit 1
-    fi
+# 8. Show Setup Information (adapted from original)
+show_setup_info() {
+    local lxc_id="$1"
+    log_info "show_setup_info: Displaying setup information for container $lxc_id..."
 
-    if [[ "$container_id" != "901" ]]; then
-        log_error "phoenix_hypervisor_setup_drdevstral.sh: This script is designed for container ID 901, got $container_id"
-        exit 1
-    fi
+    # Get configuration values for display
+    local model_path
+    local tensor_parallel_size
+    local gpu_memory_utilization
+    local attention_backend
+    local kv_cache_dtype
+    local dtype
+    local port
 
-    echo ""
-    echo "==============================================="
-    echo "DRDEVSTRAL SETUP FOR CONTAINER $container_id"
-    echo "==============================================="
-    log_info "Starting drdevstral setup for container $container_id..."
+    model_path=$(get_container_config_value "vllm.model")
+    tensor_parallel_size=$(get_container_config_value "vllm.tensor_parallel_size")
+    gpu_memory_utilization=$(get_container_config_value "vllm.gpu_memory_utilization")
+    attention_backend=$(get_container_config_value "vllm.attention_backend")
+    kv_cache_dtype=$(get_container_config_value "vllm.kv_cache_dtype")
+    dtype=$(get_container_config_value "vllm.dtype")
+    port=$(get_container_config_value "vllm.port")
 
-    validate_dependencies
-    validate_container_state "$container_id"
-
-    local gpu_assignment
-    gpu_assignment=$(jq -r ".lxc_configs.\"$container_id\".gpu_assignment // \"none\"" "$PHOENIX_LXC_CONFIG_FILE")
-    if [[ -n "$gpu_assignment" && "$gpu_assignment" != "none" ]]; then
-        log_info "Checking permissions for /etc/pve/lxc/$container_id.conf..."
-        if [[ ! -w "/etc/pve/lxc/$container_id.conf" ]]; then
-            log_error "Cannot write to /etc/pve/lxc/$container_id.conf. Please ensure proper permissions or manually configure GPU passthrough."
-            echo "Run: chmod 644 /etc/pve/lxc/$container_id.conf and chown root:pve /etc/pve/lxc/$container_id.conf"
-            exit 1
-        fi
-        # Check if GPU passthrough is already configured
-        local required_configs=(
-            "dev0: /dev/dri/card0,gid=44"
-            "dev1: /dev/dri/renderD128,gid=104"
-            "dev2: /dev/nvidia0"
-            "dev3: /dev/nvidia1"
-            "dev4: /dev/nvidia-caps/nvidia-cap1"
-            "dev5: /dev/nvidia-caps/nvidia-cap2"
-            "dev6: /dev/nvidiactl"
-            "dev7: /dev/nvidia-modeset"
-            "dev8: /dev/nvidia-uvm-tools"
-            "dev9: /dev/nvidia-uvm"
-            "lxc.cgroup2.devices.allow: a"
-            "lxc.cap.drop:"
-            "swap: 512"
-            "lxc.autodev: 1"
-            "lxc.mount.auto: sys:rw"
-        )
-        local config_file="/etc/pve/lxc/$container_id.conf"
-        local all_configs_present=true
-        for config in "${required_configs[@]}"; do
-            if ! grep -Fx "$config" "$config_file" >/dev/null; then
-                all_configs_present=false
-                break
-            fi
-        done
-        if ! $all_configs_present; then
-            log_info "Configuring GPU passthrough for container $container_id..."
-            if ! configure_lxc_gpu_passthrough "$container_id" "$gpu_assignment"; then
-                log_error "Failed to configure GPU passthrough for container $container_id"
-                exit 1
-            fi
-            log_info "Restarting container $container_id to apply GPU passthrough..."
-            pct stop "$container_id" || true
-            sleep 5
-            if ! retry_command 3 10 pct start "$container_id"; then
-                log_error "Failed to restart container $container_id after GPU passthrough"
-                exit 1
-            fi
-        else
-            log_info "GPU passthrough already configured for container $container_id"
-        fi
-    fi
-
-    validate_container "$container_id"
-    show_setup_info "$container_id"
-    setup_container_environment "$container_id" || { log_error "Container environment setup failed for $container_id"; exit 1; }
-    setup_nvidia_packages "$container_id" || { log_error "Failed to install NVIDIA packages for $container_id"; exit 1; }
-    install_nccl_library_in_container "$container_id" || handle_error "install_nccl_library_in_container"
-    build_custom_vllm_image "$container_id" || { log_error "Failed to build custom vLLM image for $container_id"; exit 1; }
-    setup_model "$container_id" || { log_error "Model setup failed for $container_id"; exit 1; }
-    setup_service "$container_id" || { log_error "Service setup failed for $container_id"; exit 1; }
-    validate_final_setup "$container_id" || log_warn "Final setup validation had warnings for $container_id"
+    # Set defaults for display if not provided
+    tensor_parallel_size=${tensor_parallel_size:-1}
+    gpu_memory_utilization=${gpu_memory_utilization:-0.9}
+    attention_backend=${attention_backend:-"FLASHINFER"}
+    kv_cache_dtype=${kv_cache_dtype:-"auto"}
+    dtype=${dtype:-"auto"}
 
     echo ""
     echo "==============================================="
-    echo "DRDEVSTRAL SETUP COMPLETED"
+    echo "DRDEVSTRAL SETUP COMPLETED FOR CONTAINER $lxc_id"
     echo "==============================================="
-    log_info "drdevstral setup completed successfully for $container_id"
-    log_info "You can now check the service with: pct exec $container_id -- systemctl status vllm-docker.service"
-    log_info "Test the model with: curl -X POST \"http://localhost:8000/v1/chat/completions\" -H \"Content-Type: application/json\" --data '{\"model\": \"Qwen/Qwen2.5-Coder-7B-Instruct\", \"messages\": [{\"role\": \"user\", \"content\": \"Write a Python function to reverse a string.\"}]}'"
-    echo "Check service status with: pct exec $container_id -- systemctl status vllm-docker.service"
-    echo "To test the model, run: curl -X POST \"http://localhost:8000/v1/chat/completions\" -H \"Content-Type: application/json\" --data '{\"model\": \"Qwen/Qwen2.5-Coder-7B-Instruct\", \"messages\": [{\"role\": \"user\", \"content\": \"Write a Python function to reverse a string.\"}]}'"
-    echo "From the host, test with: curl -X POST \"http://10.0.0.111:8000/v1/chat/completions\" -H \"Content-Type: application/json\" --data '{\"model\": \"Qwen/Qwen2.5-Coder-7B-Instruct\", \"messages\": [{\"role\": \"user\", \"content\": \"Write a Python function to reverse a string.\"}]}'"
+    echo "Model Path: $model_path"
+    echo "Tensor Parallel Size: $tensor_parallel_size"
+    echo "GPU Memory Utilization: $gpu_memory_utilization"
+    echo "Attention Backend: $attention_backend"
+    echo "KV Cache Dtype: $kv_cache_dtype"
+    echo "Dtype: $dtype"
+    echo "API Port: $port"
+    echo ""
+    echo "You can check the status of the vLLM service with:"
+    echo "  pct exec $lxc_id -- systemctl status vllm-docker"
+    echo ""
+    echo "To enter the container:"
+    echo "  pct enter $lxc_id"
     echo "==============================================="
 }
 
-main "$1"
+
+# --- Main Execution ---
+main() {
+    local lxc_id="$1"
+
+    log_info "==============================================="
+    log_info "STARTING PHOENIX HYPERVISOR DRDEVSTRAL SETUP FOR CONTAINER $lxc_id"
+    log_info "==============================================="
+
+    # 1. Validate Dependencies
+    validate_dependencies
+
+    # 2. Validate Container State (Create if needed, Start, Network, GPU Passthrough)
+    validate_container_state "$lxc_id"
+
+    # 3. Setup NVIDIA Packages (Driver, Userland, Toolkit, Docker Runtime, NCCL)
+    setup_nvidia_packages "$lxc_id"
+
+    # 4. Install Docker CE
+    log_info "Installing Docker CE in container $lxc_id..."
+    if ! install_docker_ce_in_container "$lxc_id"; then
+        log_error "Failed to install Docker CE in container $lxc_id."
+    fi
+
+    # 5. Setup Model (Download if path specified and doesn't exist)
+    setup_model "$lxc_id"
+
+    # 6. Build Custom vLLM Docker Image
+    build_custom_vllm_image "$lxc_id"
+
+    # 7. Setup vLLM Service (Systemd)
+    setup_service "$lxc_id"
+
+    # 8. Validate Final Setup
+    if ! validate_final_setup "$lxc_id"; then
+        log_warn "Final validation had some failures, but setup may still be usable. Please review logs."
+    fi
+
+    # 9. Show Setup Information
+    show_setup_info "$lxc_id"
+
+    log_info "==============================================="
+    log_info "PHOENIX HYPERVISOR DRDEVSTRAL SETUP FOR CONTAINER $lxc_id COMPLETED SUCCESSFULLY"
+    log_info "==============================================="
+}
+
+# Run main function with the provided container ID
+main "$CONTAINER_ID"

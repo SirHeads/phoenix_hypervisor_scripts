@@ -1,7 +1,7 @@
 #!/bin/bash
 # Common NVIDIA functions for LXC containers in Phoenix Hypervisor
 # Provides functions for installing/checking NVIDIA drivers, toolkit, and verifying GPU access INSIDE containers
-# Designed to be sourced by scripts that interact with containers (e.g., setup_drdevstral.sh)
+# Designed to be sourced by scripts that interact with containers (e.g., setup_drdevstral.sh, setup_drcuda.sh)
 # Version: 1.8.4
 # Author: Assistant
 
@@ -59,8 +59,8 @@ apt-get remove -y docker docker-engine docker.io containerd runc || true
 apt-get update -y --fix-missing
 apt-get install -y ca-certificates curl gnupg lsb-release
 mkdir -p /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-echo 'deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu   noble stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+echo 'deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null
 echo '[INFO] Updating package lists...'
 apt-get update -y --fix-missing || { echo '[ERROR] Failed to update package lists'; exit 1; }
 echo '[INFO] Installing Docker-ce...'
@@ -96,7 +96,7 @@ EOF
     return 1
 }
 
-# - Setup NVIDIA Repository in Container -
+# - Setup NVIDIA Repository and Install CUDA Toolkit in Container -
 setup_nvidia_repo_in_container() {
     local lxc_id="$1"
     local nvidia_repo_url="$2"
@@ -105,8 +105,8 @@ setup_nvidia_repo_in_container() {
         return 1
     fi
 
-    log_info "Setting up NVIDIA CUDA repository in container $lxc_id..."
-    echo "Setting up NVIDIA CUDA repository in container $lxc_id... This may take a moment."
+    log_info "Setting up NVIDIA CUDA repository and installing CUDA $CUDA_VERSION in container $lxc_id..."
+    echo "Setting up NVIDIA CUDA repository and installing CUDA $CUDA_VERSION in container $lxc_id... This may take a moment."
 
     local repo_cmd="
 set -e
@@ -120,11 +120,11 @@ update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 mkdir -p /etc/apt/keyrings
 if [[ ! -f /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg ]]; then
     echo '[INFO] Downloading NVIDIA Container Toolkit keyring...'
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey   | gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg || { echo '[ERROR] Failed to download NVIDIA Container Toolkit keyring'; exit 1; }
+    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg || { echo '[ERROR] Failed to download NVIDIA Container Toolkit keyring'; exit 1; }
 fi
 if [[ ! -f /etc/apt/sources.list.d/nvidia-container-toolkit.list ]]; then
     echo '[INFO] Setting up NVIDIA Container Toolkit repository...'
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list   | \
+    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
         sed 's#deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | \
         tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
 fi
@@ -138,26 +138,34 @@ if [[ ! -f /etc/apt/sources.list.d/cuda.list ]]; then
 fi
 echo '[INFO] Updating package lists... This may take a few minutes.'
 apt-get update -y --fix-missing || { echo '[ERROR] Failed to update package lists'; exit 1; }
+echo '[INFO] Installing CUDA toolkit $CUDA_VERSION and compatibility package $CUDA_COMPAT_PACKAGE...'
+apt-get install -y --no-install-recommends cuda-toolkit-$CUDA_VERSION $CUDA_COMPAT_PACKAGE || { echo '[ERROR] Failed to install CUDA toolkit'; exit 1; }
+if command -v nvcc >/dev/null 2>&1 && nvcc --version | grep -q \"$CUDA_VERSION\"; then
+    echo '[SUCCESS] CUDA toolkit $CUDA_VERSION installed successfully in container $lxc_id.'
+else
+    echo '[ERROR] CUDA toolkit verification failed in container $lxc_id.'
+    exit 1
+fi
 "
     local attempt=1
     local max_attempts=3
     while [[ $attempt -le $max_attempts ]]; do
-        log_info "Attempting NVIDIA repository setup (attempt $attempt/$max_attempts)..."
+        log_info "Attempting NVIDIA repository and CUDA toolkit setup (attempt $attempt/$max_attempts)..."
         if pct exec "$lxc_id" -- bash <<EOF 2>&1 | tee -a "$HYPERVISOR_LOGFILE"
 $repo_cmd
 EOF
         then
-            log_info "NVIDIA CUDA and Container Toolkit repositories setup completed for container $lxc_id"
-            echo "NVIDIA repositories setup completed for container $lxc_id."
+            log_info "NVIDIA CUDA and Container Toolkit repositories and CUDA $CUDA_VERSION setup completed for container $lxc_id"
+            echo "NVIDIA repositories and CUDA toolkit setup completed for container $lxc_id."
             return 0
         else
-            log_warn "NVIDIA repository setup failed on attempt $attempt. Retrying in 10 seconds..."
+            log_warn "NVIDIA repository and CUDA toolkit setup failed on attempt $attempt. Retrying in 10 seconds..."
             sleep 10
             ((attempt++))
         fi
     done
 
-    log_error "setup_nvidia_repo_in_container: Failed to set up NVIDIA repositories in container $lxc_id after $max_attempts attempts"
+    log_error "setup_nvidia_repo_in_container: Failed to set up NVIDIA repositories and CUDA toolkit in container $lxc_id after $max_attempts attempts"
     return 1
 }
 
@@ -348,6 +356,74 @@ EOF
     return 1
 }
 
+# - Build Docker Image in Container -
+build_docker_image_in_container() {
+    local lxc_id="$1"
+    local dockerfile_path="$2"
+    local image_tag="$3"
+    if [[ -z "$lxc_id" ]] || [[ -z "$dockerfile_path" ]] || [[ -z "$image_tag" ]]; then
+        log_error "build_docker_image_in_container: Missing lxc_id, dockerfile_path, or image_tag"
+        return 1
+    fi
+
+    log_info "Building Docker image $image_tag in container $lxc_id from $dockerfile_path..."
+    echo "Building Docker image $image_tag in container $lxc_id... This may take a few minutes."
+
+    local check_cmd="
+set -e
+export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+if docker images -q $image_tag | grep -q .; then
+    echo '[SUCCESS] Docker image $image_tag already exists in container $lxc_id.'
+    exit 0
+fi
+exit 1
+"
+    if pct exec "$lxc_id" -- bash <<EOF 2>&1 | tee -a "$HYPERVISOR_LOGFILE"
+$check_cmd
+EOF
+    then
+        log_info "Docker image $image_tag already exists in container $lxc_id."
+        return 0
+    fi
+
+    local build_cmd="
+set -e
+export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+if ! command -v docker >/dev/null 2>&1; then
+    echo '[ERROR] Docker not installed in container $lxc_id.'
+    exit 1
+fi
+echo '[INFO] Building Docker image $image_tag...'
+docker build -t $image_tag -f $dockerfile_path . || { echo '[ERROR] Failed to build Docker image $image_tag'; exit 1; }
+if docker images -q $image_tag | grep -q .; then
+    echo '[SUCCESS] Docker image $image_tag built successfully in container $lxc_id.'
+else
+    echo '[ERROR] Docker image $image_tag verification failed in container $lxc_id.'
+    exit 1
+fi
+"
+    local attempt=1
+    local max_attempts=3
+    while [[ $attempt -le $max_attempts ]]; do
+        log_info "Attempting Docker image build (attempt $attempt/$max_attempts)..."
+        if pct exec "$lxc_id" -- bash <<EOF 2>&1 | tee -a "$HYPERVISOR_LOGFILE"
+$build_cmd
+EOF
+        then
+            log_info "Docker image $image_tag built successfully in container $lxc_id"
+            echo "Docker image build completed for $image_tag in container $lxc_id."
+            return 0
+        else
+            log_warn "Docker image build failed on attempt $attempt. Retrying in 10 seconds..."
+            sleep 10
+            ((attempt++))
+        fi
+    done
+
+    log_error "build_docker_image_in_container: Failed to build Docker image $image_tag in container $lxc_id after $max_attempts attempts"
+    return 1
+}
+
 # - Detect GPUs Inside Container -
 detect_gpus_in_container() {
     local lxc_id="$1"
@@ -398,7 +474,7 @@ if ! docker info --format '{{.Runtimes}}' | grep -q 'nvidia'; then
     echo '[ERROR] NVIDIA runtime not configured in Docker.'
     exit 1
 fi
-if docker run --rm --gpus all --runtime=nvidia nvidia/cuda:13.0.0-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
+if docker run --rm --gpus all --runtime=nvidia nvidia/cuda:12.9.0-base-ubuntu24.04 nvidia-smi >/dev/null 2>&1; then
     echo '[SUCCESS] Docker GPU access verified in container $lxc_id.'
     exit 0
 else
@@ -454,14 +530,19 @@ configure_lxc_gpu_passthrough() {
     fi
 
     local config_file="/etc/pve/lxc/$lxc_id.conf"
-    if [[ -f "$config_file" ]]; then
-        chmod u+w "$config_file"
-    else
+    if [[ ! -f "$config_file" ]]; then
         log_error "configure_lxc_gpu_passthrough: LXC config file not found: $config_file"
         return 1
     fi
 
     log_info "Adding GPU passthrough entries to $config_file for GPUs: $gpu_indices"
+
+    # --- Check write permissions ---
+    if ! touch "$config_file" 2>/dev/null; then
+        log_warn "configure_lxc_gpu_passthrough: No write permissions for $config_file. Attempting to proceed without chmod."
+    else
+        chmod u+w "$config_file" 2>/dev/null || log_warn "configure_lxc_gpu_passthrough: Failed to set write permissions on $config_file."
+    fi
 
     # --- Cleanup existing GPU-related entries ---
     sed -i '/^lxc\.cgroup2\.devices\.allow: c 195/d' "$config_file"
@@ -477,7 +558,6 @@ configure_lxc_gpu_passthrough() {
     # --- End Cleanup ---
 
     # --- Add essential static devices ---
-    # DRI devices (often needed for graphics/CUDA)
     echo "dev0: /dev/dri/card0,gid=44" >> "$config_file"
     echo "dev1: /dev/dri/renderD128,gid=104" >> "$config_file"
     local dev_index=2
@@ -490,13 +570,11 @@ configure_lxc_gpu_passthrough() {
             log_error "configure_lxc_gpu_passthrough: Invalid GPU index: $index (must be numeric)"
             return 1
         fi
-        # Add the core NVIDIA device node for the GPU
         echo "dev$dev_index: /dev/nvidia$index" >> "$config_file"
         ((dev_index++))
     done
 
     # Add common NVIDIA capability devices if they exist on the host
-    # Check and add nvidia-caps devices
     if [[ -e "/dev/nvidia-caps/nvidia-cap1" ]]; then
         echo "dev$dev_index: /dev/nvidia-caps/nvidia-cap1" >> "$config_file"
         ((dev_index++))
@@ -511,27 +589,21 @@ configure_lxc_gpu_passthrough() {
         log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-caps/nvidia-cap2 not found on host, skipping."
     fi
 
-    # Add core control devices if they exist on the host
     if [[ -e "/dev/nvidiactl" ]]; then
         echo "dev$dev_index: /dev/nvidiactl" >> "$config_file"
         ((dev_index++))
     else
         log_error "configure_lxc_gpu_passthrough: Critical device /dev/nvidiactl not found on host!"
-        # This is likely a critical error, but we'll warn and continue for robustness
     fi
 
-    # --- MODIFICATION: Check for nvidia-modeset existence ---
     if [[ -e "/dev/nvidia-modeset" ]]; then
         echo "dev$dev_index: /dev/nvidia-modeset" >> "$config_file"
         ((dev_index++))
         log_info "configure_lxc_gpu_passthrough: Added /dev/nvidia-modeset to container config."
     else
         log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-modeset not found on host, skipping passthrough for this device."
-        # Do not add the line if the device doesn't exist
     fi
-    # --- END MODIFICATION ---
 
-    # Add UVM devices if they exist on the host
     if [[ -e "/dev/nvidia-uvm-tools" ]]; then
         echo "dev$dev_index: /dev/nvidia-uvm-tools" >> "$config_file"
         ((dev_index++))
@@ -545,17 +617,18 @@ configure_lxc_gpu_passthrough() {
     else
         log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-uvm not found on host, skipping."
     fi
-    # --- End GPU-specific Devices ---
 
     # --- Add final LXC configuration options ---
     echo "lxc.cgroup2.devices.allow: a" >> "$config_file"
-    echo "lxc.cap.drop:" >> "$config_file" # Explicitly drop no capabilities, might need adjustment
+    echo "lxc.cap.drop:" >> "$config_file"
     echo "swap: 512" >> "$config_file"
     echo "lxc.autodev: 1" >> "$config_file"
     echo "lxc.mount.auto: sys:rw" >> "$config_file"
     # --- End Final Options ---
 
-    chmod u-w "$config_file"
+    if [[ -w "$config_file" ]]; then
+        chmod u-w "$config_file" 2>/dev/null || log_warn "configure_lxc_gpu_passthrough: Failed to remove write permissions on $config_file."
+    fi
 
     log_info "GPU passthrough configuration updated for container $lxc_id (GPUs: $gpu_indices)"
     return 0

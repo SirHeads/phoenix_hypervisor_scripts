@@ -47,6 +47,12 @@ export DEFAULT_LXC_FEATURES="${DEFAULT_LXC_FEATURES:-nesting=1}"
 # NVIDIA driver version to use across all containers
 export NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-575.57.08}"
 
+# CUDA toolkit version
+export CUDA_VERSION="${CUDA_VERSION:-12.9}"
+
+# CUDA compatibility package for forward compatibility
+export CUDA_COMPAT_PACKAGE="${CUDA_COMPAT_PACKAGE:-cuda-compat-12-9}"
+
 # NVIDIA runfile URL for driver installation in containers
 export NVIDIA_RUNFILE_URL="${NVIDIA_RUNFILE_URL:-http://us.download.nvidia.com/XFree86/Linux-x86_64/575.57.08/NVIDIA-Linux-x86_64-575.57.08.run}"
 
@@ -61,7 +67,7 @@ declare -gA PHOENIX_GPU_ASSIGNMENTS
 
 # --- Default vLLM Configuration ---
 # Default vLLM Docker image tag
-export DEFAULT_VLLM_IMAGE="${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda13}"
+export DEFAULT_VLLM_IMAGE="${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda12}"
 
 # Default vLLM maximum model length
 export DEFAULT_VLLM_MAX_MODEL_LEN="${DEFAULT_VLLM_MAX_MODEL_LEN:-128}"

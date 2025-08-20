@@ -125,7 +125,6 @@ create_containers() {
             log_error "Failed to create container $id."
             if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
                 log_info "Rolling back by destroying container $id..."
-                # Note: phoenix_hypervisor_destroy.sh script content not provided in KB, assuming it exists
                 /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
             fi
             exit 1
@@ -133,9 +132,18 @@ create_containers() {
         # Specific setup for container ID 901
         if [[ "$id" == "901" ]]; then
             log_info "Setting up drdevstral container $id..."
-            # Note: phoenix_hypervisor_setup_drdevstral.sh script content not provided in KB, assuming it exists
             if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drdevstral.sh "$id"; then
                 log_error "Failed to set up drdevstral container $id."
+                if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
+                    log_info "Rolling back by destroying container $id..."
+                    /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
+                fi
+                exit 1
+            fi
+        elif [[ "$id" == "900" ]]; then
+            log_info "Setting up DrCuda container $id..."
+            if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drcuda.sh "$id"; then
+                log_error "Failed to set up DrCuda container $id."
                 if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
                     log_info "Rolling back by destroying container $id..."
                     /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"

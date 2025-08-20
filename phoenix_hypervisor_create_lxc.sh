@@ -94,6 +94,16 @@ if declare -f create_lxc_container > /dev/null; then
             exit 1
         fi
         log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id started successfully."
+        # Validate CUDA version in the container
+        if declare -f validate_cuda_version > /dev/null; then
+            if ! validate_cuda_version "$container_id"; then
+                log_error "phoenix_hypervisor_create_lxc.sh: CUDA version validation failed for container $container_id."
+                exit 1
+            fi
+            log_info "phoenix_hypervisor_create_lxc.sh: CUDA version validated successfully for container $container_id."
+        else
+            log_warn "phoenix_hypervisor_create_lxc.sh: Function 'validate_cuda_version' not found. Skipping CUDA validation."
+        fi
         exit 0
     else
         log_error "phoenix_hypervisor_create_lxc.sh: Failed to create or configure container $container_id."
