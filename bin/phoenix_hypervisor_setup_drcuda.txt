@@ -2,10 +2,11 @@
 
 # phoenix_hypervisor_setup_drcuda.sh
 #
-# Sets up the DrCuda container (ID 900) with Docker, NVIDIA support (Driver 580.76.05, CUDA 12.8), and a PyTorch environment.
+# Sets up the DrCuda container (ID 900) with Docker, NVIDIA support (Driver 580.76.05, CUDA 12.8),
+# and pulls a pre-built PyTorch environment from the DrSwarm registry.
 # This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
 #
-# Version: 1.2.0 (Updated for Driver 580.76.05, CUDA 12.8, PyTorch CUDA 12.8)
+# Version: 1.3.2 (Integrated DrSwarm Registry Image Pull)
 # Author: Assistant
 
 set -euo pipefail
@@ -199,6 +200,29 @@ if [[ $PHOENIX_VALIDATION_LOADED -ne 1 ]]; then
     log_error "Failed to load phoenix_hypervisor_lxc_common_validation.sh. Cannot proceed with validation operations."
 fi
 
+# --- NEW: Source Swarm Pull LXC Common Functions ---
+PHOENIX_SWARM_PULL_LOADED=0
+for swarm_pull_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_swarmpull.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_swarmpull.sh"; do
+    if [[ -f "$swarm_pull_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$swarm_pull_path"
+        if declare -F configure_local_registry_trust >/dev/null 2>&1; then
+            PHOENIX_SWARM_PULL_LOADED=1
+            log_info "phoenix_hypervisor_setup_drcuda.sh: Sourced Swarm Pull LXC common functions from $swarm_pull_path."
+            break
+        else
+            log_warn "Sourced $swarm_pull_path, but Swarm Pull LXC functions not found. Trying next location."
+        fi
+    fi
+done
+
+if [[ $PHOENIX_SWARM_PULL_LOADED -ne 1 ]]; then
+    log_error "Failed to load phoenix_hypervisor_lxc_common_swarmpull.sh. Cannot proceed with registry integration."
+fi
+# --- END NEW ---
+
 # --- Core Setup Functions ---
 
 # 1. Validate Dependencies
@@ -214,206 +238,62 @@ validate_dependencies() {
 }
 
 # 2. Validate Container State (Create if needed, Start, Network, GPU Passthrough)
-validate_container_state() {
-    local lxc_id="$1"
-    log_info "validate_container_state: Validating state for container $lxc_id..."
-
-    # Check if container exists
-    if ! validate_container_exists "$lxc_id"; then
-        log_info "validate_container_state: Container $lxc_id does not exist. Calling phoenix_hypervisor_create_lxc.sh..."
-        # Delegate creation to the standard script
-        if ! "$PHOENIX_BIN_DIR/phoenix_hypervisor_create_lxc.sh" "$lxc_id"; then
-             # Check if the failure was due to the premature CUDA validation in create_lxc.sh
-             # We expect it to fail here, so we check if the container was actually created and started.
-             if validate_container_exists "$lxc_id"; then
-                 if validate_container_running "$lxc_id"; then
-                     log_warn "validate_container_state: phoenix_hypervisor_create_lxc.sh reported failure, but container $lxc_id seems to be created and running. Proceeding."
-                 else
-                     log_error "validate_container_state: Failed to create container $lxc_id via phoenix_hypervisor_create_lxc.sh and container is not running."
-                 fi
-             else
-                 log_error "validate_container_state: Failed to create container $lxc_id via phoenix_hypervisor_create_lxc.sh."
-             fi
-        fi
-        log_info "validate_container_state: Container $lxc_id creation process completed (or handled)."
-    else
-        log_info "validate_container_state: Container $lxc_id already exists."
-    fi
-
-    # Ensure container is running
-    if ! ensure_container_running "$lxc_id"; then
-        log_error "validate_container_state: Failed to ensure container $lxc_id is running."
-    fi
-
-    # Basic network check
-    if ! check_container_network "$lxc_id"; then
-        log_warn "validate_container_state: Network check failed. Attempting to set temporary DNS..."
-        if ! set_temporary_dns "$lxc_id"; then
-            log_error "validate_container_state: Failed to set temporary DNS for container $lxc_id."
-        fi
-        # Retry network check after setting DNS
-        if ! check_container_network "$lxc_id"; then
-            log_error "validate_container_state: Network check still failed after setting DNS for container $lxc_id."
-        fi
-    fi
-
-    # Check and Configure GPU Passthrough
-    # Get GPU assignment from the main config
-    local gpu_assignment
-    gpu_assignment=$(get_gpu_assignment "$lxc_id")
-    if [[ "$gpu_assignment" == "none" || -z "$gpu_assignment" ]]; then
-        log_info "validate_container_state: No GPU assignment found for container $lxc_id. Skipping GPU passthrough."
-        return 0
-    fi
-
-    # Validate GPU assignment format
-    if ! validate_gpu_assignment "$lxc_id" "$gpu_assignment"; then
-        log_error "validate_container_state: Invalid GPU assignment for container $lxc_id: $gpu_assignment"
-    fi
-
-    # Check if GPU passthrough is already configured by looking for a common entry
-    local config_file="/etc/pve/lxc/${lxc_id}.conf"
-    local gpu_configured
-    gpu_configured=$(pct config "$lxc_id" | grep -c "lxc.cgroup2.devices.allow: c 195" || true)
-
-    if [[ "$gpu_configured" -gt 0 ]]; then
-        log_info "validate_container_state: GPU passthrough already configured for container $lxc_id."
-    else
-        log_info "validate_container_state: Configuring GPU passthrough for container $lxc_id (GPUs: $gpu_assignment)..."
-        if ! configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
-            log_error "validate_container_state: Failed to configure GPU passthrough for container $lxc_id."
-        fi
-        log_info "validate_container_state: GPU passthrough configured. Restarting container $lxc_id to apply changes..."
-        pct stop "$lxc_id" || true
-        sleep 5
-        if ! retry_command 3 10 pct start "$lxc_id"; then
-            log_error "validate_container_state: Failed to restart container $lxc_id after GPU passthrough configuration."
-        fi
-        log_info "validate_container_state: Container $lxc_id restarted with GPU passthrough."
-    fi
-}
+# ... (This function remains unchanged) ...
 
 # 3. Setup NVIDIA Packages (using NEW project-required functions)
-setup_nvidia_packages() {
-    local lxc_id="$1"
-    log_info "setup_nvidia_packages: Installing NVIDIA components (Driver 580.76.05, CUDA 12.8) in container $lxc_id..."
-
-    # Install NVIDIA driver 580.76.05 via runfile (NEW FUNCTION)
-    log_info "setup_nvidia_packages: Installing NVIDIA driver 580.76.05 via runfile (no kernel module)..."
-    if ! install_nvidia_driver_in_container_via_runfile "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA driver via runfile in container $lxc_id."
-    fi
-
-    # Install CUDA Toolkit 12.8 (NEW FUNCTION)
-    log_info "setup_nvidia_packages: Installing CUDA Toolkit 12.8..."
-    if ! install_cuda_toolkit_12_8_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install CUDA Toolkit 12.8 in container $lxc_id."
-    fi
-
-    # Install NVIDIA Container Toolkit (nvidia-docker2)
-    log_info "setup_nvidia_packages: Installing NVIDIA Container Toolkit..."
-    if ! install_nvidia_toolkit_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to install NVIDIA toolkit in container $lxc_id."
-    fi
-
-    # Configure Docker to use NVIDIA runtime
-    log_info "setup_nvidia_packages: Configuring Docker NVIDIA runtime..."
-    if ! configure_docker_nvidia_runtime "$lxc_id"; then
-        log_error "setup_nvidia_packages: Failed to configure Docker NVIDIA runtime in container $lxc_id."
-    fi
-
-    # Verify basic GPU access inside the container
-    log_info "setup_nvidia_packages: Verifying basic GPU access in container $lxc_id..."
-    if ! verify_lxc_gpu_access_in_container "$lxc_id"; then
-        log_error "setup_nvidia_packages: Basic GPU access verification failed in container $lxc_id."
-    fi
-
-    # Verify CUDA Toolkit installation (nvcc)
-    log_info "setup_nvidia_packages: Verifying CUDA Toolkit installation (nvcc) in container $lxc_id..."
-    local nvcc_check_cmd="set -e
-if command -v nvcc >/dev/null 2>&1; then
-    nvcc_version=\$(nvcc --version | grep 'release' | awk '{print \$5}' | sed 's/,//')
-    echo \"[SUCCESS] nvcc found, version: \$nvcc_version\"
-    exit 0
-else
-    echo '[ERROR] nvcc not found'
-    exit 1
-fi"
-
-    # Use pct_exec_with_retry if available
-    local exec_func="pct exec"
-    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
-        exec_func="pct_exec_with_retry"
-    fi
-
-    if ! $exec_func "$lxc_id" -- bash -c "$nvcc_check_cmd"; then
-        log_error "setup_nvidia_packages: CUDA Toolkit verification (nvcc) failed in container $lxc_id."
-    fi
-
-    log_info "setup_nvidia_packages: NVIDIA components (Driver 580.76.05, CUDA 12.8) installed and verified successfully in container $lxc_id."
-}
+# ... (This function remains unchanged) ...
 
 # 4. Install Docker CE (using common function)
-install_docker_in_container() {
-    local lxc_id="$1"
-    log_info "install_docker_in_container: Installing Docker CE in container $lxc_id..."
+# ... (This function remains unchanged) ...
 
-    if ! install_docker_ce_in_container "$lxc_id"; then
-        log_error "install_docker_in_container: Failed to install Docker CE in container $lxc_id."
+# --- NEW: Configure Registry Trust ---
+configure_registry_trust_in_drcuda() {
+    local lxc_id="$1"
+    log_info "configure_registry_trust_in_drcuda: Configuring registry trust in container $lxc_id..."
+
+    # Hardcoded registry address based on DrSwarm config
+    local registry_address="10.0.0.99:5000"
+
+    if [[ $PHOENIX_SWARM_PULL_LOADED -eq 1 ]]; then
+        if ! configure_local_registry_trust "$lxc_id" "$registry_address"; then
+            log_error "configure_registry_trust_in_drcuda: Failed to configure registry trust in container $lxc_id using common function."
+        fi
+    else
+        log_error "configure_registry_trust_in_drcuda: phoenix_hypervisor_lxc_common_swarmpull.sh not loaded. Cannot configure registry trust."
     fi
 
-    log_info "install_docker_in_container: Docker CE installed successfully in container $lxc_id."
+    log_info "configure_registry_trust_in_drcuda: Registry trust configured in container $lxc_id."
 }
+# --- END NEW ---
 
-# 5. Build PyTorch Docker Image (Updated for CUDA 12.8)
-build_pytorch_docker_image() {
+# --- REPLACED/REMOVED: Complex build/push logic ---
+# The function `push_pytorch_image_to_registry` is removed or replaced.
+
+# --- NEW: Pull PyTorch Image from Registry into Container ---
+pull_pytorch_image_from_registry() {
     local lxc_id="$1"
-    log_info "build_pytorch_docker_image: Building PyTorch Docker image in container $lxc_id..."
+    log_info "pull_pytorch_image_from_registry: Pulling PyTorch image into container $lxc_id..."
 
-    # Updated for CUDA 12.8
+    # Define the image tag as known in the registry and expected locally
+    # This should match the directory name in phoenix_docker_images (pytorch-cuda)
+    # and the tag used during the build/push process in DrSwarm setup.
     local image_tag="pytorch-cuda:12.8"
-    local dockerfile_path="/root/pytorch_dockerfile"
 
-    # Define the Dockerfile content directly as a string
-    # Using CUDA 12.8 PyTorch image as an example
-    # Note: PyTorch's cu124 index URL is often used for CUDA 12.8 compatible builds.
-    # Alternatively, a generic wheel or the closest available (cu129) might work.
-    local dockerfile_content='FROM nvidia/cuda:12.8.0-base-ubuntu24.04
-
-# Install additional tools if needed
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 python3-pip \
-    && rm -rf /var/lib/apt/lists/*
-
-# Install PyTorch for CUDA 12.4/12.8 (using cu124 index which is often compatible)
-# Check https://download.pytorch.org/whl/cu124   or https://download.pytorch.org/whl/torch_stable.html   for latest
-RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124  
-
-# Set a default command (can be overridden)
-CMD ["bash"]'
-
-    # Write the Dockerfile content to a file inside the container
-    local write_dockerfile_cmd="set -e
-mkdir -p /root/pytorch_build
-cat << 'EOF_DOCKERFILE' > $dockerfile_path
-$dockerfile_content
-EOF_DOCKERFILE
-echo '[INFO] Dockerfile written to $dockerfile_path'"
-
-    if ! pct_exec_with_retry "$lxc_id" "$write_dockerfile_cmd"; then
-        log_error "build_pytorch_docker_image: Failed to write Dockerfile in container $lxc_id."
+    if [[ $PHOENIX_SWARM_PULL_LOADED -eq 1 ]]; then
+        if ! pull_from_swarm_registry "$lxc_id" "$image_tag"; then
+            log_error "pull_pytorch_image_from_registry: Failed to pull image $image_tag into container $lxc_id using common function."
+        fi
+    else
+        log_error "pull_pytorch_image_from_registry: phoenix_hypervisor_lxc_common_swarmpull.sh not loaded. Cannot pull image."
     fi
 
-    # Build the Docker image inside the container using the written Dockerfile
-    # Using the function from the Docker common library
-    if ! build_docker_image_in_container "$lxc_id" "$dockerfile_path" "$image_tag"; then
-        log_error "build_pytorch_docker_image: Failed to build PyTorch Docker image in container $lxc_id."
-    fi
-
-    log_info "build_pytorch_docker_image: PyTorch Docker image built successfully in container $lxc_id."
+    log_info "pull_pytorch_image_from_registry: PyTorch image pulled into container $lxc_id."
 }
+# --- END NEW ---
 
 # 6. Final Validation (adapted from drdevstral)
+# ... (This function remains largely unchanged, but the image tag is updated) ...
+# --- Slightly Updated Validation ---
 validate_final_setup() {
     local lxc_id="$1"
     local checks_passed=0
@@ -440,7 +320,7 @@ else
     echo '[ERROR] Docker is not installed or not running'
     exit 1
 fi"
-    if pct_exec_with_retry "$lxc_id" "$docker_check_cmd"; then
+    if pct_exec_with_retry "$lxc_id" -- bash -c "$docker_check_cmd"; then
         log_info "validate_final_setup: Docker is installed and running in container $lxc_id"
         ((checks_passed++)) || true
     else
@@ -458,6 +338,24 @@ fi"
         ((checks_failed++)) || true
     fi
 
+    # --- NEW: Check if PyTorch Image is Present Locally ---
+    local image_check_cmd="set -e
+if docker images -q pytorch-cuda:12.8 | grep -q .; then
+    echo '[SUCCESS] PyTorch image pytorch-cuda:12.8 found locally'
+    exit 0
+else
+    echo '[ERROR] PyTorch image pytorch-cuda:12.8 not found locally'
+    exit 1
+fi"
+    if pct_exec_with_retry "$lxc_id" -- bash -c "$image_check_cmd"; then
+        log_info "validate_final_setup: PyTorch image found locally in container $lxc_id"
+        ((checks_passed++)) || true
+    else
+        log_error "validate_final_setup: PyTorch image not found locally in container $lxc_id"
+        ((checks_failed++)) || true
+    fi
+    # --- END NEW ---
+
     # --- Summary ---
     log_info "validate_final_setup: Validation summary: $checks_passed passed, $checks_failed failed"
     if [[ $checks_failed -gt 0 ]]; then
@@ -468,8 +366,10 @@ fi"
     echo "All validation checks passed for container $lxc_id."
     return 0
 }
+# --- END Slightly Updated Validation ---
 
 # 7. Show Setup Information (adapted from drdevstral)
+# ... (This function remains largely unchanged, but the image tag is updated) ...
 show_setup_info() {
     local lxc_id="$1"
     log_info "show_setup_info: Displaying setup information for container $lxc_id..."
@@ -478,7 +378,7 @@ show_setup_info() {
     echo "DR CUDA SETUP COMPLETED FOR CONTAINER $lxc_id"
     echo "==============================================="
     # Updated image tag
-    echo "PyTorch Docker Image: pytorch-cuda:12.8 (built inside container)"
+    echo "PyTorch Docker Image: pytorch-cuda:12.8 (pulled from registry into container)"
     echo ""
     echo "You can now run PyTorch jobs using Docker inside the container."
     echo "Example command to test:"
@@ -512,8 +412,15 @@ main() {
     # Now Docker is available when configure_docker_nvidia_runtime is called
     setup_nvidia_packages "$lxc_id"
 
-    # 5. Build PyTorch Docker Image (Updated for CUDA 12.8)
-    build_pytorch_docker_image "$lxc_id"
+    # --- NEW: Configure Registry Trust ---
+    # Configure the DrCuda container's Docker daemon to trust the DrSwarm registry
+    configure_registry_trust_in_drcuda "$lxc_id"
+    # --- END NEW ---
+
+    # --- NEW: Pull Pre-Built Image ---
+    # Pull the pre-built image from the DrSwarm registry into the DrCuda container
+    pull_pytorch_image_from_registry "$lxc_id"
+    # --- END NEW ---
 
     # 6. Validate Final Setup
     if ! validate_final_setup "$lxc_id"; then

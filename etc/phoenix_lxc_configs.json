@@ -1,5 +1,5 @@
 {
-    "$schema": "/usr/local/etc/phoenix_lxc_configs.schema.json",
+    "$schema": "/usr/local/etc/phoenix_hypervisor_configs.schema.json",
     "nvidia_driver_version": "580.76.05",
     "nvidia_repo_url": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/",
     "lxc_configs": {
@@ -12,6 +12,8 @@
             "storage_size_gb": 64,
             "network_config": "10.0.0.111/24,10.0.0.1,8.8.8.8",
             "features": "nesting=1,keyctl=1",
+            "static_ip": "10.0.0.111/24",
+            "mac_address": "01:23:45:67:89:A1",
             "gpu_assignment": "0,1",
             "vllm_model": "/models/Qwen/Qwen2.5-Coder-7B-Instruct",
             "vllm_tensor_parallel_size": 2,
@@ -34,6 +36,8 @@
             "storage_size_gb": 20,
             "network_config": "10.0.0.110/24,10.0.0.1,8.8.8.8",
             "features": "nesting=1,keyctl=1",
+            "static_ip": "10.0.0.110/24",
+            "mac_address": "01:23:45:67:89:A0",
             "gpu_assignment": "0,1",
             "vllm_model": "none",
             "vllm_tensor_parallel_size": 2,
@@ -56,7 +60,21 @@
             "storage_size_gb": 64,
             "network_config": "10.0.0.112/24,10.0.0.1,8.8.8.8",
             "features": "nesting=1,keyctl=1",
+            "static_ip": "10.0.0.112/24",
+            "mac_address": "01:23:45:67:89:A2",
             "gpu_assignment": "0,1"
+        },
+        "999": {
+            "name": "DrSwarm",
+            "memory_mb": 4096,
+            "cores": 2,
+            "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
+            "storage_pool": "lxc-disks",
+            "storage_size_gb": 16,
+            "network_config": "10.0.0.99/24,10.0.0.1,8.8.8.8",
+            "features": "nesting=1",
+            "static_ip": "10.0.0.99/24",
+            "mac_address": "01:23:45:67:89:99"
         }
     }
 }

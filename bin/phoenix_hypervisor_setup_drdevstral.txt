@@ -3,10 +3,11 @@
 # phoenix_hypervisor_setup_drdevstral.sh
 #
 # Container-specific setup script for drdevstral (LXC ID 901)
-# Installs NVIDIA drivers (580.76.05 via runfile), toolkit (12.8), Docker, vLLM, and sets up the AI model service.
+# Installs NVIDIA drivers (580.76.05 via runfile), toolkit (12.8), Docker,
+# pulls the pre-built vLLM base image from DrSwarm registry, and sets up the AI model service.
 # This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
 #
-# Version: 1.10.0 (Updated for Driver 580.76.05, CUDA 12.8, Refactored NVIDIA Setup)
+# Version: 1.11.0 (Integrated DrSwarm Registry Image Pull)
 # Author: Assistant
 
 set -euo pipefail
@@ -60,8 +61,9 @@ if [[ $PHOENIX_CONFIG_LOADED -ne 1 ]]; then
 fi
 
 # Set default for DEFAULT_VLLM_IMAGE if not defined
+# Note: This default might not be used if we pull a specific image.
 if [[ -z "${DEFAULT_VLLM_IMAGE:-}" ]]; then
-    DEFAULT_VLLM_IMAGE="vllm/vllm-openai:cuda13"
+    DEFAULT_VLLM_IMAGE="vllm/vllm-openai:cuda13" # Fallback, likely overridden
     echo "[DEBUG] DEFAULT_VLLM_IMAGE was unset, defaulting to $DEFAULT_VLLM_IMAGE" >> "${HYPERVISOR_LOGFILE%.log}_debug.log"
 fi
 echo "[DEBUG] DEFAULT_VLLM_IMAGE=$DEFAULT_VLLM_IMAGE" >> "${HYPERVISOR_LOGFILE%.log}_debug.log"
@@ -116,6 +118,29 @@ done
 if [[ $PHOENIX_NVIDIA_LOADED -ne 1 ]]; then
     log_error "Failed to load phoenix_hypervisor_lxc_common_nvidia.sh. Cannot proceed with NVIDIA setup."
 fi
+
+# --- NEW: Source Swarm Pull LXC Common Functions ---
+PHOENIX_SWARM_PULL_LOADED=0
+for swarm_pull_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_swarmpull.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_swarmpull.sh"; do
+    if [[ -f "$swarm_pull_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$swarm_pull_path"
+        if declare -F configure_local_registry_trust >/dev/null 2>&1; then
+            PHOENIX_SWARM_PULL_LOADED=1
+            log_info "phoenix_hypervisor_setup_drdevstral.sh: Sourced Swarm Pull LXC common functions from $swarm_pull_path."
+            break
+        else
+            log_warn "Sourced $swarm_pull_path, but Swarm Pull LXC functions not found. Trying next location."
+        fi
+    fi
+done
+
+if [[ $PHOENIX_SWARM_PULL_LOADED -ne 1 ]]; then
+    log_error "Failed to load phoenix_hypervisor_lxc_common_swarmpull.sh. Cannot proceed with registry integration."
+fi
+# --- END NEW ---
 
 # --- Source New Common Libraries ---
 # Source Base LXC Common Functions
@@ -344,14 +369,37 @@ setup_nvidia_packages() {
     # --- Verify CUDA Toolkit installation (nvcc) ---
     log_info "setup_nvidia_packages: Verifying CUDA Toolkit installation (nvcc) in container $lxc_id..."
     local nvcc_check_cmd="set -e
+# Source the persistent CUDA environment if the script exists
+# This is crucial for non-interactive shells created by pct exec
+if [[ -f /etc/profile.d/cuda.sh ]]; then
+    source /etc/profile.d/cuda.sh
+    # echo '[DEBUG] Sourced /etc/profile.d/cuda.sh for nvcc check' # Optional debug line
+fi
+
+# Now check for nvcc with the potentially updated PATH
 if command -v nvcc >/dev/null 2>&1; then
+    # Get the version
     nvcc_version=\$(nvcc --version | grep 'release' | awk '{print \$5}' | sed 's/,//')
-    echo \"[SUCCESS] nvcc found, version: \$nvcc_version\"
-    exit 0
+    if [[ \"\$nvcc_version\" == \"12.8\" ]]; then
+        echo '[SUCCESS] nvcc version \$nvcc_version verified in container $lxc_id.'
+        exit 0
+    else
+        echo '[ERROR] Incorrect nvcc version in container $lxc_id. Expected 12.8, found \$nvcc_version.'
+        exit 1
+    fi
 else
-    echo '[ERROR] nvcc not found'
+    # Provide a bit more diagnostic info
+    echo '[ERROR] nvcc not found in container $lxc_id.'
+    echo '[INFO] PATH is: \$PATH'
+    echo '[INFO] Checking standard CUDA bin location...'
+    if [[ -f /usr/local/cuda/bin/nvcc ]]; then
+       echo '[INFO] Found nvcc at /usr/local/cuda/bin/nvcc, but not in PATH.'
+    else
+       echo '[INFO] nvcc not found at /usr/local/cuda/bin/nvcc either.'
+    fi
     exit 1
-fi"
+fi
+"
 
     # Use pct_exec_with_retry if available
     local exec_func="pct exec"
@@ -416,45 +464,47 @@ echo '[SUCCESS] Model download completed.'
     log_info "setup_model: Model setup completed for container $lxc_id."
 }
 
-# 5. Build Custom vLLM Image (adapted from original)
-build_custom_vllm_image() {
+# --- REPLACED: build_custom_vllm_image ---
+# --- NEW: Pull vLLM Base Image from DrSwarm Registry ---
+pull_vllm_base_image() {
     local lxc_id="$1"
-    log_info "build_custom_vllm_image: Building custom vLLM Docker image in container $lxc_id..."
+    log_info "pull_vllm_base_image: Pulling vLLM base image into container $lxc_id..."
 
-    local vllm_image_tag="vllm-custom:latest"
-    local dockerfile_path="/root/vllm_custom_dockerfile"
+    # Define the image tag as known in the registry and expected locally
+    # This should match the directory name in phoenix_docker_images (vllm-base)
+    # and the tag used during the build/push process in DrSwarm setup.
+    local image_tag="vllm-base:latest"
 
-    # Define the Dockerfile content directly as a string
-    # Based on default vLLM image, adding hf_transfer for faster model loading
-    local dockerfile_content="FROM $DEFAULT_VLLM_IMAGE
+    # --- NEW: Configure Registry Trust ---
+    # Configure the DrDevStral container's Docker daemon to trust the DrSwarm registry
+    log_info "pull_vllm_base_image: Configuring registry trust in container $lxc_id..."
+    local registry_address="10.0.0.99:5000" # Hardcoded DrSwarm registry address
 
-# Install hf_transfer for faster model downloading
-RUN pip install hf_transfer
-
-# Set a default command (can be overridden)
-CMD [\"python3\", \"--version\"]"
-
-    # Write the Dockerfile content to a file inside the container
-    local write_dockerfile_cmd="set -e
-mkdir -p /root/vllm_build
-cat << 'EOF_DOCKERFILE' > $dockerfile_path
-$dockerfile_content
-EOF_DOCKERFILE
-echo '[INFO] Custom vLLM Dockerfile written to $dockerfile_path'"
-
-    if ! pct_exec_with_retry "$lxc_id" "$write_dockerfile_cmd"; then
-        log_error "build_custom_vllm_image: Failed to write Dockerfile in container $lxc_id."
+    if [[ $PHOENIX_SWARM_PULL_LOADED -eq 1 ]]; then
+        if ! configure_local_registry_trust "$lxc_id" "$registry_address"; then
+            log_error "pull_vllm_base_image: Failed to configure registry trust in container $lxc_id using common function."
+        fi
+    else
+        log_error "pull_vllm_base_image: phoenix_hypervisor_lxc_common_swarmpull.sh not loaded. Cannot configure registry trust."
     fi
+    # --- END NEW: Configure Registry Trust ---
 
-    # Build the Docker image inside the container using the written Dockerfile
-    if ! build_docker_image_in_container "$lxc_id" "$dockerfile_path" "$vllm_image_tag"; then
-        log_error "build_custom_vllm_image: Failed to build custom vLLM Docker image in container $lxc_id."
+    # --- NEW: Pull Image ---
+    log_info "pull_vllm_base_image: Pulling image $image_tag from DrSwarm registry into container $lxc_id..."
+    if [[ $PHOENIX_SWARM_PULL_LOADED -eq 1 ]]; then
+        if ! pull_from_swarm_registry "$lxc_id" "$image_tag"; then
+            log_error "pull_vllm_base_image: Failed to pull image $image_tag into container $lxc_id using common function."
+        fi
+    else
+        log_error "pull_vllm_base_image: phoenix_hypervisor_lxc_common_swarmpull.sh not loaded. Cannot pull image."
     fi
+    # --- END NEW: Pull Image ---
 
-    log_info "build_custom_vllm_image: Custom vLLM Docker image built successfully in container $lxc_id."
+    log_info "pull_vllm_base_image: vLLM base image pulled into container $lxc_id."
 }
+# --- END NEW ---
 
-# 6. Setup vLLM Service (adapted from original)
+# 6. Setup vLLM Service (adapted from original, updated to use pulled image)
 setup_service() {
     local lxc_id="$1"
     log_info "setup_service: Setting up vLLM service in container $lxc_id..."
@@ -496,6 +546,11 @@ setup_service() {
     dtype=${dtype:-"auto"}
     max_model_len=${max_model_len:-""} # Empty means no limit
 
+    # --- UPDATED: Use the pulled image tag ---
+    # Use the image tag that was pulled from the registry
+    local vllm_image_tag="vllm-base:latest"
+    # --- END UPDATED ---
+
     # Build Docker run command arguments
     local docker_args="--gpus all"
     docker_args+=" --shm-size=16G"
@@ -528,8 +583,10 @@ Requires=docker.service
 Type=simple
 Restart=always
 RestartSec=5
-ExecStartPre=/bin/bash -c 'docker image inspect vllm-custom:latest > /dev/null || { echo \"Custom vLLM image not found\"; exit 1; }'
-ExecStart=/usr/bin/docker run $docker_args vllm-custom:latest python3 -m vllm.entrypoints.openai.api_server $vllm_args
+# --- UPDATED: Use the pulled image tag ---
+ExecStartPre=/bin/bash -c 'docker image inspect $vllm_image_tag > /dev/null || { echo \"Pulled vLLM image $vllm_image_tag not found\"; exit 1; }'
+ExecStart=/usr/bin/docker run $docker_args $vllm_image_tag python3 -m vllm.entrypoints.openai.api_server $vllm_args
+# --- END UPDATED ---
 ExecStop=/usr/bin/docker stop -t 10 vllm-server
 ExecStopPost=/usr/bin/docker rm -f vllm-server
 
@@ -647,6 +704,24 @@ fi"
         ((checks_passed++)) || true # Consider this a pass if not configured
     fi
 
+    # --- NEW: Check if vLLM Base Image is Present Locally ---
+    local image_check_cmd="set -e
+if docker images -q vllm-base:latest | grep -q .; then
+    echo '[SUCCESS] Pulled vLLM base image vllm-base:latest found locally'
+    exit 0
+else
+    echo '[ERROR] Pulled vLLM base image vllm-base:latest not found locally'
+    exit 1
+fi"
+    if pct_exec_with_retry "$lxc_id" "$image_check_cmd"; then
+        log_info "validate_final_setup: Pulled vLLM base image found locally in container $lxc_id"
+        ((checks_passed++)) || true
+    else
+        log_error "validate_final_setup: Pulled vLLM base image not found locally in container $lxc_id"
+        ((checks_failed++)) || true
+    fi
+    # --- END NEW ---
+
     # --- Check vLLM Service Status ---
     local service_status
     service_status=$(check_systemd_service_status_in_container "$lxc_id" "vllm-docker")
@@ -716,6 +791,8 @@ show_setup_info() {
     echo "Dtype: $dtype"
     echo "API Port: $port"
     echo ""
+    echo "vLLM Base Docker Image: vllm-base:latest (pulled from registry into container)"
+    echo ""
     echo "You can check the status of the vLLM service with:"
     echo "  pct exec $lxc_id -- systemctl status vllm-docker"
     echo ""
@@ -753,10 +830,13 @@ main() {
     # 5. Setup Model (Download if path specified and doesn't exist)
     setup_model "$lxc_id"
 
-    # 6. Build Custom vLLM Docker Image
-    build_custom_vllm_image "$lxc_id"
+    # --- REPLACED: build_custom_vllm_image ---
+    # --- NEW: Pull Pre-Built Image ---
+    # Pull the pre-built vLLM base image from the DrSwarm registry into the DrDevStral container
+    pull_vllm_base_image "$lxc_id"
+    # --- END NEW ---
 
-    # 7. Setup vLLM Service (Systemd)
+    # 7. Setup vLLM Service (Systemd) - Updated to use pulled image
     setup_service "$lxc_id"
 
     # 8. Validate Final Setup

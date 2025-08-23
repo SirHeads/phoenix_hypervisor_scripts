@@ -5,12 +5,14 @@
         "nvidia_driver_version": {
             "type": "string",
             "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-            "default": "580.76.05"
+            "default": "580.76.05",
+            "description": "The NVIDIA driver version to be installed in GPU-enabled containers."
         },
         "nvidia_repo_url": {
             "type": "string",
             "format": "uri",
-            "default": "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/"
+            "default": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/",
+            "description": "The base URL for the NVIDIA CUDA repository."
         },
         "lxc_configs": {
             "type": "object",
@@ -19,54 +21,77 @@
                 "properties": {
                     "name": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "The human-readable name for the LXC container."
                     },
                     "memory_mb": {
                         "type": "integer",
-                        "minimum": 512
+                        "minimum": 512,
+                        "description": "The amount of RAM allocated to the container in megabytes."
                     },
                     "cores": {
                         "type": "integer",
-                        "minimum": 1
+                        "minimum": 1,
+                        "description": "The number of CPU cores allocated to the container."
                     },
                     "template": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "The path to the LXC template tarball used to create the container."
                     },
                     "storage_pool": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "The name of the Proxmox storage pool to use for the container's root filesystem."
                     },
                     "storage_size_gb": {
                         "type": "integer",
-                        "minimum": 10
+                        "minimum": 10,
+                        "description": "The size of the container's root filesystem in gigabytes."
                     },
                     "network_config": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "pattern": "^([0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+/[0-9]+,){2}[0-9]+(\\.[0-9]+){3}(,[0-9]+(\\.[0-9]+){3})*$",
+                        "description": "Comma-separated network configuration: IP/CIDR,Gateway,DNS1[,DNS2,...]. Example: '10.0.0.111/24,10.0.0.1,8.8.8.8,1.1.1.1'."
                     },
                     "features": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "Optional LXC features (e.g., nesting=1,keyctl=1)."
+                    },
+                    "static_ip": {
+                        "type": "string",
+                        "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$",
+                        "description": "Optional static IP address in CIDR notation (e.g., 10.0.0.99/24) for the container's primary network interface. Used for consistent addressing, especially for core services like DrSwarm."
+                    },
+                    "mac_address": {
+                        "type": "string",
+                        "pattern": "^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$",
+                        "description": "Optional static MAC address for the container's primary network interface (e.g., 01:23:45:67:89:AB). Useful for DHCP reservations."
                     },
                     "gpu_assignment": {
                         "type": "string",
                         "pattern": "^([0-9]+(,[0-9]+)*|none)$",
-                        "default": "none"
+                        "default": "none",
+                        "description": "Comma-separated list of GPU indices to assign to the container (e.g., '0', '1', '0,1'). Use 'none' or omit for no GPU assignment."
                     },
                     "vllm_model": {
                         "type": "string",
-                        "minLength": 1
+                        "minLength": 1,
+                        "description": "The path to the vLLM model directory inside the container."
                     },
                     "vllm_tensor_parallel_size": {
                         "type": "integer",
                         "minimum": 1,
-                        "default": 1
+                        "default": 1,
+                        "description": "The number of GPUs to use for tensor parallelism in vLLM."
                     },
                     "vllm_max_model_len": {
                         "type": "integer",
                         "minimum": 64,
-                        "default": 128
+                        "default": 128,
+                        "description": "The maximum length of the model context window in vLLM."
                     },
                     "vllm_kv_cache_dtype": {
                         "type": "string",
@@ -75,29 +100,34 @@
                             "fp8",
                             "fp16"
                         ],
-                        "default": "auto"
+                        "default": "auto",
+                        "description": "The data type for the key-value cache in vLLM."
                     },
                     "vllm_shm_size": {
                         "type": "string",
                         "pattern": "^[0-9]+[mg]$",
-                        "default": "8g"
+                        "default": "8g",
+                        "description": "The size of the shared memory segment (/dev/shm) for vLLM (e.g., '8g', '16m')."
                     },
                     "vllm_gpu_count": {
                         "type": "integer",
                         "minimum": 1,
-                        "default": 1
+                        "default": 1,
+                        "description": "The total number of GPUs allocated to the vLLM service."
                     },
                     "vllm_api_port": {
                         "type": "integer",
                         "minimum": 1024,
                         "maximum": 65535,
-                        "default": 8000
+                        "default": 8000,
+                        "description": "The port on which the vLLM API server will listen."
                     },
                     "vllm_gpu_memory_utilization": {
                         "type": "number",
                         "minimum": 0.0,
                         "maximum": 1.0,
-                        "default": 0.8
+                        "default": 0.8,
+                        "description": "The fraction of GPU memory to use for the vLLM model weights and cache."
                     },
                     "vllm_dtype": {
                         "type": "string",
@@ -106,7 +136,8 @@
                             "bfloat16",
                             "float32"
                         ],
-                        "default": "float16"
+                        "default": "float16",
+                        "description": "The data type for the model weights in vLLM."
                     },
                     "vllm_attention_backend": {
                         "type": "string",
@@ -115,12 +146,14 @@
                             "XFORMERS",
                             "TORCH"
                         ],
-                        "default": "FLASHINFER"
+                        "default": "FLASHINFER",
+                        "description": "The backend to use for attention computation in vLLM."
                     },
                     "vllm_nccl_so_path": {
                         "type": "string",
                         "minLength": 1,
-                        "default": "/root/.config/vllm/nccl/cu13/libnccl.so"
+                        "default": "/root/.config/vllm/nccl/cu13/libnccl.so",
+                        "description": "The path to the NCCL shared library inside the container."
                     }
                 },
                 "required": [
@@ -130,8 +163,7 @@
                     "template",
                     "storage_pool",
                     "storage_size_gb",
-                    "network_config",
-                    "features"
+                    "network_config"
                 ]
             }
         }

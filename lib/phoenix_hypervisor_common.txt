@@ -1,6 +1,6 @@
 #!/bin/bash
 # Common functions for Phoenix Hypervisor scripts
-# Version: 1.7.12 (Fixed Premature CUDA Validation)
+# Version: 1.7.13 (Fixed Premature CUDA Validation, Added static_ip and mac_address support)
 # Author: Assistant
 
 # --- Signal successful loading ---
@@ -349,31 +349,68 @@ create_lxc_container() {
     local network_config
     network_config=$(echo "$container_config" | jq -r '.network_config')
     local features
-    features=$(echo "$container_config" | jq -r '.features')
+    features=$(echo "$container_config" | jq -r '.features // empty') # Handle optional features
     local gpu_assignment
     gpu_assignment=$(echo "$container_config" | jq -r '.gpu_assignment // "none"')
+    # --- NEW: Extract optional parameters ---
+    local static_ip
+    static_ip=$(echo "$container_config" | jq -r '.static_ip // empty') # Use 'empty' to signify not present
+    local mac_address
+    mac_address=$(echo "$container_config" | jq -r '.mac_address // empty') # Use 'empty' to signify not present
+    # --- END NEW: Extract optional parameters ---
     # --- End Extract Parameters ---
 
     # --- Parse Network Configuration ---
-    local ip_cidr gateway dns
-    # Split the network_config string by commas
-    IFS=',' read -r ip_cidr gateway dns <<< "$network_config"
+    # Initialize variables for net0 construction
+    local net0_args="name=eth0,bridge=vmbr0"
 
-    # Validate IP/CIDR format (basic regex)
-    if [[ ! "$ip_cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-        log_error "Invalid IP/CIDR format in network_config: $ip_cidr"
-        return 1
+    # Handle MAC Address
+    if [[ -n "$mac_address" && "$mac_address" != "null" ]]; then
+        # Validate MAC address format (basic regex check)
+        if [[ ! "$mac_address" =~ ^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$ ]]; then
+            log_error "Invalid MAC address format for container $lxc_id: '$mac_address'"
+            return 1
+        fi
+        net0_args+=",hwaddr=$mac_address"
+        log_info "Using custom MAC address for container $lxc_id: $mac_address"
     fi
+
+    # Determine IP configuration for net0
+    if [[ -n "$static_ip" && "$static_ip" != "null" ]]; then
+        # If static_ip is provided, use it. network_config should contain gw,dns.
+        # Validate static_ip format (basic regex)
+        if [[ ! "$static_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+            log_error "Invalid static_ip format for container $lxc_id: '$static_ip'"
+            return 1
+        fi
+        net0_args+=",ip=$static_ip"
+        log_info "Using static IP for container $lxc_id: $static_ip"
+    else
+        # If no static_ip, fall back to parsing the old network_config format for IP/CIDR
+        local ip_cidr
+        IFS=',' read -r ip_cidr _ <<< "$network_config" # Read only the first part (IP/CIDR)
+        # Validate IP/CIDR format (basic regex)
+        if [[ ! "$ip_cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
+            log_error "Invalid IP/CIDR format in network_config (fallback) for container $lxc_id: $ip_cidr"
+            return 1
+        fi
+        net0_args+=",ip=$ip_cidr"
+        log_info "Using IP/CIDR from network_config for container $lxc_id: $ip_cidr"
+    fi
+
+    # Parse Gateway and DNS from network_config (always used if present)
+    local gateway dns
+    IFS=',' read -r _ gateway dns <<< "$network_config" # Skip IP part, read gw and dns
     # Validate Gateway format (basic regex)
-    if [[ ! "$gateway" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        log_error "Invalid Gateway format in network_config: $gateway"
-        return 1
+    if [[ -n "$gateway" && "$gateway" != "null" ]]; then
+        if [[ ! "$gateway" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            log_error "Invalid Gateway format in network_config for container $lxc_id: $gateway"
+            return 1
+        fi
+        net0_args+=",gw=$gateway"
     fi
-    # Validate DNS format (basic regex)
-    if [[ ! "$dns" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-        log_error "Invalid DNS format in network_config: $dns"
-        return 1
-    fi
+    # Nameserver is handled separately by pct create
+
     # --- End Parse Network ---
 
     # --- Validate Required Fields (Double-check after jq parsing) ---
@@ -406,10 +443,7 @@ create_lxc_container() {
         log_error "create_lxc_container: Missing 'network_config' for container $lxc_id"
         return 1
     fi
-    if [[ -z "$features" || "$features" == "null" ]]; then
-        log_error "create_lxc_container: Missing 'features' for container $lxc_id"
-        return 1
-    fi
+    # features is now optional, so no check for it here
     # --- End Validate Fields ---
 
     # Prepare storage size argument for pct (just the number, unit assumed GB)
@@ -417,16 +451,24 @@ create_lxc_container() {
 
     # --- Create the LXC Container ---
     log_info "Creating container $lxc_id ($name)..."
+    # Prepare the base command
+    local pct_create_cmd=(pct create "$lxc_id" "$template"
+        --hostname "$name"
+        --memory "$memory_mb"
+        --cores "$cores"
+        --storage "$storage_pool"
+        --rootfs "$storage_size"
+        --net0 "$net0_args"
+        --nameserver "$dns"
+    )
+
+    # Add features if present and not null
+    if [[ -n "$features" && "$features" != "null" ]]; then
+         pct_create_cmd+=(--features "$features")
+    fi
+
     # Use retry_command to attempt container creation
-    if ! retry_command 3 10 pct create "$lxc_id" "$template" \
-        --hostname "$name" \
-        --memory "$memory_mb" \
-        --cores "$cores" \
-        --storage "$storage_pool" \
-        --rootfs "$storage_size" \
-        --net0 "name=eth0,bridge=vmbr0,ip=$ip_cidr,gw=$gateway" \
-        --nameserver "$dns" \
-        --features "$features"; then
+    if ! retry_command 3 10 "${pct_create_cmd[@]}"; then
         log_error "Failed to create LXC container $lxc_id"
         return 1
     fi

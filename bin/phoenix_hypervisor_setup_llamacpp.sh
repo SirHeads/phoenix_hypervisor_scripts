@@ -2,10 +2,11 @@
 
 # phoenix_hypervisor_setup_llamacpp.sh
 #
-# Sets up the llamacpp container (ID 902) with NVIDIA support (Driver 580.76.05, CUDA 12.8) and builds llama.cpp.
+# Sets up the llamacpp container (ID 902) with NVIDIA support (Driver 580.76.05, CUDA 12.8)
+# and pulls the pre-built llama.cpp base image from the DrSwarm registry.
 # This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
 #
-# Version: 1.0.0 (Initial for Project Requirements)
+# Version: 1.1.0 (Integrated DrSwarm Registry Image Pull)
 # Author: Assistant
 
 set -euo pipefail
@@ -108,6 +109,29 @@ done
 if [[ $PHOENIX_NVIDIA_LOADED -ne 1 ]]; then
     log_error "Failed to load phoenix_hypervisor_lxc_common_nvidia.sh. Cannot proceed with NVIDIA setup."
 fi
+
+# --- NEW: Source Swarm Pull LXC Common Functions ---
+PHOENIX_SWARM_PULL_LOADED=0
+for swarm_pull_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_swarmpull.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_swarmpull.sh"; do
+    if [[ -f "$swarm_pull_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$swarm_pull_path"
+        if declare -F configure_local_registry_trust >/dev/null 2>&1; then
+            PHOENIX_SWARM_PULL_LOADED=1
+            log_info "phoenix_hypervisor_setup_llamacpp.sh: Sourced Swarm Pull LXC common functions from $swarm_pull_path."
+            break
+        else
+            log_warn "Sourced $swarm_pull_path, but Swarm Pull LXC functions not found. Trying next location."
+        fi
+    fi
+done
+
+if [[ $PHOENIX_SWARM_PULL_LOADED -ne 1 ]]; then
+    log_error "Failed to load phoenix_hypervisor_lxc_common_swarmpull.sh. Cannot proceed with registry integration."
+fi
+# --- END NEW ---
 
 # --- Source New Common Libraries ---
 # Source Base LXC Common Functions
@@ -261,7 +285,7 @@ validate_container_state() {
     fi
 
     # Check and Configure GPU Passthrough
-    # Get GPU assignment from config
+    # Get GPU assignment from config (using common function)
     local gpu_assignment
     gpu_assignment=$(get_gpu_assignment "$lxc_id")
     if [[ "$gpu_assignment" == "none" || -z "$gpu_assignment" ]]; then
@@ -296,18 +320,17 @@ validate_container_state() {
     fi
 }
 
-# 3. Install Build Dependencies and Tools in Container
-install_build_dependencies() {
+# 3. Install Basic Dependencies (if needed beyond what create_lxc provides)
+install_basic_dependencies() {
     local lxc_id="$1"
-    log_info "install_build_dependencies: Installing build tools and dependencies in container $lxc_id..."
+    log_info "install_basic_dependencies: Installing basic dependencies in container $lxc_id..."
 
+    # Example: Install common tools if not present
     local install_cmd="set -e
 export DEBIAN_FRONTEND=noninteractive
-apt-get update -y --fix-missing
-apt-get install -y git build-essential cmake curl python3 python3-pip wget
-# Install CUDA development toolkit 12.8 (assuming common function exists)
-# This step might be moved to after NVIDIA driver installation if needed
-echo '[SUCCESS] Build dependencies installed.'
+apt-get update -y --fix-missing > /tmp/apt-update-deps.log 2>&1 || { echo '[ERROR] Failed to update package lists'; cat /tmp/apt-update-deps.log; exit 1; }
+apt-get install -y curl wget git > /tmp/apt-install-deps.log 2>&1 || { echo '[ERROR] Failed to install basic dependencies'; cat /tmp/apt-install-deps.log; exit 1; }
+echo '[SUCCESS] Basic dependencies installed.'
 "
 
     # Use pct_exec_with_retry if available
@@ -317,10 +340,10 @@ echo '[SUCCESS] Build dependencies installed.'
     fi
 
     if ! $exec_func "$lxc_id" -- bash -c "$install_cmd"; then
-        log_error "install_build_dependencies: Failed to install build dependencies in container $lxc_id."
+        log_error "install_basic_dependencies: Failed to install basic dependencies in container $lxc_id."
     fi
 
-    log_info "install_build_dependencies: Build tools and dependencies installed successfully in container $lxc_id."
+    log_info "install_basic_dependencies: Basic dependencies installed successfully in container $lxc_id."
 }
 
 
@@ -351,6 +374,18 @@ setup_nvidia_packages() {
         log_error "setup_nvidia_packages: Required function 'install_cuda_toolkit_12_8_in_container' not found. Please update phoenix_hypervisor_lxc_common_nvidia.sh."
     fi
 
+    # Install NVIDIA Container Toolkit (nvidia-docker2)
+    log_info "setup_nvidia_packages: Installing NVIDIA Container Toolkit..."
+    if ! install_nvidia_toolkit_in_container "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to install NVIDIA toolkit in container $lxc_id."
+    fi
+
+    # Configure Docker to use NVIDIA runtime
+    log_info "setup_nvidia_packages: Configuring Docker NVIDIA runtime..."
+    if ! configure_docker_nvidia_runtime "$lxc_id"; then
+        log_error "setup_nvidia_packages: Failed to configure Docker NVIDIA runtime in container $lxc_id."
+    fi
+
     # Verify basic GPU access inside the container
     log_info "setup_nvidia_packages: Verifying basic GPU access in container $lxc_id..."
     if ! verify_lxc_gpu_access_in_container "$lxc_id"; then
@@ -360,14 +395,37 @@ setup_nvidia_packages() {
     # Verify CUDA Toolkit installation (nvcc)
     log_info "setup_nvidia_packages: Verifying CUDA Toolkit installation (nvcc) in container $lxc_id..."
     local nvcc_check_cmd="set -e
+# Source the persistent CUDA environment if the script exists
+# This is crucial for non-interactive shells created by pct exec
+if [[ -f /etc/profile.d/cuda.sh ]]; then
+    source /etc/profile.d/cuda.sh
+    # echo '[DEBUG] Sourced /etc/profile.d/cuda.sh for nvcc check' # Optional debug line
+fi
+
+# Now check for nvcc with the potentially updated PATH
 if command -v nvcc >/dev/null 2>&1; then
+    # Get the version
     nvcc_version=\$(nvcc --version | grep 'release' | awk '{print \$5}' | sed 's/,//')
-    echo \"[SUCCESS] nvcc found, version: \$nvcc_version\"
-    exit 0
+    if [[ \"\$nvcc_version\" == \"12.8\" ]]; then
+        echo '[SUCCESS] nvcc version \$nvcc_version verified in container $lxc_id.'
+        exit 0
+    else
+        echo '[ERROR] Incorrect nvcc version in container $lxc_id. Expected 12.8, found \$nvcc_version.'
+        exit 1
+    fi
 else
-    echo '[ERROR] nvcc not found'
+    # Provide a bit more diagnostic info
+    echo '[ERROR] nvcc not found in container $lxc_id.'
+    echo '[INFO] PATH is: \$PATH'
+    echo '[INFO] Checking standard CUDA bin location...'
+    if [[ -f /usr/local/cuda/bin/nvcc ]]; then
+       echo '[INFO] Found nvcc at /usr/local/cuda/bin/nvcc, but not in PATH.'
+    else
+       echo '[INFO] nvcc not found at /usr/local/cuda/bin/nvcc either.'
+    fi
     exit 1
-fi"
+fi
+"
 
     # Use pct_exec_with_retry if available
     local exec_func="pct exec"
@@ -383,85 +441,48 @@ fi"
 }
 
 
-# 5. Build llama.cpp in Container
-build_llama_cpp() {
+# --- REPLACED: build_llama_cpp & install_python_bindings ---
+# --- NEW: Pull llama.cpp Base Image from DrSwarm Registry ---
+pull_llamacpp_base_image() {
     local lxc_id="$1"
-    log_info "build_llama_cpp: Building llama.cpp in container $lxc_id..."
+    log_info "pull_llamacpp_base_image: Pulling llama.cpp base image into container $lxc_id..."
 
-    local build_cmd="set -e
-export LC_ALL=C.UTF-8
-export LANG=C.UTF-8
+    # Define the image tag as known in the registry and expected locally
+    # This should match the directory name in phoenix_docker_images (llamacpp-base)
+    # and the tag used during the build/push process in DrSwarm setup.
+    local image_tag="llamacpp-base:latest"
 
-# Create a working directory
-mkdir -p /opt/ai
-cd /opt/ai
+    # --- NEW: Configure Registry Trust ---
+    # Configure the LlamaCpp container's Docker daemon to trust the DrSwarm registry
+    log_info "pull_llamacpp_base_image: Configuring registry trust in container $lxc_id..."
+    local registry_address="10.0.0.99:5000" # Hardcoded DrSwarm registry address
 
-# Clone the llama.cpp repository
-echo '[INFO] Cloning llama.cpp repository...'
-git clone https://github.com/ggml-org/llama.cpp
-cd llama.cpp
-
-# Create build directory and configure with CUDA and CURL support
-echo '[INFO] Configuring build with CUDA and CURL support...'
-cmake -B build -DGGML_CUDA=ON -DLLAMA_CURL=ON
-
-# Build the project
-echo '[INFO] Building llama.cpp (this may take a while)...'
-cmake --build build --config Release -j \$(nproc)
-
-echo '[SUCCESS] llama.cpp built successfully.'
-"
-
-    # Use pct_exec_with_retry if available
-    local exec_func="pct exec"
-    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
-        exec_func="pct_exec_with_retry"
+    if [[ $PHOENIX_SWARM_PULL_LOADED -eq 1 ]]; then
+        if ! configure_local_registry_trust "$lxc_id" "$registry_address"; then
+            log_error "pull_llamacpp_base_image: Failed to configure registry trust in container $lxc_id using common function."
+        fi
+    else
+        log_error "pull_llamacpp_base_image: phoenix_hypervisor_lxc_common_swarmpull.sh not loaded. Cannot configure registry trust."
     fi
+    # --- END NEW: Configure Registry Trust ---
 
-     # Note: Building can take a long time, consider increasing retry delays or attempts if needed.
-    if ! $exec_func "$lxc_id" -- bash -c "$build_cmd"; then
-        log_error "build_llama_cpp: Failed to build llama.cpp in container $lxc_id."
+    # --- NEW: Pull Image ---
+    log_info "pull_llamacpp_base_image: Pulling image $image_tag from DrSwarm registry into container $lxc_id..."
+    if [[ $PHOENIX_SWARM_PULL_LOADED -eq 1 ]]; then
+        if ! pull_from_swarm_registry "$lxc_id" "$image_tag"; then
+            log_error "pull_llamacpp_base_image: Failed to pull image $image_tag into container $lxc_id using common function."
+        fi
+    else
+        log_error "pull_llamacpp_base_image: phoenix_hypervisor_lxc_common_swarmpull.sh not loaded. Cannot pull image."
     fi
+    # --- END NEW: Pull Image ---
 
-    log_info "build_llama_cpp: llama.cpp built successfully in container $lxc_id."
+    log_info "pull_llamacpp_base_image: llama.cpp base image pulled into container $lxc_id."
 }
-
-# 6. Install Python Bindings (llama-cpp-python) in Container
-install_python_bindings() {
-    local lxc_id="$1"
-    log_info "install_python_bindings: Installing llama-cpp-python in container $lxc_id..."
-
-    local install_cmd="set -e
-export LC_ALL=C.UTF-8
-export LANG=C.UTF-8
-
-# Update pip
-pip3 install --upgrade pip
-
-# Install llama-cpp-python with CUDA support
-# Note: CUDA autodetection usually works, but CMAKE_ARGS can force it if needed
-echo '[INFO] Installing llama-cpp-python with CUDA support...'
-# CMAKE_ARGS=\"-DGGML_CUDA=on\" pip3 install llama-cpp-python # Alternative if auto-detect fails
-pip3 install llama-cpp-python
-
-echo '[SUCCESS] llama-cpp-python installed.'
-"
-
-    # Use pct_exec_with_retry if available
-    local exec_func="pct exec"
-    if declare -F pct_exec_with_retry >/dev/null 2>&1; then
-        exec_func="pct_exec_with_retry"
-    fi
-
-    if ! $exec_func "$lxc_id" -- bash -c "$install_cmd"; then
-        log_error "install_python_bindings: Failed to install llama-cpp-python in container $lxc_id."
-    fi
-
-    log_info "install_python_bindings: llama-cpp-python installed successfully in container $lxc_id."
-}
+# --- END NEW ---
 
 
-# 7. Final Validation
+# 7. Final Validation (Updated to check for pulled image)
 validate_final_setup() {
     local lxc_id="$1"
     local checks_passed=0
@@ -516,10 +537,19 @@ fi"
 
     # --- Check CUDA Toolkit (nvcc) ---
     local nvcc_check="set -e
+# Source the persistent CUDA environment if the script exists
+if [[ -f /etc/profile.d/cuda.sh ]]; then
+    source /etc/profile.d/cuda.sh
+fi
 if command -v nvcc >/dev/null 2>&1; then
     nvcc_version=\$(nvcc --version | grep 'release' | awk '{print \$5}' | sed 's/,//')
-    echo \"[SUCCESS] nvcc found, version: \$nvcc_version\"
-    exit 0
+    if [[ \"\$nvcc_version\" == \"12.8\" ]]; then
+        echo '[SUCCESS] nvcc found, version: \$nvcc_version'
+        exit 0
+    else
+        echo '[ERROR] Incorrect nvcc version: \$nvcc_version (expected 12.8)'
+        exit 1
+    fi
 else
     echo '[ERROR] nvcc not found'
     exit 1
@@ -532,39 +562,49 @@ fi"
         ((checks_failed++)) || true
     fi
 
-    # --- Check llama.cpp Binary ---
-    local llama_binary_check="set -e
-if [[ -f '/opt/ai/llama.cpp/build/bin/llama-cli' ]]; then
-    echo '[SUCCESS] llama-cli binary found'
+    # --- Check Docker Status ---
+    local docker_check_cmd="set -e
+if command -v docker >/dev/null 2>&1 && systemctl is-active --quiet docker; then
+    echo '[SUCCESS] Docker is installed and running'
     exit 0
 else
-    echo '[ERROR] llama-cli binary not found'
+    echo '[ERROR] Docker is not installed or not running'
     exit 1
 fi"
-    if $exec_func "$lxc_id" -- bash -c "$llama_binary_check"; then
-        log_info "validate_final_setup: llama-cli binary check passed in container $lxc_id"
+    if $exec_func "$lxc_id" -- bash -c "$docker_check_cmd"; then
+        log_info "validate_final_setup: Docker is installed and running in container $lxc_id"
         ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: llama-cli binary check failed in container $lxc_id"
+        log_error "validate_final_setup: Docker check failed in container $lxc_id"
         ((checks_failed++)) || true
     fi
 
-    # --- Check Python Bindings ---
-    local python_check="set -e
-if python3 -c 'import llama_cpp; print(\"llama_cpp imported successfully\")' >/dev/null 2>&1; then
-    echo '[SUCCESS] llama_cpp Python module imported'
-    exit 0
-else
-    echo '[ERROR] Failed to import llama_cpp Python module'
-    exit 1
-fi"
-    if $exec_func "$lxc_id" -- bash -c "$python_check"; then
-        log_info "validate_final_setup: Python bindings check passed in container $lxc_id"
+    # --- Check GPU Access via Docker ---
+    if verify_docker_gpu_access_in_container "$lxc_id"; then
+        log_info "validate_final_setup: Docker GPU access verified for container $lxc_id"
         ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: Python bindings check failed in container $lxc_id"
+        log_error "validate_final_setup: Docker GPU access verification failed for container $lxc_id"
         ((checks_failed++)) || true
     fi
+
+    # --- NEW: Check if llama.cpp Base Image is Present Locally ---
+    local image_check_cmd="set -e
+if docker images -q llamacpp-base:latest | grep -q .; then
+    echo '[SUCCESS] Pulled llama.cpp base image llamacpp-base:latest found locally'
+    exit 0
+else
+    echo '[ERROR] Pulled llama.cpp base image llamacpp-base:latest not found locally'
+    exit 1
+fi"
+    if $exec_func "$lxc_id" -- bash -c "$image_check_cmd"; then
+        log_info "validate_final_setup: Pulled llama.cpp base image found locally in container $lxc_id"
+        ((checks_passed++)) || true
+    else
+        log_error "validate_final_setup: Pulled llama.cpp base image not found locally in container $lxc_id"
+        ((checks_failed++)) || true
+    fi
+    # --- END NEW ---
 
     # --- Summary ---
     log_info "validate_final_setup: Validation summary: $checks_passed passed, $checks_failed failed"
@@ -577,7 +617,7 @@ fi"
     return 0
 }
 
-# 8. Show Setup Information
+# 8. Show Setup Information (Updated to reflect pulled image)
 show_setup_info() {
     local lxc_id="$1"
     log_info "show_setup_info: Displaying setup information for container $lxc_id..."
@@ -585,16 +625,17 @@ show_setup_info() {
     echo "==============================================="
     echo "LLAMACPP SETUP COMPLETED FOR CONTAINER $lxc_id"
     echo "==============================================="
-    echo "llama.cpp is built in /opt/ai/llama.cpp/build"
-    echo "llama-cli binary is at /opt/ai/llama.cpp/build/bin/llama-cli"
-    echo "Python bindings (llama-cpp-python) are installed."
+    echo "NVIDIA Driver 580.76.05 and CUDA Toolkit 12.8 are installed."
+    echo "llama.cpp base Docker image (llamacpp-base:latest) has been pulled from the DrSwarm registry."
     echo ""
     echo "To enter the container:"
     echo "  pct enter $lxc_id"
-    echo "To run llama-cli (example):"
-    echo "  pct exec $lxc_id -- /opt/ai/llama.cpp/build/bin/llama-cli -m <path_to_model.gguf> -p \"Hello world\""
-    echo "To use Python bindings (example):"
-    echo "  pct exec $lxc_id -- python3 -c \"from llama_cpp import Llama; print('Llama imported')\""
+    echo "To run llama.cpp server (example, requires model):"
+    echo "  pct exec $lxc_id -- docker run --gpus all -p 8080:8080 llamacpp-base:latest --help"
+    echo "  (You will need to mount a model volume and provide server arguments)"
+    echo "To run llama.cpp CLI (example, requires model):"
+    echo "  pct exec $lxc_id -- docker run --gpus all --rm -it llamacpp-base:latest --help"
+    echo "  (You will need to mount a model volume and provide CLI arguments)"
     echo "==============================================="
 }
 
@@ -613,24 +654,32 @@ main() {
     # 2. Validate Container State (Create if needed, Start, Network, GPU Passthrough)
     validate_container_state "$lxc_id"
 
-    # 3. Install Build Dependencies
-    install_build_dependencies "$lxc_id"
+    # 3. Install Basic Dependencies (if needed)
+    # install_basic_dependencies "$lxc_id" # Uncomment if needed
 
-    # 4. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA Toolkit 12.8)
+    # === ORDER CORRECTED HERE ===
+    # 5. Install Docker CE (NOW BEFORE NVIDIA Setup)
+    log_info "Installing Docker CE in container $lxc_id..."
+    if ! install_docker_ce_in_container "$lxc_id"; then
+        log_error "Failed to install Docker CE in container $lxc_id."
+    fi
+
+    # 4. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA Toolkit 12.8, Toolkit, Docker Runtime)
+    # Now Docker is available when configure_docker_nvidia_runtime is called
     setup_nvidia_packages "$lxc_id"
 
-    # 5. Build llama.cpp
-    build_llama_cpp "$lxc_id"
+    # --- REPLACED: build_llama_cpp & install_python_bindings ---
+    # --- NEW: Pull Pre-Built Image ---
+    # Pull the pre-built llama.cpp base image from the DrSwarm registry into the LlamaCpp container
+    pull_llamacpp_base_image "$lxc_id"
+    # --- END NEW ---
 
-    # 6. Install Python Bindings (llama-cpp-python)
-    install_python_bindings "$lxc_id"
-
-    # 7. Validate Final Setup
+    # 7. Validate Final Setup (Updated to check for pulled image)
     if ! validate_final_setup "$lxc_id"; then
         log_warn "Final validation had some failures, but setup may still be usable. Please review logs."
     fi
 
-    # 8. Show Setup Information
+    # 8. Show Setup Information (Updated)
     show_setup_info "$lxc_id"
 
     log_info "==============================================="
