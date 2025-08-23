@@ -132,16 +132,8 @@
                     "storage_size_gb",
                     "network_config",
                     "features"
-                    // Removed vllm_model and vllm_api_port from required as they are not needed for all container types (e.g., llamacpp)
                 ]
             }
-            // Optional: Add patternProperties for stricter key validation (e.g., keys must be numeric strings)
-            // "patternProperties": {
-            //   "^[0-9]+$": {
-            //     "type": "object"
-            //     // ... (properties definition can be repeated here or rely on additionalProperties)
-            //   }
-            // }
         }
     },
     "required": [

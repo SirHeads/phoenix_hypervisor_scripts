@@ -1,7 +1,7 @@
 #!/bin/bash
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# --- Argument Parsing (MOVED UP) ---
+# --- Argument Parsing ---
 # Check if we have a container ID argument
 if [[ $# -ne 1 ]]; then
     echo "[ERROR] Usage: $0 <container_id>" >&2
@@ -21,7 +21,7 @@ echo "[DEBUG] Script started. Checking jq availability..." >&2
 # Ensure jq is installed before proceeding
 echo "[DEBUG] About to run 'command -v jq'..." >&2
 if ! command -v jq >/dev/null 2>&1; then
-    echo "[DEBUG] 'command -v jq' failed. PATH=$PATH, which jq=$(which jq 2>&1)" >&2 # Add more debug info
+    echo "[DEBUG] 'command -v jq' failed. PATH=$PATH, which jq=$(which jq 2>&1)" >&2
     echo "[ERROR] 'jq' command not found. Please install jq (apt install jq)." >&2
     exit 1
 else
@@ -29,14 +29,10 @@ else
 fi
 echo "[DEBUG] Past jq check." >&2
 
-# --- Load Configuration (CORRECTED CHECK) ---
+# --- Load Configuration ---
 # Load configuration for this specific container directly from JSON file
-# Since this script runs in a separate process, it can't access the global LXC_CONFIGS array
-# loaded by phoenix_establish_hypervisor.sh
 container_config=""
-# Use command -v jq instead of declare -f jq
 if command -v jq > /dev/null 2>&1; then
-    # Directly extract the config from the JSON file using jq
     container_config=$(jq -c ".lxc_configs.\"$container_id\"" "$PHOENIX_LXC_CONFIG_FILE")
     if [[ -z "$container_config" || "$container_config" == "null" ]]; then
         echo "[ERROR] No configuration found for container ID $container_id in $PHOENIX_LXC_CONFIG_FILE" >&2
@@ -47,13 +43,25 @@ else
     exit 1
 fi
 
+# Extract and validate template from JSON
+template_path=$(echo "$container_config" | jq -r '.template')
+if [[ -z "$template_path" || "$template_path" == "null" ]]; then
+    echo "[ERROR] No template specified in configuration for container $container_id" >&2
+    exit 1
+fi
+echo "[INFO] Using template: $template_path for container $container_id" >&2
+
+# Validate template file existence
+if ! test -f "$template_path"; then
+    echo "[ERROR] Template file not found: $template_path" >&2
+    exit 1
+fi
+echo "[DEBUG] Template file validated: $template_path" >&2
+
 # --- Enhanced Sourcing of Dependencies ---
-# Source configuration from the standard location
-# Ensures paths like PHOENIX_LXC_CONFIG_FILE are available
 if [[ -f "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
     source /usr/local/etc/phoenix_hypervisor_config.sh
 else
-    # Fallback to current directory if standard location not found (less ideal)
     if [[ -f "./phoenix_hypervisor_config.sh" ]]; then
         source ./phoenix_hypervisor_config.sh
         echo "[WARN] phoenix_hypervisor_create_lxc.sh: Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh" >&2
@@ -63,9 +71,7 @@ else
     fi
 fi
 
-# Source common functions from the standard location (as defined in corrected common.sh)
-# Priority: 1. Standard lib location, 2. Standard bin location, 3. Current directory
-# This provides access to logging functions (log_info, etc.) and other utilities if needed.
+# Source common functions
 if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
     source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh
 elif [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
@@ -75,19 +81,37 @@ elif [[ -f "./phoenix_hypervisor_common.sh" ]]; then
     source ./phoenix_hypervisor_common.sh
     echo "[WARN] phoenix_hypervisor_create_lxc.sh: Sourced common functions from current directory. Prefer standard locations." >&2
 else
-    # Define minimal fallback logging if common functions can't be sourced
-    # This ensures the script can report basic errors even if sourcing fails completely
     log_info() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $1"; }
     log_warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $1" >&2; }
     log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $1" >&2; }
     log_warn "phoenix_hypervisor_create_lxc.sh: Common functions file not found in standard locations. Using minimal logging."
 fi
 
-# --- Call the central creation function from phoenix_hypervisor_common.sh ---
-# This is the core action, delegating to the shared library.
+# --- Call the central creation function ---
 if declare -f create_lxc_container > /dev/null; then
     if create_lxc_container "$container_id" "$container_config"; then
         log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id created and configured successfully."
+
+        # Try to get container codename for informational purposes, but don't fail if it's not available
+        container_codename=$(pct exec "$container_id" -- bash -c "lsb_release -cs 2>/dev/null || echo 'unknown'")
+        if [[ "$container_codename" != "unknown" ]]; then
+            log_info "phoenix_hypervisor_create_lxc.sh: Container codename detected: $container_codename (template: $(echo "$container_config" | jq -r '.template'))"
+        else
+            log_info "phoenix_hypervisor_create_lxc.sh: Container codename not immediately available, continuing with setup"
+        fi
+
+        # Validate init system
+        init_system=$(pct exec "$container_id" -- bash -c "ps -p 1 -o comm=" 2>/dev/null)
+        if [[ $? -ne 0 || -z "$init_system" ]]; then
+            log_error "phoenix_hypervisor_create_lxc.sh: Failed to retrieve init system for container $container_id."
+            exit 1
+        fi
+        if [[ "$init_system" != "systemd" ]]; then
+            log_error "phoenix_hypervisor_create_lxc.sh: Non-systemd init detected: $init_system. Docker requires systemd."
+            exit 1
+        fi
+        log_info "phoenix_hypervisor_create_lxc.sh: Container init system: $init_system"
+
         log_info "phoenix_hypervisor_create_lxc.sh: Starting container $container_id..."
         if ! retry_command 3 10 pct start "$container_id"; then
             log_error "phoenix_hypervisor_create_lxc.sh: Failed to start container $container_id."
@@ -95,32 +119,12 @@ if declare -f create_lxc_container > /dev/null; then
         fi
         log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id started successfully."
 
-        # --- CRITICAL FIX: REMOVED Premature CUDA Validation ---
-        # The call to validate_cuda_version has been REMOVED from this point.
-        # Reason: CUDA/NVCC is not installed inside the container immediately after creation.
-        # CUDA validation should happen in the specific container setup scripts
-        # (e.g., phoenix_hypervisor_setup_drdevstral.sh, phoenix_hypervisor_setup_drcuda.sh, phoenix_hypervisor_setup_llamacpp.sh)
-        # AFTER the NVIDIA driver and CUDA toolkit have been installed inside the container.
-        # ---
-        # if declare -f validate_cuda_version > /dev/null; then
-        #     if ! validate_cuda_version "$container_id"; then
-        #         log_error "phoenix_hypervisor_create_lxc.sh: CUDA version validation failed for container $container_id."
-        #         exit 1
-        #     fi
-        #     log_info "phoenix_hypervisor_create_lxc.sh: CUDA version validated successfully for container $container_id."
-        # else
-        #     log_warn "phoenix_hypervisor_create_lxc.sh: Function 'validate_cuda_version' not found. Skipping CUDA validation."
-        # fi
-        # ---
-        # --- End Critical Fix ---
-
         exit 0
     else
         log_error "phoenix_hypervisor_create_lxc.sh: Failed to create or configure container $container_id."
         exit 1
     fi
 else
-    # Use log function if available, else echo
     if declare -f log_error > /dev/null 2>&1; then
         log_error "phoenix_hypervisor_create_lxc.sh: Required function 'create_lxc_container' not found in common.sh."
     else

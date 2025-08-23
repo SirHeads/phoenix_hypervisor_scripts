@@ -2,8 +2,7 @@
 # Common NVIDIA functions for LXC containers in Phoenix Hypervisor
 # Provides functions for installing/checking NVIDIA drivers, toolkit, and verifying GPU access INSIDE containers
 # Designed to be sourced by scripts that interact with containers (e.g., setup_drdevstral.sh, setup_drcuda.sh)
-# Version: 1.9.1 (Updated for Project Requirements: Driver 580.76.05 Runfile, CUDA 12.8 Repo)
-# Author: Assistant
+# Version: 1.9.7 (Added AppArmor bypass in detect_gpus_in_container, improved Docker GPU verification)
 
 # --- Enhanced Sourcing of Dependencies ---
 if ! declare -f log_info > /dev/null 2>&1; then
@@ -21,16 +20,9 @@ fi
 
 # --- NVIDIA Functions for LXC Containers ---
 
-# --- NEW FUNCTION: Install NVIDIA Driver in Container via Runfile ---
-# Installs the NVIDIA driver inside an LXC container using the .run file method.
-# This is the required method for containers as it uses --no-kernel-module.
-# Args:
-#   $1: LXC ID
-#   $2: (Optional) Driver version. Defaults to NVIDIA_DRIVER_VERSION from config or 580.76.05.
-#   $3: (Optional) Runfile URL. Defaults to NVIDIA_RUNFILE_URL from config or the project URL for 580.76.05.
+# --- Install NVIDIA Driver in Container via Runfile ---
 install_nvidia_driver_in_container_via_runfile() {
     local lxc_id="$1"
-    # Allow overriding version/URL from config/script args, fallback to project defaults
     local driver_version="${2:-${NVIDIA_DRIVER_VERSION:-580.76.05}}"
     local runfile_url="${3:-${NVIDIA_RUNFILE_URL:-https://us.download.nvidia.com/XFree86/Linux-x86_64/580.76.05/NVIDIA-Linux-x86_64-580.76.05.run}}"
     local runfile_name="NVIDIA-Linux-x86_64-${driver_version}.run"
@@ -43,7 +35,6 @@ install_nvidia_driver_in_container_via_runfile() {
     log_info "install_nvidia_driver_in_container_via_runfile: Installing NVIDIA driver $driver_version in container $lxc_id using runfile..."
     echo "Installing NVIDIA driver $driver_version in container $lxc_id... This may take a few minutes."
 
-    # --- 1. Check if already installed ---
     local check_installed_cmd="
 set -e
 export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
@@ -58,15 +49,13 @@ if command -v nvidia-smi >/dev/null 2>&1; then
 else
     echo '[INFO] NVIDIA driver not found. Proceeding with installation.'
 fi
-exit 1 # Force install if not already correct version
+exit 1
 "
     if pct exec "$lxc_id" -- bash -c "$check_installed_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
         log_info "install_nvidia_driver_in_container_via_runfile: NVIDIA driver $driver_version already correctly installed in container $lxc_id."
         return 0
     fi
-    # --- End Check ---
 
-    # --- 2. Install Prerequisites inside container ---
     log_info "install_nvidia_driver_in_container_via_runfile: Installing prerequisites in container $lxc_id..."
     local install_prereqs_cmd="
 set -e
@@ -82,9 +71,7 @@ echo '[SUCCESS] Prerequisites installed.'
         log_error "install_nvidia_driver_in_container_via_runfile: Failed to install prerequisites in container $lxc_id."
         return 1
     fi
-    # --- End Prerequisites ---
 
-    # --- 3. Download the runfile inside the container ---
     log_info "install_nvidia_driver_in_container_via_runfile: Downloading driver runfile ($runfile_name) in container $lxc_id from $runfile_url..."
     local download_cmd="
 set -e
@@ -100,9 +87,7 @@ echo '[SUCCESS] Downloaded $runfile_name.'
         log_error "install_nvidia_driver_in_container_via_runfile: Failed to download runfile in container $lxc_id."
         return 1
     fi
-    # --- End Download ---
 
-    # --- 4. Run the installer inside the container with --no-kernel-module ---
     log_info "install_nvidia_driver_in_container_via_runfile: Running installer ($runfile_name) in container $lxc_id with --no-kernel-module..."
     local install_runfile_cmd="
 set -e
@@ -110,9 +95,7 @@ export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 echo '[INFO] Making $runfile_name executable...'
 chmod +x '$runfile_name'
 echo '[INFO] Running $runfile_name installer with --no-kernel-module...'
-# Use yes '' to automate prompts, pipe stderr to stdout to capture all output
 ./'$runfile_name' --silent --no-kernel-module --accept-license 2>&1 | grep -E '(ERROR|WARNING|Installing|complete)' || true
-# Check if installer process completed (it exits 0 even if it skips kernel module part)
 if [[ -f '/usr/bin/nvidia-smi' ]]; then
     echo '[INFO] Installer reported completion. Verifying...'
 else
@@ -120,24 +103,17 @@ else
     exit 1
 fi
 "
-    # Note: The NVIDIA runfile installer can be finicky with output and exit codes in containers.
-    # We focus on the presence of nvidia-smi post-install as a key indicator.
     if ! pct exec "$lxc_id" -- bash -c "$install_runfile_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
         log_error "install_nvidia_driver_in_container_via_runfile: Failed to run installer in container $lxc_id."
-        # Attempt cleanup of runfile on failure
         pct exec "$lxc_id" -- bash -c "rm -f '$runfile_name'" 2>/dev/null || true
         return 1
     fi
-    # --- End Run Installer ---
 
-    # --- 5. Cleanup runfile ---
     log_info "install_nvidia_driver_in_container_via_runfile: Cleaning up runfile in container $lxc_id..."
     if ! pct exec "$lxc_id" -- bash -c "rm -f '$runfile_name'" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
         log_warn "install_nvidia_driver_in_container_via_runfile: Failed to clean up runfile in container $lxc_id. Continuing."
     fi
-    # --- End Cleanup ---
 
-    # --- 6. Verify Installation ---
     log_info "install_nvidia_driver_in_container_via_runfile: Verifying driver installation in container $lxc_id..."
     local verify_cmd="
 set -e
@@ -167,15 +143,9 @@ fi
         log_error "install_nvidia_driver_in_container_via_runfile: Failed to verify driver installation in container $lxc_id."
         return 1
     fi
-    # --- End Verify ---
 }
-# --- END NEW FUNCTION ---
 
-
-# --- NEW FUNCTION: Install CUDA Toolkit 12.8 in Container ---
-# Installs the CUDA Development Toolkit 12.8 inside an LXC container using the official repository method.
-# Args:
-#   $1: LXC ID
+# --- Install CUDA Toolkit 12.8 in Container ---
 install_cuda_toolkit_12_8_in_container() {
     local lxc_id="$1"
 
@@ -187,10 +157,19 @@ install_cuda_toolkit_12_8_in_container() {
     log_info "install_cuda_toolkit_12_8_in_container: Installing CUDA Toolkit 12.8 in container $lxc_id..."
     echo "Installing CUDA Toolkit 12.8 in container $lxc_id... This may take a few minutes."
 
-    # --- 1. Check if already installed ---
+    # --- MODIFIED CHECK INSTALLED CMD ---
+    # Source the persistent env script if it exists for accurate check
     local check_installed_cmd="
 set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+# Source the persistent CUDA environment if it exists
+if [[ -f /etc/profile.d/cuda.sh ]]; then
+    source /etc/profile.d/cuda.sh
+    echo '[INFO] Sourced existing /etc/profile.d/cuda.sh'
+fi
+# Ensure PATH includes CUDA bin for this check session
+export PATH=/usr/local/cuda-12.8/bin:\$PATH
+export LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:\$LD_LIBRARY_PATH
 if command -v nvcc >/dev/null 2>&1; then
     installed_version=\$(nvcc --version | grep 'release' | awk '{print \$5}' | sed 's/,//')
     if [[ \"\$installed_version\" == \"12.8\" ]]; then
@@ -202,23 +181,24 @@ if command -v nvcc >/dev/null 2>&1; then
 else
     echo '[INFO] CUDA Toolkit (nvcc) not found. Proceeding with installation.'
 fi
-exit 1 # Force install if not already correct version
+exit 1
 "
     if pct exec "$lxc_id" -- bash -c "$check_installed_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
         log_info "install_cuda_toolkit_12_8_in_container: CUDA Toolkit 12.8 already correctly installed in container $lxc_id."
         return 0
     fi
-    # --- End Check ---
+    # --- END MODIFIED CHECK ---
 
-    # --- 2. Install Prerequisites (if not done by driver install) ---
-    # Note: Some overlap with driver install prereqs, but ensures they are present.
-    log_info "install_cuda_toolkit_12_8_in_container: Ensuring build tools are present in container $lxc_id..."
+    log_info "install_cuda_toolkit_12_8_in_container: Ensuring build tools and locale are present in container $lxc_id..."
     local install_prereqs_cmd="
 set -e
 export DEBIAN_FRONTEND=noninteractive
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-echo '[INFO] Updating package lists...'
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+echo '[INFO] Ensuring locale is set...'
 apt-get update -y --fix-missing
+apt-get install -y locales
+locale-gen en_US.UTF-8 C.UTF-8
+update-locale LC_ALL=C.UTF-8 LANG=C.UTF-8
 echo '[INFO] Installing wget and gnupg for repository setup...'
 apt-get install -y wget gnupg software-properties-common
 echo '[SUCCESS] Prerequisites for CUDA repo ensured.'
@@ -227,47 +207,79 @@ echo '[SUCCESS] Prerequisites for CUDA repo ensured.'
         log_error "install_cuda_toolkit_12_8_in_container: Failed to install prerequisites in container $lxc_id."
         return 1
     fi
-    # --- End Prerequisites ---
 
-    # --- 3. Add CUDA Repository and Install Toolkit ---
     log_info "install_cuda_toolkit_12_8_in_container: Adding CUDA repository and installing toolkit in container $lxc_id..."
+    # --- MODIFIED CUDA INSTALL CMD ---
+    # Ensure /etc/profile.d/cuda.sh is created as part of the installation process
     local cuda_install_cmd="
 set -e
 export DEBIAN_FRONTEND=noninteractive
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-
-# Determine Ubuntu codename (assuming 24.04/24.10)
-CODENAME=\$(lsb_release -cs 2>/dev/null || echo 'noble') # Fallback to noble if lsb_release fails
-
-echo '[INFO] Determined Ubuntu codename: \$CODENAME'
-
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 echo '[INFO] Installing CUDA keyring...'
-wget -qO /tmp/cuda-keyring_1.0-1_all.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
-dpkg -i /tmp/cuda-keyring_1.0-1_all.deb
-rm -f /tmp/cuda-keyring_1.0-1_all.deb
-
+wget -qO /tmp/cuda-keyring_1.1-1_all.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+dpkg -i /tmp/cuda-keyring_1.1-1_all.deb || { echo '[ERROR] Failed to install CUDA keyring'; exit 1; }
+rm -f /tmp/cuda-keyring_1.1-1_all.deb
+echo 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/   /' > /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list
 echo '[INFO] Updating package lists for CUDA...'
-apt-get update -y --fix-missing
-
-echo '[INFO] Installing CUDA Toolkit 12.8...'
-apt-get install -y cuda-toolkit-12-8
-
+apt-get update -y --fix-missing > /tmp/apt-update.log 2>&1 || { echo '[ERROR] Failed to update package lists'; cat /tmp/apt-update.log; exit 1; }
+if ! apt-cache policy cuda-toolkit-12-8 | grep -q 'Candidate'; then
+    echo '[ERROR] No cuda-toolkit-12-8 package candidates available'
+    cat /tmp/apt-update.log
+    exit 1
+fi
+echo '[INFO] Installing CUDA Toolkit 12.8 and compiler...'
+apt-get install -y cuda-toolkit-12-8 cuda-compiler-12-8 > /tmp/apt-install.log 2>&1 || { echo '[ERROR] Failed to install CUDA Toolkit'; cat /tmp/apt-install.log; exit 1; }
+echo '[INFO] Creating persistent CUDA environment script (/etc/profile.d/cuda.sh)...'
+mkdir -p /etc/profile.d
+# Create the persistent environment script
+cat > /etc/profile.d/cuda.sh << 'EOF_PROF'
+#!/bin/bash
+# Set up CUDA environment variables
+# Added by Phoenix Hypervisor setup
+export CUDA_HOME=/usr/local/cuda
+export PATH=\$CUDA_HOME/bin:\$PATH
+export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH
+EOF_PROF
+# Make it executable
+chmod +x /etc/profile.d/cuda.sh
+echo '[INFO] Sourcing the new environment script for immediate use...'
+source /etc/profile.d/cuda.sh
 echo '[INFO] Installation commands completed. Verifying...'
 "
+    # --- END MODIFIED CUDA INSTALL CMD ---
     if ! pct exec "$lxc_id" -- bash -c "$cuda_install_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
         log_error "install_cuda_toolkit_12_8_in_container: Failed to add repository or install CUDA toolkit in container $lxc_id."
         return 1
     fi
-    # --- End Repo Add/Install ---
 
-    # --- 4. Verify Installation ---
     log_info "install_cuda_toolkit_12_8_in_container: Verifying CUDA Toolkit installation in container $lxc_id..."
+    # --- MODIFIED VERIFY CMD ---
+    # Prioritize sourcing the persistent env script for verification
     local verify_cmd="
 set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+# Source the persistent CUDA environment as the primary method
+if [[ -f /etc/profile.d/cuda.sh ]]; then
+    source /etc/profile.d/cuda.sh
+    echo '[INFO] Sourced /etc/profile.d/cuda.sh for verification.'
+else
+    echo '[WARN] /etc/profile.d/cuda.sh not found during verification, setting environment variables manually...'
+    export CUDA_HOME=/usr/local/cuda
+    export PATH=\$CUDA_HOME/bin:\$PATH
+    export LD_LIBRARY_PATH=\$CUDA_HOME/lib64:\$LD_LIBRARY_PATH
+fi
+echo '[INFO] Checking environment variables...'
+echo \"PATH: \$PATH\"
+echo \"LD_LIBRARY_PATH: \$LD_LIBRARY_PATH\"
 echo '[INFO] Checking for nvcc...'
 if ! command -v nvcc >/dev/null 2>&1; then
     echo '[ERROR] nvcc command not found after installation.'
+    echo '[INFO] Checking if /usr/local/cuda-12.8/bin/nvcc exists...'
+    if [[ -f /usr/local/cuda-12.8/bin/nvcc ]]; then
+        echo '[INFO] nvcc found at /usr/local/cuda-12.8/bin/nvcc but not in PATH.'
+    else
+        echo '[INFO] nvcc not found at /usr/local/cuda-12.8/bin/nvcc.'
+    fi
     exit 1
 fi
 echo '[INFO] Running nvcc --version...'
@@ -281,6 +293,7 @@ else
     exit 1
 fi
 "
+    # --- END MODIFIED VERIFY CMD ---
     if pct exec "$lxc_id" -- bash -c "$verify_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
         log_info "install_cuda_toolkit_12_8_in_container: CUDA Toolkit 12.8 installed and verified successfully in container $lxc_id."
         echo "CUDA Toolkit 12.8 installation completed for container $lxc_id."
@@ -289,10 +302,7 @@ fi
         log_error "install_cuda_toolkit_12_8_in_container: Failed to verify CUDA Toolkit installation in container $lxc_id."
         return 1
     fi
-    # --- End Verify ---
 }
-# --- END NEW FUNCTION ---
-
 
 # - Install Docker-ce in Container -
 install_docker_ce_in_container() {
@@ -329,17 +339,34 @@ apt-get remove -y docker docker-engine docker.io containerd runc || true
 apt-get update -y --fix-missing
 apt-get install -y ca-certificates curl gnupg lsb-release
 mkdir -p /etc/apt/keyrings
-curl -fsSL https://download.docker.com/linux/ubuntu/gpg   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-# Use 'noble' codename for Ubuntu 24.04/24.10 compatibility
+curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
 echo 'deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu noble stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null
 echo '[INFO] Updating package lists...'
 apt-get update -y --fix-missing || { echo '[ERROR] Failed to update package lists'; exit 1; }
 echo '[INFO] Installing Docker-ce...'
 apt-get install -y docker-ce docker-ce-cli containerd.io || { echo '[ERROR] Failed to install Docker-ce'; exit 1; }
-systemctl enable docker
-systemctl start docker
+echo '[INFO] Checking if systemd is available...'
+if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+    echo '[INFO] systemd detected, enabling and starting docker.service...'
+    systemctl enable docker || { echo '[ERROR] Failed to enable docker.service'; exit 1; }
+    systemctl start docker || { echo '[ERROR] Failed to start docker.service'; exit 1; }
+else
+    echo '[INFO] systemd not detected, starting dockerd manually...'
+    if pgrep -x dockerd >/dev/null 2>&1; then
+        echo '[INFO] Docker daemon already running.'
+    else
+        /usr/bin/dockerd -H unix:///var/run/docker.sock --containerd=/run/containerd/containerd.sock >/dev/null 2>&1 &
+        sleep 5
+        if pgrep -x dockerd >/dev/null 2>&1; then
+            echo '[INFO] Docker daemon started successfully.'
+        else
+            echo '[ERROR] Failed to start Docker daemon manually.'
+            exit 1
+        fi
+    fi
+fi
 if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-    echo '[SUCCESS] Docker-ce installed successfully in container $lxc_id.'
+    echo '[SUCCESS] Docker-ce installed and running successfully in container $lxc_id.'
 else
     echo '[ERROR] Docker-ce verification failed in container $lxc_id.'
     exit 1
@@ -364,76 +391,89 @@ fi
     return 1
 }
 
-# - Setup NVIDIA Repository and Install CUDA Toolkit in Container -
-setup_nvidia_repo_in_container() {
+# - Install NVIDIA Container Toolkit in Container -
+install_nvidia_toolkit_in_container() {
     local lxc_id="$1"
-    local nvidia_repo_url="$2" # This argument is less relevant now, as CUDA version is fixed to 12.8
-    if [[ -z "$lxc_id" ]] || [[ -z "$nvidia_repo_url" ]]; then
-        log_error "setup_nvidia_repo_in_container: Missing lxc_id or nvidia_repo_url"
+
+    if [[ -z "$lxc_id" ]]; then
+        log_error "install_nvidia_toolkit_in_container: Missing lxc_id"
         return 1
     fi
 
-    log_warn "setup_nvidia_repo_in_container: This function is deprecated for the project goal (CUDA 12.8). Consider using install_cuda_toolkit_12_8_in_container."
-    log_info "setup_nvidia_repo_in_container: Setting up NVIDIA CUDA repository and installing CUDA $CUDA_VERSION in container $lxc_id..."
-    echo "Setting up NVIDIA CUDA repository and installing CUDA $CUDA_VERSION in container $lxc_id... This may take a moment."
+    log_info "install_nvidia_toolkit_in_container: Installing NVIDIA Container Toolkit in container $lxc_id using CUDA Ubuntu 24.04 repository..."
+    echo "Installing NVIDIA Container Toolkit in container $lxc_id... This may take a few minutes."
 
-    # Use the existing logic, but note it installs $CUDA_VERSION, not necessarily 12.8
-    # unless $CUDA_VERSION is set correctly elsewhere.
-    local repo_cmd="
+    local check_installed_cmd="
+set -e
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+if command -v nvidia-ctk >/dev/null 2>&1 && dpkg -l | grep -q nvidia-container-toolkit; then
+    echo '[SUCCESS] NVIDIA Container Toolkit already installed in container $lxc_id.'
+    exit 0
+fi
+exit 1
+"
+    if pct exec "$lxc_id" -- bash -c "$check_installed_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+        log_info "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit already installed in container $lxc_id."
+        return 0
+    fi
+
+    log_info "install_nvidia_toolkit_in_container: Ensuring prerequisites in container $lxc_id..."
+    local install_prereqs_cmd="
 set -e
 export DEBIAN_FRONTEND=noninteractive
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-echo '[INFO] Setting up locale...'
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+echo '[INFO] Updating package lists...'
 apt-get update -y --fix-missing
-apt-get install -y locales
-locale-gen en_US.UTF-8
-update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-mkdir -p /etc/apt/keyrings
-if [[ ! -f /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg ]]; then
-    echo '[INFO] Downloading NVIDIA Container Toolkit keyring...'
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey   | gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg || { echo '[ERROR] Failed to download NVIDIA Container Toolkit keyring'; exit 1; }
+echo '[INFO] Installing prerequisites for NVIDIA Container Toolkit...'
+apt-get install -y curl gnupg ca-certificates
+echo '[SUCCESS] Prerequisites installed.'
+"
+    if ! pct exec "$lxc_id" -- bash -c "$install_prereqs_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+        log_error "install_nvidia_toolkit_in_container: Failed to install prerequisites in container $lxc_id."
+        return 1
+    fi
+
+    log_info "install_nvidia_toolkit_in_container: Using existing NVIDIA CUDA repository for Ubuntu 24.04 in container $lxc_id..."
+    local install_cmd="
+set -e
+export DEBIAN_FRONTEND=noninteractive
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
+echo '[INFO] Ensuring NVIDIA CUDA repository is configured...'
+if [ ! -f /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list ]; then
+    mkdir -p /etc/apt/keyrings
+    wget -qO /tmp/cuda-keyring_1.1-1_all.deb https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb
+    dpkg -i /tmp/cuda-keyring_1.1-1_all.deb || { echo '[ERROR] Failed to install CUDA keyring'; exit 1; }
+    rm -f /tmp/cuda-keyring_1.1-1_all.deb
+    echo 'deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/ /' > /etc/apt/sources.list.d/cuda-ubuntu2404-x86_64.list
 fi
-if [[ ! -f /etc/apt/sources.list.d/nvidia-container-toolkit.list ]]; then
-    echo '[INFO] Setting up NVIDIA Container Toolkit repository...'
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list   | \
-        sed 's#deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | \
-        tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
-fi
-if [[ ! -f /etc/apt/keyrings/cuda-archive-keyring.gpg ]]; then
-    echo '[INFO] Downloading CUDA keyring...'
-    wget -qO /etc/apt/keyrings/cuda-archive-keyring.gpg ${nvidia_repo_url}cuda-archive-keyring.gpg || { echo '[ERROR] Failed to download CUDA keyring'; exit 1; }
-fi
-if [[ ! -f /etc/apt/sources.list.d/cuda.list ]]; then
-    echo '[INFO] Setting up CUDA repository...'
-    echo 'deb [signed-by=/etc/apt/keyrings/cuda-archive-keyring.gpg] ${nvidia_repo_url} /' | tee /etc/apt/sources.list.d/cuda.list > /dev/null
-fi
-echo '[INFO] Updating package lists... This may take a few minutes.'
-apt-get update -y --fix-missing || { echo '[ERROR] Failed to update package lists'; exit 1; }
-echo '[INFO] Installing CUDA toolkit $CUDA_VERSION and compatibility package $CUDA_COMPAT_PACKAGE...'
-apt-get install -y --no-install-recommends cuda-toolkit-$CUDA_VERSION $CUDA_COMPAT_PACKAGE || { echo '[ERROR] Failed to install CUDA toolkit'; exit 1; }
-if command -v nvcc >/dev/null 2>&1 && nvcc --version | grep -q \"$CUDA_VERSION\"; then
-    echo '[SUCCESS] CUDA toolkit $CUDA_VERSION installed successfully in container $lxc_id.'
+echo '[INFO] Updating package lists...'
+apt-get update -y --fix-missing > /tmp/apt-update.log 2>&1 || { echo '[ERROR] Failed to update package lists'; cat /tmp/apt-update.log; exit 1; }
+echo '[INFO] Installing NVIDIA Container Toolkit...'
+apt-get install -y nvidia-container-toolkit > /tmp/apt-install.log 2>&1 || { echo '[ERROR] Failed to install NVIDIA Container Toolkit'; cat /tmp/apt-install.log; exit 1; }
+echo '[INFO] Verifying NVIDIA Container Toolkit installation...'
+if command -v nvidia-ctk >/dev/null 2>&1; then
+    echo '[SUCCESS] NVIDIA Container Toolkit installed successfully in container $lxc_id.'
 else
-    echo '[ERROR] CUDA toolkit verification failed in container $lxc_id.'
+    echo '[ERROR] NVIDIA Container Toolkit verification failed in container $lxc_id.'
     exit 1
 fi
 "
     local attempt=1
     local max_attempts=3
     while [[ $attempt -le $max_attempts ]]; do
-        log_info "setup_nvidia_repo_in_container: Attempting NVIDIA repository and CUDA toolkit setup (attempt $attempt/$max_attempts)..."
-        if pct exec "$lxc_id" -- bash -c "$repo_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-            log_info "setup_nvidia_repo_in_container: NVIDIA CUDA and Container Toolkit repositories and CUDA $CUDA_VERSION setup completed for container $lxc_id"
-            echo "NVIDIA repositories and CUDA toolkit setup completed for container $lxc_id."
+        log_info "install_nvidia_toolkit_in_container: Attempting NVIDIA Container Toolkit installation (attempt $attempt/$max_attempts)..."
+        if pct exec "$lxc_id" -- bash -c "$install_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+            log_info "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit installed successfully in container $lxc_id."
+            echo "NVIDIA Container Toolkit installation completed for container $lxc_id."
             return 0
         else
-            log_warn "setup_nvidia_repo_in_container: NVIDIA repository and CUDA toolkit setup failed on attempt $attempt. Retrying in 10 seconds..."
+            log_warn "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit installation failed on attempt $attempt. Retrying in 10 seconds..."
             sleep 10
             ((attempt++))
         fi
     done
 
-    log_error "setup_nvidia_repo_in_container: Failed to set up NVIDIA repositories and CUDA toolkit in container $lxc_id after $max_attempts attempts"
+    log_error "install_nvidia_toolkit_in_container: Failed to install NVIDIA Container Toolkit in container $lxc_id after $max_attempts attempts."
     return 1
 }
 
@@ -497,81 +537,10 @@ fi
     return 1
 }
 
-# - Install NVIDIA Container Toolkit in Container -
-install_nvidia_toolkit_in_container() {
-    local lxc_id="$1"
-    if [[ -z "$lxc_id" ]]; then
-        log_error "install_nvidia_toolkit_in_container: Missing lxc_id"
-        return 1
-    fi
-
-    log_info "install_nvidia_toolkit_in_container: Installing NVIDIA Container Toolkit in container $lxc_id..."
-    echo "Installing NVIDIA Container Toolkit in container $lxc_id... This may take a few minutes."
-
-    local check_cmd="
-set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-if dpkg -l | grep -q nvidia-container-toolkit; then
-    echo '[SUCCESS] NVIDIA Container Toolkit already installed in container $lxc_id.'
-    exit 0
-fi
-exit 1
-"
-    if pct exec "$lxc_id" -- bash -c "$check_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-        log_info "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit already installed in container $lxc_id."
-        return 0
-    fi
-
-    local install_cmd="
-set -e
-export DEBIAN_FRONTEND=noninteractive
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-echo '[INFO] Installing NVIDIA Container Toolkit... This may take a few minutes.'
-# Ensure keyring is present for nvidia-docker2 package
-if [[ ! -f /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg ]]; then
-    echo '[INFO] Downloading NVIDIA Container Toolkit keyring...'
-    curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg || { echo '[ERROR] Failed to download NVIDIA Container Toolkit keyring'; exit 1; }
-fi
-if [[ ! -f /etc/apt/sources.list.d/nvidia-container-toolkit.list ]]; then
-    echo '[INFO] Setting up NVIDIA Container Toolkit repository...'
-    curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | \
-        sed 's#deb https://#deb [signed-by=/etc/apt/keyrings/nvidia-container-toolkit-keyring.gpg] https://#' | \
-        tee /etc/apt/sources.list.d/nvidia-container-toolkit.list > /dev/null
-fi
-apt-get update -y --fix-missing
-apt-get install -y --no-install-recommends nvidia-container-toolkit nvidia-docker2 || { echo '[ERROR] Failed to install NVIDIA Container Toolkit'; exit 1; }
-if command -v nvidia-ctk >/dev/null 2>&1; then
-    echo '[INFO] Configuring NVIDIA runtime for Docker...'
-    nvidia-ctk runtime configure --runtime=docker || { echo '[ERROR] Failed to configure NVIDIA runtime'; exit 1; }
-    systemctl restart docker || { echo '[ERROR] Failed to restart Docker'; exit 1; }
-    echo '[SUCCESS] NVIDIA Container Toolkit installed and configured successfully in container $lxc_id.'
-else
-    echo '[ERROR] NVIDIA Container Toolkit verification failed in container $lxc_id.'
-    exit 1
-fi
-"
-    local attempt=1
-    local max_attempts=3
-    while [[ $attempt -le $max_attempts ]]; do
-        log_info "install_nvidia_toolkit_in_container: Attempting NVIDIA Container Toolkit installation (attempt $attempt/$max_attempts)..."
-        if pct exec "$lxc_id" -- bash -c "$install_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-            log_info "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit installed successfully in container $lxc_id"
-            echo "NVIDIA Container Toolkit installation completed for container $lxc_id."
-            return 0
-        else
-            log_warn "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit installation failed on attempt $attempt. Retrying in 10 seconds..."
-            sleep 10
-            ((attempt++))
-        fi
-    done
-
-    log_error "install_nvidia_toolkit_in_container: Failed to install NVIDIA Container Toolkit in container $lxc_id after $max_attempts attempts"
-    return 1
-}
-
 # - Configure NVIDIA Runtime for Docker -
 configure_docker_nvidia_runtime() {
     local lxc_id="$1"
+
     if [[ -z "$lxc_id" ]]; then
         log_error "configure_docker_nvidia_runtime: Missing lxc_id"
         return 1
@@ -587,15 +556,98 @@ if ! command -v nvidia-ctk >/dev/null 2>&1; then
     echo '[ERROR] NVIDIA Container Toolkit not installed'
     exit 1
 fi
+if ! command -v nvidia-smi >/dev/null 2>&1 || ! nvidia-smi >/dev/null 2>&1; then
+    echo '[ERROR] NVIDIA driver not available or not functioning'
+    exit 1
+fi
 if docker info --format '{{.Runtimes}}' | grep -q 'nvidia'; then
     echo '[INFO] NVIDIA runtime already configured.'
     exit 0
 fi
 echo '[INFO] Configuring NVIDIA runtime for Docker...'
-nvidia-ctk runtime configure --runtime=docker || { echo '[ERROR] Failed to configure NVIDIA runtime'; exit 1; }
-echo '[INFO] Restarting Docker service...'
-systemctl restart docker || { echo '[ERROR] Failed to restart Docker'; exit 1; }
-sleep 5
+nvidia-ctk runtime configure --runtime=docker > /tmp/docker-nvidia-config.log 2>&1 || { echo '[ERROR] Failed to configure NVIDIA runtime'; cat /tmp/docker-nvidia-config.log; exit 1; }
+echo '[INFO] Ensuring no-cgroups = true in NVIDIA Container Toolkit config...'
+if [ ! -f /etc/nvidia-container-runtime/config.toml ]; then
+    echo '[ERROR] NVIDIA Container Toolkit config file not found at /etc/nvidia-container-runtime/config.toml'
+    exit 1
+fi
+if grep -q 'no-cgroups = true' /etc/nvidia-container-runtime/config.toml; then
+    echo '[INFO] NVIDIA Container Toolkit already configured with no-cgroups = true.'
+else
+    echo '[nvidia-container-runtime]' > /tmp/config.toml
+    echo 'no-cgroups = true' >> /tmp/config.toml
+    cat /etc/nvidia-container-runtime/config.toml >> /tmp/config.toml
+    mv /tmp/config.toml /etc/nvidia-container-runtime/config.toml || { echo '[ERROR] Failed to update NVIDIA Container Toolkit config'; exit 1; }
+fi
+echo '[INFO] Verifying no-cgroups setting...'
+if grep -q 'no-cgroups = true' /etc/nvidia-container-runtime/config.toml; then
+    echo '[SUCCESS] no-cgroups = true verified in NVIDIA Container Toolkit config.'
+else
+    echo '[ERROR] Failed to verify no-cgroups = true in NVIDIA Container Toolkit config.'
+    cat /etc/nvidia-container-runtime/config.toml
+    exit 1
+fi
+echo '[INFO] Updating Docker daemon configuration...'
+cat > /etc/docker/daemon.json << 'EOF'
+{
+    "runtimes": {
+        "nvidia": {
+            "path": "/usr/bin/nvidia-container-runtime",
+            "runtimeArgs": []
+        }
+    },
+    "default-runtime": "nvidia",
+    "exec-opts": ["native.cgroupdriver=cgroupfs"]
+}
+EOF
+echo '[INFO] Validating Docker daemon configuration syntax...'
+if command -v jq >/dev/null 2>&1 || apt-get install -y jq; then
+    if ! jq . /etc/docker/daemon.json >/tmp/daemon-json-validate.log 2>&1; then
+        echo '[ERROR] Invalid Docker daemon.json syntax.'
+        cat /tmp/daemon-json-validate.log
+        exit 1
+    else
+        echo '[INFO] Docker daemon.json syntax is valid.'
+    fi
+else
+    echo '[WARN] jq not found and could not be installed, skipping daemon.json syntax validation.'
+fi
+echo '[INFO] Checking for systemd availability...'
+if command -v systemctl >/dev/null 2>&1 && systemctl is-system-running >/dev/null 2>&1; then
+    echo '[INFO] Systemd available, using systemctl to restart Docker...'
+    systemctl daemon-reload > /tmp/systemd-daemon-reload.log 2>&1 || { echo '[ERROR] Failed to reload systemd daemon'; cat /tmp/systemd-daemon-reload.log; exit 1; }
+    systemctl restart docker > /tmp/docker-restart.log 2>&1 || { echo '[ERROR] Failed to restart Docker service'; cat /tmp/docker-restart.log; exit 1; }
+    if systemctl is-active --quiet docker; then
+        echo '[SUCCESS] Docker service restarted successfully via systemd.'
+    else
+        echo '[ERROR] Docker service is not active after restart.'
+        exit 1
+    fi
+else
+    echo '[WARN] Systemd not available, attempting manual Docker restart...'
+    if command -v dockerd >/dev/null 2>&1; then
+        echo '[INFO] Stopping dockerd manually if running...'
+        pkill -x dockerd || { echo '[INFO] No running dockerd process found.'; }
+        sleep 2
+        if pgrep -x dockerd >/dev/null 2>&1; then
+            echo '[ERROR] Failed to stop dockerd manually.'
+            exit 1
+        fi
+        echo '[INFO] Starting dockerd manually...'
+        /usr/bin/dockerd -H unix:///var/run/docker.sock --containerd=/run/containerd/containerd.sock > /tmp/docker-manual-restart.log 2>&1 &
+        sleep 5
+        if pgrep -x dockerd >/dev/null 2>&1; then
+            echo '[SUCCESS] Docker daemon restarted manually.'
+        else
+            echo '[ERROR] Failed to restart dockerd manually.'
+            cat /tmp/docker-manual-restart.log
+            exit 1
+        fi
+    else
+        echo '[ERROR] dockerd not found and systemd not available.'
+        exit 1
+    fi
+fi
 if docker info --format '{{.Runtimes}}' | grep -q 'nvidia'; then
     echo '[SUCCESS] NVIDIA runtime configured successfully.'
 else
@@ -608,7 +660,7 @@ fi
     while [[ $attempt -le $max_attempts ]]; do
         log_info "configure_docker_nvidia_runtime: Attempting NVIDIA runtime configuration (attempt $attempt/$max_attempts)..."
         if pct exec "$lxc_id" -- bash -c "$config_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-            log_info "configure_docker_nvidia_runtime: NVIDIA runtime configured successfully for container $lxc_id"
+            log_info "configure_docker_nvidia_runtime: NVIDIA runtime configured successfully in container $lxc_id"
             echo "NVIDIA runtime configuration completed for container $lxc_id."
             return 0
         else
@@ -657,7 +709,6 @@ if ! command -v docker >/dev/null 2>&1; then
     exit 1
 fi
 echo '[INFO] Building Docker image $image_tag...'
-# Change to the directory containing the Dockerfile
 cd \"\$(dirname $dockerfile_path)\" || { echo '[ERROR] Failed to change directory'; exit 1; }
 docker build -t $image_tag -f $dockerfile_path . || { echo '[ERROR] Failed to build Docker image $image_tag'; exit 1; }
 if docker images -q $image_tag | grep -q .; then
@@ -703,7 +754,7 @@ export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
 if command -v nvidia-smi >/dev/null 2>&1; then
     if nvidia-smi >/dev/null 2>&1; then
         echo '[SUCCESS] GPUs detected in container $lxc_id.'
-        nvidia-smi --query-gpu=count,driver_version,cuda_version --format=csv,noheader | head -n 1
+        nvidia-smi --query-gpu=count,driver_version --format=csv,noheader | head -n 1
     else
         echo '[ERROR] nvidia-smi command failed inside container $lxc_id.'
         exit 1
@@ -725,6 +776,14 @@ fi
         local docker_check="
 set -e
 export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+echo '[INFO] Checking cgroup version...'
+if [ -d /sys/fs/cgroup/cgroup.controllers ]; then
+    echo '[INFO] Cgroups v2 detected.'
+else
+    echo '[INFO] Cgroups v1 detected.'
+fi
+echo '[INFO] Checking NVIDIA device permissions...'
+ls -l /dev/nvidia* /dev/dri/* 2>/dev/null || echo '[WARN] No NVIDIA or DRI devices found.'
 if ! command -v docker >/dev/null 2>&1; then
     echo '[ERROR] Docker not installed in container $lxc_id.'
     exit 1
@@ -733,13 +792,63 @@ if ! docker info --format '{{.Runtimes}}' | grep -q 'nvidia'; then
     echo '[ERROR] NVIDIA runtime not configured in Docker.'
     exit 1
 fi
-# Use a standard CUDA base image for testing
-if docker run --rm --gpus all --runtime=nvidia nvidia/cuda:12.4.1-base-ubuntu22.04 nvidia-smi >/dev/null 2>&1; then
+echo '[INFO] Verifying NVIDIA Container Toolkit configuration...'
+if grep -q 'no-cgroups = true' /etc/nvidia-container-runtime/config.toml; then
+    echo '[INFO] NVIDIA Container Toolkit configured with no-cgroups = true.'
+else
+    echo '[WARN] NVIDIA Container Toolkit not configured with no-cgroups = true.'
+fi
+echo '[INFO] Checking AppArmor status inside container...'
+if command -v aa-status >/dev/null 2>&1; then
+    if aa-status --quiet; then
+        echo '[INFO] AppArmor is active.'
+    else
+        echo '[WARN] AppArmor is not active.'
+    fi
+else
+    echo '[WARN] aa-status command not found.'
+fi
+echo '[INFO] Testing Docker GPU access with nvidia-smi...'
+if ! docker pull nvidia/cuda:12.8.0-base-ubuntu24.04 >/tmp/docker-pull.log 2>&1; then
+    echo '[WARN] Failed to pull nvidia/cuda:12.8.0-base-ubuntu24.04, attempting fallback image nvidia/cuda:12.8.0-base-ubuntu22.04...'
+    if ! docker pull nvidia/cuda:12.8.0-base-ubuntu22.04 >/tmp/docker-pull-fallback.log 2>&1; then
+        echo '[ERROR] Failed to pull fallback image nvidia/cuda:12.8.0-base-ubuntu22.04'
+        cat /tmp/docker-pull-fallback.log
+        exit 1
+    fi
+fi
+echo '[INFO] Attempting Docker GPU test with AppArmor bypass...'
+if docker run --rm --gpus all --runtime=nvidia --security-opt apparmor=unconfined nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi >/tmp/docker-gpu-test.log 2>&1; then
     echo '[SUCCESS] Docker GPU access verified in container $lxc_id.'
     exit 0
 else
     echo '[ERROR] Docker GPU access verification failed in container $lxc_id.'
-    exit 1
+    cat /tmp/docker-gpu-test.log
+    echo '[INFO] Retrying without AppArmor bypass...'
+    if docker run --rm --gpus all --runtime=nvidia nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi >/tmp/docker-gpu-test-no-apparmor.log 2>&1; then
+        echo '[SUCCESS] Docker GPU access verified without AppArmor bypass in container $lxc_id.'
+        exit 0
+    else
+        echo '[ERROR] Docker GPU access verification failed without AppArmor bypass in container $lxc_id.'
+        cat /tmp/docker-gpu-test-no-apparmor.log
+        echo '[INFO] Retrying with privileged mode...'
+        if docker run --rm --gpus all --runtime=nvidia --privileged nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi >/tmp/docker-gpu-test-privileged.log 2>&1; then
+            echo '[SUCCESS] Docker GPU access verified in privileged mode in container $lxc_id.'
+            exit 0
+        else
+            echo '[ERROR] Docker GPU access verification failed in privileged mode in container $lxc_id.'
+            cat /tmp/docker-gpu-test-privileged.log
+            echo '[INFO] Retrying with fallback image nvidia/cuda:12.8.0-base-ubuntu22.04...'
+            if docker run --rm --gpus all --runtime=nvidia --privileged nvidia/cuda:12.8.0-base-ubuntu22.04 nvidia-smi >/tmp/docker-gpu-test-fallback.log 2>&1; then
+                echo '[SUCCESS] Docker GPU access verified with fallback image in container $lxc_id.'
+                exit 0
+            else
+                echo '[ERROR] Docker GPU access verification failed with fallback image in container $lxc_id.'
+                cat /tmp/docker-gpu-test-fallback.log
+                exit 1
+            fi
+        fi
+    fi
 fi
 "
         if pct exec "$lxc_id" -- bash -c "$docker_check" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
@@ -758,7 +867,7 @@ fi
 # - Verify LXC GPU Access Inside Container -
 verify_lxc_gpu_access_in_container() {
     local lxc_id="$1"
-    local gpu_indices="$2" # This argument is not used in the current logic but kept for signature consistency
+    local gpu_indices="${2:-}" # Optional, currently unused in this function
 
     if [[ -z "$lxc_id" ]]; then
         log_error "verify_lxc_gpu_access_in_container: Container ID cannot be empty"
@@ -788,20 +897,16 @@ configure_lxc_gpu_passthrough() {
 
     local config_file="/etc/pve/lxc/$lxc_id.conf"
     if [[ ! -f "$config_file" ]]; then
-        log_error "configure_lxc_gpu_passthrough: LXC config file not found: $config_file"
+        log_error "configure_lxc_gpu_passthrough: LXC config file not found: $config_file. Container $lxc_id may have been deleted."
         return 1
     fi
 
-    log_info "configure_lxc_gpu_passthrough: Adding GPU passthrough entries to $config_file for GPUs: $gpu_indices"
+    log_info "DEBUG: Entering configure_lxc_gpu_passthrough for container $lxc_id (GPUs: $gpu_indices)"
 
-    # --- Check write permissions ---
     if ! touch "$config_file" 2>/dev/null; then
-        log_warn "configure_lxc_gpu_passthrough: No write permissions for $config_file. Attempting to proceed without chmod."
-    else
-        chmod u+w "$config_file" 2>/dev/null || log_warn "configure_lxc_gpu_passthrough: Failed to set write permissions on $config_file."
+        log_warn "configure_lxc_gpu_passthrough: No write permissions for $config_file. Continuing as root may not require explicit permissions."
     fi
 
-    # --- Cleanup existing GPU-related entries ---
     sed -i '/^lxc\.cgroup2\.devices\.allow: c 195/d' "$config_file"
     sed -i '/^lxc\.cgroup2\.devices\.allow: c 235/d' "$config_file"
     sed -i '/^lxc\.cgroup2\.devices\.allow: c 236/d' "$config_file"
@@ -812,15 +917,12 @@ configure_lxc_gpu_passthrough() {
     sed -i '/^swap: /d' "$config_file"
     sed -i '/^lxc\.autodev:/d' "$config_file"
     sed -i '/^lxc\.mount\.auto:/d' "$config_file"
-    # --- End Cleanup ---
+    sed -i '/^lxc\.aa_profile:/d' "$config_file"
+    sed -i '/^lxc\.apparmor\.profile:/d' "$config_file"
 
-    # --- Add essential static devices ---
     echo "dev0: /dev/dri/card0,gid=44" >> "$config_file"
     echo "dev1: /dev/dri/renderD128,gid=104" >> "$config_file"
     local dev_index=2
-    # --- End Static Devices ---
-
-    # --- Add GPU-specific devices dynamically ---
     IFS=',' read -ra INDICES <<< "$gpu_indices"
     for index in "${INDICES[@]}"; do
         if ! [[ "$index" =~ ^[0-9]+$ ]]; then
@@ -831,7 +933,6 @@ configure_lxc_gpu_passthrough() {
         ((dev_index++))
     done
 
-    # Add common NVIDIA capability devices if they exist on the host
     if [[ -e "/dev/nvidia-caps/nvidia-cap1" ]]; then
         echo "dev$dev_index: /dev/nvidia-caps/nvidia-cap1" >> "$config_file"
         ((dev_index++))
@@ -851,14 +952,7 @@ configure_lxc_gpu_passthrough() {
         ((dev_index++))
     else
         log_error "configure_lxc_gpu_passthrough: Critical device /dev/nvidiactl not found on host!"
-    fi
-
-    if [[ -e "/dev/nvidia-modeset" ]]; then
-        echo "dev$dev_index: /dev/nvidia-modeset" >> "$config_file"
-        ((dev_index++))
-        log_info "configure_lxc_gpu_passthrough: Added /dev/nvidia-modeset to container config."
-    else
-        log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-modeset not found on host, skipping passthrough for this device."
+        return 1
     fi
 
     if [[ -e "/dev/nvidia-uvm-tools" ]]; then
@@ -875,23 +969,50 @@ configure_lxc_gpu_passthrough() {
         log_warn "configure_lxc_gpu_passthrough: Device /dev/nvidia-uvm not found on host, skipping."
     fi
 
-    # --- Add final LXC configuration options ---
     echo "lxc.cgroup2.devices.allow: a" >> "$config_file"
-    echo "lxc.cap.drop:" >> "$config_file" # Clearing cap.drop for full access, as done in original
-    echo "lxc.aa_profile: unconfined" >> "$config_file" # Ensure unconfined AppArmor profile
+    echo "lxc.cap.drop:" >> "$config_file"
+    echo "lxc.apparmor.profile: unconfined" >> "$config_file"
     echo "swap: 512" >> "$config_file"
     echo "lxc.autodev: 1" >> "$config_file"
     echo "lxc.mount.auto: sys:rw" >> "$config_file"
-    # --- End Final Options ---
 
-    if [[ -w "$config_file" ]]; then
-        chmod u-w "$config_file" 2>/dev/null || log_warn "configure_lxc_gpu_passthrough: Failed to remove write permissions on $config_file."
+    if grep -q "lxc.apparmor.profile: unconfined" "$config_file"; then
+        log_info "configure_lxc_gpu_passthrough: Successfully set lxc.apparmor.profile to unconfined for container $lxc_id."
+    else
+        log_error "configure_lxc_gpu_passthrough: Failed to set lxc.apparmor.profile in $config_file."
+        return 1
+    fi
+
+    if command -v aa-status >/dev/null 2>&1; then
+        log_info "configure_lxc_gpu_passthrough: Checking AppArmor status..."
+        if aa-status --quiet; then
+            log_info "configure_lxc_gpu_passthrough: AppArmor service is active."
+        else
+            log_warn "configure_lxc_gpu_passthrough: AppArmor service is not active. This may cause container startup issues."
+        fi
+    else
+        log_warn "configure_lxc_gpu_passthrough: aa-status command not found. Cannot verify AppArmor status."
+    fi
+
+    log_info "configure_lxc_gpu_passthrough: Checking container $lxc_id initialization status..."
+    local container_status
+    container_status=$(pct status "$lxc_id" 2>/dev/null | grep -oP 'status: \K\w+' || echo "unknown")
+    log_info "configure_lxc_gpu_passthrough: Container $lxc_id status: $container_status"
+    if [[ "$container_status" != "stopped" && "$container_status" != "running" ]]; then
+        log_warn "configure_lxc_gpu_passthrough: Container $lxc_id is not in a valid state (status: $container_status). Monitor socket issues may persist."
+    fi
+
+    if command -v lxc-info >/dev/null 2>&1; then
+        log_info "configure_lxc_gpu_passthrough: Fetching LXC monitor info for container $lxc_id..."
+        lxc_info=$(lxc-info -n "$lxc_id" 2>&1)
+        log_info "configure_lxc_gpu_passthrough: lxc-info output: $lxc_info"
+    else
+        log_warn "configure_lxc_gpu_passthrough: lxc-info command not found. Cannot verify LXC monitor status."
     fi
 
     log_info "configure_lxc_gpu_passthrough: GPU passthrough configuration updated for container $lxc_id (GPUs: $gpu_indices)"
     return 0
 }
-
 
 # Signal that this library has been loaded
 export PHOENIX_HYPERVISOR_LXC_NVIDIA_LOADED=1

@@ -10,22 +10,11 @@
 # Execute command in container with retry logic
 # Usage: pct_exec_with_retry <container_id> <command_string>
 pct_exec_with_retry() {
-    local lxc_id="$1"
-    local command="$2"
+    local lxc_id=""
+    local command=""
     local max_attempts=3
     local delay=30
     local attempt=1
-
-    if [[ -z "$lxc_id" || -z "$command" ]]; then
-        # Fallback logging if common lib not loaded
-        if declare -F log_error >/dev/null 2>&1; then
-            log_error "pct_exec_with_retry: Container ID and command string are required."
-        else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] pct_exec_with_retry: Container ID and command string are required." >&2
-            exit 1
-        fi
-        return 1
-    fi
 
     # Use log_info if available, otherwise fallback
     local log_func="log_info"
@@ -33,8 +22,55 @@ pct_exec_with_retry() {
         log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*"; }
     fi
 
+    # Use log_error if available, otherwise fallback
+    local error_func="log_error"
+    if ! declare -F log_error >/dev/null 2>&1; then
+        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
+    fi
+
+    # --- Parse arguments correctly ---
+    if [[ $# -lt 2 ]]; then
+        "$error_func" "pct_exec_with_retry: Container ID and command are required."
+        return 1
+    fi
+
+    lxc_id="$1"
+    shift
+
+    # Check if the next argument is the standard '--' separator for pct exec
+    if [[ "$1" == "--" ]]; then
+        shift # Remove the '--'
+    fi
+
+    # Check if there's anything left to run
+    if [[ $# -eq 0 ]]; then
+         "$error_func" "pct_exec_with_retry: No command provided."
+        return 1
+    fi
+
+    # Reconstruct the command from the remaining arguments
+    # This handles simple strings and commands with arguments
+    command=""
+    while [[ $# -gt 0 ]]; do
+       if [[ -z "$command" ]]; then
+           command="$1"
+       else
+           # Quote arguments to prevent word splitting issues when passed to bash -c later
+           # printf %q is generally good for this in bash
+           command="$command $(printf "%q" "$1")"
+       fi
+       shift
+    done
+    # --- End argument parsing ---
+
+    if [[ -z "$lxc_id" || -z "$command" ]]; then
+        "$error_func" "pct_exec_with_retry: Container ID and command string are required."
+        return 1
+    fi
+
     while [[ $attempt -le $max_attempts ]]; do
         "$log_func" "pct_exec_with_retry: Executing command in container $lxc_id (attempt $attempt/$max_attempts)..."
+        # Execute the reconstructed command string with bash -c
         if pct exec "$lxc_id" -- bash -c "$command"; then
             "$log_func" "pct_exec_with_retry: Command executed successfully in container $lxc_id"
             return 0
@@ -50,11 +86,6 @@ pct_exec_with_retry() {
         fi
     done
 
-    # Use log_error if available, otherwise fallback
-    local error_func="log_error"
-    if ! declare -F log_error >/dev/null 2>&1; then
-        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
-    fi
     "$error_func" "pct_exec_with_retry: Command failed after $max_attempts attempts in container $lxc_id"
     return 1
 }

@@ -58,6 +58,30 @@ if [[ $PHOENIX_CONFIG_LOADED -ne 1 ]]; then
     exit 1
 fi
 
+# Source Phoenix Hypervisor Systemd Functions
+PHOENIX_SYSTEMD_LOADED=0
+for systemd_path in \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_systemd.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_systemd.sh"; do
+    if [[ -f "$systemd_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$systemd_path"
+        if declare -F create_systemd_service_in_container >/dev/null 2>&1; then
+            PHOENIX_SYSTEMD_LOADED=1
+            echo "[INFO] Sourced Phoenix Hypervisor systemd functions from $systemd_path."
+            break
+        else
+            echo "[WARN] Sourced $systemd_path, but systemd functions not found. Trying next location."
+        fi
+    fi
+done
+
+if [[ $PHOENIX_SYSTEMD_LOADED -ne 1 ]]; then
+    echo "[ERROR] Failed to load phoenix_hypervisor_lxc_common_systemd.sh from standard locations." >&2
+    echo "[ERROR] Please ensure it's installed correctly." >&2
+    exit 1
+fi
+
 # Source Phoenix Hypervisor Common Functions
 PHOENIX_COMMON_LOADED=0
 for common_path in \
@@ -109,7 +133,6 @@ if [[ $PHOENIX_NVIDIA_LOADED -ne 1 ]]; then
     log_error "Failed to load phoenix_hypervisor_lxc_common_nvidia.sh. Cannot proceed with NVIDIA setup."
 fi
 
-# --- Source New Common Libraries ---
 # Source Base LXC Common Functions
 PHOENIX_BASE_LOADED=0
 for base_path in \
@@ -175,30 +198,6 @@ done
 if [[ $PHOENIX_VALIDATION_LOADED -ne 1 ]]; then
     log_error "Failed to load phoenix_hypervisor_lxc_common_validation.sh. Cannot proceed with validation operations."
 fi
-
-# Source Systemd LXC Common Functions (May not be used directly here, but good to have for consistency)
-PHOENIX_SYSTEMD_LOADED=0
-for systemd_path in \
-    "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_systemd.sh" \
-    "$SCRIPT_DIR/phoenix_hypervisor_lxc_common_systemd.sh"; do
-    if [[ -f "$systemd_path" ]]; then
-        # shellcheck source=/dev/null
-        source "$systemd_path"
-        if declare -F create_systemd_service_in_container >/dev/null 2>&1; then
-            PHOENIX_SYSTEMD_LOADED=1
-            log_info "phoenix_hypervisor_setup_drcuda.sh: Sourced Systemd LXC common functions from $systemd_path."
-            break
-        else
-            log_warn "Sourced $systemd_path, but Systemd LXC functions not found. Trying next location."
-        fi
-    fi
-done
-
-# Loading systemd lib is optional for this script
-if [[ $PHOENIX_SYSTEMD_LOADED -ne 1 ]]; then
-    log_warn "Failed to load phoenix_hypervisor_lxc_common_systemd.sh. This might be OK if not needed."
-fi
-
 
 # --- Core Setup Functions ---
 
@@ -387,8 +386,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # Install PyTorch for CUDA 12.4/12.8 (using cu124 index which is often compatible)
-# Check https://download.pytorch.org/whl/cu124 or https://download.pytorch.org/whl/torch_stable.html for latest
-RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124
+# Check https://download.pytorch.org/whl/cu124   or https://download.pytorch.org/whl/torch_stable.html   for latest
+RUN pip3 install torch torchvision --index-url https://download.pytorch.org/whl/cu124  
 
 # Set a default command (can be overridden)
 CMD ["bash"]'
@@ -455,7 +454,7 @@ fi"
         log_info "validate_final_setup: Docker GPU access verified for container $lxc_id"
         ((checks_passed++)) || true
     else
-        log_error "validate_final_setup: Docker GPU access verification failed for container $lxc_id"
+        log_error "validate_final_setup: Docker GPU access verification failed in container $lxc_id"
         ((checks_failed++)) || true
     fi
 
@@ -491,7 +490,6 @@ show_setup_info() {
     echo "==============================================="
 }
 
-
 # --- Main Execution ---
 main() {
     local lxc_id="$1"
@@ -506,11 +504,13 @@ main() {
     # 2. Validate Container State (Create if needed, Start, Network, GPU Passthrough)
     validate_container_state "$lxc_id"
 
-    # 3. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA 12.8, Toolkit, Docker Runtime)
-    setup_nvidia_packages "$lxc_id"
-
-    # 4. Install Docker CE
+    # === ORDER CORRECTED HERE ===
+    # 4. Install Docker CE (NOW BEFORE NVIDIA Setup)
     install_docker_in_container "$lxc_id"
+
+    # 3. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA 12.8, Toolkit, Docker Runtime)
+    # Now Docker is available when configure_docker_nvidia_runtime is called
+    setup_nvidia_packages "$lxc_id"
 
     # 5. Build PyTorch Docker Image (Updated for CUDA 12.8)
     build_pytorch_docker_image "$lxc_id"

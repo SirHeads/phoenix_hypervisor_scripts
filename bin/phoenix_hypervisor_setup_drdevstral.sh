@@ -739,14 +739,16 @@ main() {
     # 2. Validate Container State (Create if needed, Start, Network, GPU Passthrough)
     validate_container_state "$lxc_id"
 
-    # 3. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA 12.8, Toolkit, Docker Runtime)
-    setup_nvidia_packages "$lxc_id"
-
-    # 4. Install Docker CE
+    # === ORDER CORRECTED HERE ===
+    # 4. Install Docker CE (NOW BEFORE NVIDIA Setup)
     log_info "Installing Docker CE in container $lxc_id..."
     if ! install_docker_ce_in_container "$lxc_id"; then
         log_error "Failed to install Docker CE in container $lxc_id."
     fi
+
+    # 3. Setup NVIDIA Packages (Driver 580.76.05 via runfile, CUDA 12.8, Toolkit, Docker Runtime)
+    # Now Docker is available when configure_docker_nvidia_runtime is called
+    setup_nvidia_packages "$lxc_id"
 
     # 5. Setup Model (Download if path specified and doesn't exist)
     setup_model "$lxc_id"
