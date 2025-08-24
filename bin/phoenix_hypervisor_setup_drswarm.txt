@@ -5,7 +5,7 @@
 # Discovers and builds base Docker images from shared directories and pushes them to the local registry.
 # This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
 #
-# Version: 1.2.0 (Mount shared dir, fix build path, prioritize core containers)
+# Version: 1.4.0 (Improved LXC config handling, Refactored library sourcing logic)
 # Author: Assistant
 
 set -euo pipefail
@@ -23,13 +23,14 @@ trap restore_terminal EXIT
 
 # - Script Metadata -
 SCRIPT_NAME="phoenix_hypervisor_setup_drswarm.sh"
-SCRIPT_VERSION="1.2.0"
+SCRIPT_VERSION="1.4.0"
 AUTHOR="Assistant"
 
 # - Configuration -
 # Expected container name for ID 999
 EXPECTED_CONTAINER_NAME="DrSwarm"
 # Required common library functions
+# Note: validate_container_exists will come from phoenix_hypervisor_lxc_common_validation.sh
 REQUIRED_COMMON_FUNCTIONS=(
     "log_info" "log_warn" "log_error"
     "pct_exec_with_retry"
@@ -50,52 +51,59 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PHOENIX_ETC_DIR="/usr/local/etc"
 PHOENIX_LIB_DIR="/usr/local/lib/phoenix_hypervisor"
 
-# Source Common Functions
+# --- NEW: Refactored Library Sourcing Logic ---
+# 1. Source Configuration File
+PHOENIX_CONFIG_LOADED=0
+for config_path in \
+    "$PHOENIX_ETC_DIR/phoenix_hypervisor_config.sh" \
+    "$PHOENIX_LIB_DIR/phoenix_hypervisor_config.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_config.sh" \
+    "./phoenix_hypervisor_config.sh"; do
+    if [[ -f "$config_path" ]]; then
+        # shellcheck source=/dev/null
+        source "$config_path"
+        PHOENIX_CONFIG_LOADED=1
+        # Use minimal logging initially if common lib isn't loaded yet
+        if declare -F log_info >/dev/null 2>&1; then
+            log_info "$SCRIPT_NAME: Sourced configuration from $config_path."
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $SCRIPT_NAME: Sourced configuration from $config_path."
+        fi
+        break
+    fi
+done
+if [[ $PHOENIX_CONFIG_LOADED -ne 1 ]]; then
+    echo "[ERROR] $SCRIPT_NAME: Failed to load phoenix_hypervisor_config.sh from standard locations." >&2
+    echo "[ERROR] Please ensure it's installed correctly." >&2
+    exit 1
+fi
+
+# 2. Source Main Common Functions
 PHOENIX_COMMON_LOADED=0
 for common_path in \
     "$PHOENIX_LIB_DIR/phoenix_hypervisor_common.sh" \
-    "$PHOENIX_ETC_DIR/phoenix_hypervisor_config.sh" \
-    "$SCRIPT_DIR/phoenix_hypervisor_config.sh" \
+    "$SCRIPT_DIR/phoenix_hypervisor_common.sh" \
     "/usr/local/bin/phoenix_hypervisor_common.sh" \
     "./phoenix_hypervisor_common.sh"; do
     if [[ -f "$common_path" ]]; then
         # shellcheck source=/dev/null
         source "$common_path"
-        # Check if required functions are available
-        local all_found=true
-        for func in "${REQUIRED_COMMON_FUNCTIONS[@]}"; do
-            if ! declare -F "$func" >/dev/null 2>&1; then
-                all_found=false
-                break
-            fi
-        done
-        if [[ "$all_found" == true ]]; then
-            PHOENIX_COMMON_LOADED=1
-            if declare -F log_info >/dev/null 2>&1; then
-                log_info "$SCRIPT_NAME: Sourced common functions from $common_path."
-            else
-                echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $SCRIPT_NAME: Sourced common functions from $common_path."
-            fi
-            break
+        PHOENIX_COMMON_LOADED=1
+        if declare -F log_info >/dev/null 2>&1; then
+            log_info "$SCRIPT_NAME: Sourced main common functions from $common_path."
         else
-            if declare -F log_warn >/dev/null 2>&1; then
-                log_warn "$SCRIPT_NAME: Sourced $common_path, but required functions not found. Trying next location."
-            else
-                echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $SCRIPT_NAME: Sourced $common_path, but required functions not found. Trying next location." >&2
-            fi
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $SCRIPT_NAME: Sourced main common functions from $common_path."
         fi
+        break
     fi
 done
-
-# Fallback logging if common lib fails
 if [[ $PHOENIX_COMMON_LOADED -ne 1 ]]; then
-    echo "[WARN] $SCRIPT_NAME: Common functions not fully loaded. Using minimal logging."
-    log_info() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*"; }
-    log_warn() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $*" >&2; }
-    log_error() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
+    echo "[ERROR] $SCRIPT_NAME: Failed to load phoenix_hypervisor_common.sh from standard locations." >&2
+    echo "[ERROR] Please ensure it's installed correctly." >&2
+    exit 1
 fi
 
-# Source Base LXC Common Functions
+# 3. Source Base LXC Common Functions (contains pct_exec_with_retry)
 PHOENIX_BASE_LOADED=0
 for base_path in \
     "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_base.sh" \
@@ -116,7 +124,7 @@ if [[ $PHOENIX_BASE_LOADED -ne 1 ]]; then
     log_error "$SCRIPT_NAME: Failed to load phoenix_hypervisor_lxc_common_base.sh. Cannot proceed with base LXC operations."
 fi
 
-# Source Docker LXC Common Functions
+# 4. Source Docker LXC Common Functions
 PHOENIX_DOCKER_LOADED=0
 for docker_path in \
     "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_docker.sh" \
@@ -138,7 +146,7 @@ if [[ $PHOENIX_DOCKER_LOADED -ne 1 ]]; then
     log_warn "$SCRIPT_NAME: Failed to load phoenix_hypervisor_lxc_common_docker.sh. Will attempt manual Docker installation."
 fi
 
-# Source Validation LXC Common Functions
+# 5. Source Validation LXC Common Functions
 PHOENIX_VALIDATION_LOADED=0
 for validation_path in \
     "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_validation.sh" \
@@ -146,7 +154,7 @@ for validation_path in \
     if [[ -f "$validation_path" ]]; then
         # shellcheck source=/dev/null
         source "$validation_path"
-        if declare -F validate_lxc_state >/dev/null 2>&1; then
+        if declare -F validate_container_exists >/dev/null 2>&1; then
             PHOENIX_VALIDATION_LOADED=1
             log_info "$SCRIPT_NAME: Sourced Validation LXC common functions from $validation_path."
             break
@@ -159,7 +167,7 @@ if [[ $PHOENIX_VALIDATION_LOADED -ne 1 ]]; then
     log_error "$SCRIPT_NAME: Failed to load phoenix_hypervisor_lxc_common_validation.sh. Cannot proceed with validation operations."
 fi
 
-# Source Systemd LXC Common Functions
+# 6. Source Systemd LXC Common Functions
 PHOENIX_SYSTEMD_LOADED=0
 for systemd_path in \
     "$PHOENIX_LIB_DIR/phoenix_hypervisor_lxc_common_systemd.sh" \
@@ -180,6 +188,36 @@ done
 if [[ $PHOENIX_SYSTEMD_LOADED -ne 1 ]]; then
     log_warn "$SCRIPT_NAME: Failed to load phoenix_hypervisor_lxc_common_systemd.sh. This might be OK if not needed."
 fi
+
+# 7. Final Check: Verify ALL Required Functions are Available
+ALL_FUNCTIONS_AVAILABLE=true
+MISSING_FUNCTIONS=()
+for func in "${REQUIRED_COMMON_FUNCTIONS[@]}"; do
+    if ! declare -F "$func" >/dev/null 2>&1; then
+        ALL_FUNCTIONS_AVAILABLE=false
+        # Use minimal logging if log_error isn't available
+        if declare -F log_error >/dev/null 2>&1; then
+            log_error "$SCRIPT_NAME: Required function '$func' is not available after sourcing libraries."
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $SCRIPT_NAME: Required function '$func' is not available after sourcing libraries." >&2
+            exit 1
+        fi
+        MISSING_FUNCTIONS+=("$func")
+    fi
+done
+
+if [[ "$ALL_FUNCTIONS_AVAILABLE" != true ]]; then
+    # Use minimal logging if log_error isn't available
+    if declare -F log_error >/dev/null 2>&1; then
+        log_error "$SCRIPT_NAME: Failed to load required functions: ${MISSING_FUNCTIONS[*]}"
+    else
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $SCRIPT_NAME: Failed to load required functions: ${MISSING_FUNCTIONS[*]}" >&2
+        exit 1
+    fi
+else
+    log_info "$SCRIPT_NAME: All required functions are now available."
+fi
+# --- END NEW: Refactored Library Sourcing Logic ---
 
 # - Core Setup Functions -
 
@@ -206,13 +244,16 @@ validate_container_config() {
     log_info "validate_container_config: Validating configuration for container $lxc_id..."
 
     # Load hypervisor config to access LXC_CONFIGS array
+    # Note: validate_dependencies should have loaded it, but check here too for robustness
     if ! load_hypervisor_config; then
         log_error "validate_container_config: Failed to load hypervisor configuration."
+        exit 1 # Explicit exit for robustness
     fi
 
     # Check if container ID exists in config
     if [[ -z "${LXC_CONFIGS[$lxc_id]:-}" ]]; then
         log_error "validate_container_config: Container ID $lxc_id not found in $PHOENIX_LXC_CONFIG_FILE."
+        exit 1 # Explicit exit for robustness
     fi
 
     # Extract name and check
@@ -220,67 +261,93 @@ validate_container_config() {
     container_name=$(echo "${LXC_CONFIGS[$lxc_id]}" | jq -r '.name')
     if [[ "$container_name" != "$EXPECTED_CONTAINER_NAME" ]]; then
         log_error "validate_container_config: Container $lxc_id name is '$container_name', expected '$EXPECTED_CONTAINER_NAME'."
+        exit 1 # Explicit exit for robustness
     fi
 
     log_info "validate_container_config: Container $lxc_id configuration is valid for $EXPECTED_CONTAINER_NAME."
 }
 
-# 3. Make Container Privileged and Mount Shared Directory
+
+# 3. Make Container Privileged and Mount Shared Directory (IMPROVED)
 make_container_privileged_and_mount() {
     local lxc_id="$1"
     local config_file="/etc/pve/lxc/$lxc_id.conf"
 
-    log_info "make_container_privileged_and_mount: Configuring container $lxc_id to be privileged and mounting shared directory..."
+    log_info "make_container_privileged_and_mount: Configuring container $lxc_id for Docker and mounting shared directory..."
 
-    # Check current status
+    # Check current status and stop if running
     if pct status "$lxc_id" >/dev/null 2>&1; then
         log_info "make_container_privileged_and_mount: Stopping container $lxc_id..."
         pct stop "$lxc_id" || log_error "make_container_privileged_and_mount: Failed to stop container $lxc_id."
         sleep 5 # Allow time to stop
     fi
 
-    # --- NEW: Check and Add Mount Point ---
-    # Check if the mount point already exists in the config
-    if grep -q "^mp0:.*$SHARED_DOCKER_IMAGES_DIR.*$LXC_MOUNT_POINT" "$config_file" 2>/dev/null; then
-        log_info "make_container_privileged_and_mount: Mount point for '$SHARED_DOCKER_IMAGES_DIR' already configured at '$LXC_MOUNT_POINT' in $config_file."
+    # --- IMPROVED: Fix LXC Configuration File ---
+    # 1. Correct unprivileged setting
+    # Check if the line exists and replace it, or append if it doesn't
+    if grep -q "^unprivileged:" "$config_file" 2>/dev/null; then
+        # Line exists, replace it to ensure it's 'unprivileged: 0'
+        sed -i 's/^unprivileged:.*/unprivileged: 0/' "$config_file"
+        log_info "make_container_privileged_and_mount: Updated 'unprivileged:' line to 'unprivileged: 0' in $config_file."
     else
+        # Line doesn't exist, append it
+        echo "unprivileged: 0" >> "$config_file"
+        log_info "make_container_privileged_and_mount: Added 'unprivileged: 0' to $config_file."
+    fi
+
+    # 2. Ensure AppArmor is unconfined for Docker
+    if ! grep -q "^lxc.apparmor.profile: unconfined" "$config_file" 2>/dev/null; then
+        echo "lxc.apparmor.profile: unconfined" >> "$config_file"
+        log_info "make_container_privileged_and_mount: Added lxc.apparmor.profile: unconfined to $config_file."
+    fi
+
+    # 3. Fix/Ensure Mount Point Format (mp=bind)
+    # Check if mp0 line exists and if it's correctly formatted
+    if grep -q "^mp0:" "$config_file" 2>/dev/null; then
+        # Check if it already contains mp=bind
+        if ! grep -q "^mp0:.*mp=bind" "$config_file" 2>/dev/null; then
+            # Line exists but lacks mp=bind. Attempt to correct it.
+            # This is a bit fragile but handles the common case seen.
+            # It assumes the format is roughly "mp0: source,dest" and adds ",mp=bind"
+            # A more robust solution would parse the line, but this is a common quick fix.
+            # Example: mp0: /source,/dest -> mp0: /source,/dest,mp=bind
+            # This sed adds ',mp=bind' before the end of the line if 'mp=' is not found.
+            sed -i 's/^\(mp0:.*\)$/\1,mp=bind/' "$config_file"
+            log_info "make_container_privileged_and_mount: Corrected mp0 line format in $config_file to include 'mp=bind'."
+        else
+             log_info "make_container_privileged_and_mount: mp0 line in $config_file already correctly formatted with 'mp=bind'."
+        fi
+    else
+        # mp0 line doesn't exist, add it correctly
         log_info "make_container_privileged_and_mount: Adding mount point for '$SHARED_DOCKER_IMAGES_DIR' at '$LXC_MOUNT_POINT' in $config_file..."
-        echo "mp0: $SHARED_DOCKER_IMAGES_DIR,$LXC_MOUNT_POINT" >> "$config_file"
+        echo "mp0: $SHARED_DOCKER_IMAGES_DIR,$LXC_MOUNT_POINT,mp=bind" >> "$config_file"
         log_info "make_container_privileged_and_mount: Mount point added to $config_file."
     fi
-    # --- END NEW ---
+    # --- END IMPROVED: Fix LXC Configuration File ---
 
-    # Check if already privileged
-    if grep -q "^unprivileged: 0" "$config_file" 2>/dev/null; then
-        log_info "make_container_privileged_and_mount: Container $lxc_id is already configured as privileged."
-    else
-        log_info "make_container_privileged_and_mount: Setting unprivileged: 0 in $config_file..."
-        echo "unprivileged: 0" >> "$config_file"
-        # Optional: Add AppArmor unconfined
-        if ! grep -q "^lxc.apparmor.profile: unconfined" "$config_file" 2>/dev/null; then
-            echo "lxc.apparmor.profile: unconfined" >> "$config_file"
-            log_info "make_container_privileged_and_mount: Added lxc.apparmor.profile: unconfined to $config_file."
-        fi
-    fi
-
+    # Start the container
     log_info "make_container_privileged_and_mount: Starting container $lxc_id..."
     pct start "$lxc_id" || log_error "make_container_privileged_and_mount: Failed to start container $lxc_id."
 
     # Wait for container to be ready
     log_info "make_container_privileged_and_mount: Waiting for container $lxc_id to become responsive..."
+    # Use a faster check and retry mechanism for responsiveness
     local attempt=1
-    local max_attempts=20
+    # Reduced attempts and sleep time for a fast system
+    local max_attempts=5
     while [[ $attempt -le $max_attempts ]]; do
-        if pct_exec_with_retry "$lxc_id" -- hostname >/dev/null 2>&1; then
+        # Use a simple command that should respond quickly if the container is up
+        if pct_exec_with_retry "$lxc_id" hostname >/dev/null 2>&1; then
             log_info "make_container_privileged_and_mount: Container $lxc_id is responsive."
             return 0
         fi
-        log_info "make_container_privileged_and_mount: Container $lxc_id not responsive (attempt $attempt/$max_attempts)..."
-        sleep 5
+        log_info "make_container_privileged_and_mount: Container $lxc_id not responsive (attempt $attempt/$max_attempts), retrying quickly..."
+        sleep 1 # Shorter sleep
         ((attempt++))
     done
     log_error "make_container_privileged_and_mount: Container $lxc_id did not become responsive after $max_attempts attempts."
 }
+
 
 # 4. Install Docker (using common function or manual)
 install_docker_in_swarm_manager() {
@@ -290,14 +357,18 @@ install_docker_in_swarm_manager() {
 
     if [[ $PHOENIX_DOCKER_LOADED -eq 1 ]] && declare -F install_docker_ce_in_container >/dev/null 2>&1; then
         log_info "install_docker_in_swarm_manager: Using common function to install Docker..."
+        # The common function should handle enabling/starting the service
         if install_docker_ce_in_container "$lxc_id"; then
             log_info "install_docker_in_swarm_manager: Docker installed successfully using common function."
+            return 0 # Explicit success
         else
             log_error "install_docker_in_swarm_manager: Failed to install Docker using common function."
+            return 1 # Explicit failure
         fi
     else
         log_warn "install_docker_in_swarm_manager: Common Docker function not available, falling back to manual installation..."
         # Manual Docker installation steps (simplified version of common function logic)
+        # Includes explicit enable and start
         local install_cmd="
         set -e
         export DEBIAN_FRONTEND=noninteractive
@@ -307,23 +378,31 @@ install_docker_in_swarm_manager() {
         apt-get install -y ca-certificates curl gnupg lsb-release > /tmp/docker-apt-prereqs.log 2>&1 || { echo '[ERROR] Failed to install prerequisites'; cat /tmp/docker-apt-prereqs.log; exit 1; }
         echo '[INFO] Adding Docker repository...'
         mkdir -p /etc/apt/keyrings
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        # --- CORRECTED: Fixed spacing in curl URL ---
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         chmod a+r /etc/apt/keyrings/docker.gpg
-        echo 'deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu   $(lsb_release -cs) stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        # --- CORRECTED: Fixed spacing in repo URL ---
+        echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null
         echo '[INFO] Updating package lists for Docker...'
-        apt-get update -y --fix-missing > /tmp/docker-apt-update.log 2>&1 || { echo '[ERROR] Failed to update package lists'; cat /tmp/docker-apt-update.log; exit 1; }
+        apt-get update -y --fix-missing > /tmp/docker-apt-update2.log 2>&1 || { echo '[ERROR] Failed to update package lists'; cat /tmp/docker-apt-update2.log; exit 1; }
         echo '[INFO] Installing Docker-ce...'
         apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /tmp/docker-apt-install.log 2>&1 || { echo '[ERROR] Failed to install Docker-ce'; cat /tmp/docker-apt-install.log; exit 1; }
-        echo '[INFO] Enabling Docker service...'
+        echo '[INFO] Enabling and starting Docker service...'
         systemctl enable docker > /tmp/docker-enable.log 2>&1 || { echo '[ERROR] Failed to enable Docker service'; cat /tmp/docker-enable.log; exit 1; }
-        echo '[SUCCESS] Docker-ce installed and enabled successfully.'
+        systemctl start docker > /tmp/docker-start.log 2>&1 || { echo '[ERROR] Failed to start Docker service'; cat /tmp/docker-start.log; exit 1; }
+        echo '[SUCCESS] Docker-ce installed, enabled, and started successfully.'
         "
-        if pct_exec_with_retry "$lxc_id" -- bash -c "$install_cmd"; then
+        # Use pct_exec_with_retry for robustness
+        if pct_exec_with_retry "$lxc_id" bash -c "$install_cmd"; then
             log_info "install_docker_in_swarm_manager: Docker installed successfully via manual method."
+            return 0 # Explicit success
         else
             log_error "install_docker_in_swarm_manager: Failed to install Docker via manual method."
+            return 1 # Explicit failure
         fi
     fi
+    # Should not reach here due to returns above, but good practice
+    return 1
 }
 
 # 5. Initialize Docker Swarm
@@ -332,9 +411,7 @@ initialize_docker_swarm() {
     log_info "initialize_docker_swarm: Initializing Docker Swarm on container $lxc_id..."
 
     # Get the static IP from the config
-    if ! load_hypervisor_config; then
-        log_error "initialize_docker_swarm: Failed to load hypervisor configuration."
-    fi
+    # Note: validate_container_config/load_hypervisor_config should have loaded LXC_CONFIGS
     local static_ip
     static_ip=$(echo "${LXC_CONFIGS[$lxc_id]}" | jq -r '.static_ip // empty')
     if [[ -z "$static_ip" ]]; then
@@ -348,6 +425,8 @@ initialize_docker_swarm() {
 
     local init_cmd="
     set -e
+    echo '[INFO] Waiting briefly for Docker service to be fully ready...'
+    sleep 5 # Give Docker a moment after installation/start
     echo '[INFO] Initializing Docker Swarm with advertise address $advertise_ip...'
     if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q 'active'; then
         echo '[INFO] Swarm already active. Leaving existing swarm first.'
@@ -360,7 +439,8 @@ initialize_docker_swarm() {
     echo '[SUCCESS] Docker Swarm initialized successfully on $advertise_ip.'
     "
 
-    if pct_exec_with_retry "$lxc_id" -- bash -c "$init_cmd"; then
+    # Use pct_exec_with_retry for robustness
+    if pct_exec_with_retry "$lxc_id" bash -c "$init_cmd"; then
         log_info "initialize_docker_swarm: Docker Swarm initialized successfully on $advertise_ip."
     else
         log_error "initialize_docker_swarm: Failed to initialize Docker Swarm."
@@ -394,7 +474,8 @@ start_local_registry() {
     fi
     "
 
-    if pct_exec_with_retry "$lxc_id" -- bash -c "$registry_cmd"; then
+    # Use pct_exec_with_retry for robustness
+    if pct_exec_with_retry "$lxc_id" bash -c "$registry_cmd"; then
         log_info "start_local_registry: Local Docker registry started successfully."
     else
         log_error "start_local_registry: Failed to start local Docker registry."
@@ -411,7 +492,7 @@ discover_and_build_images() {
     local lxc_shared_path="$LXC_MOUNT_POINT"
 
     # Verify the shared directory exists inside the LXC container
-    if ! pct_exec_with_retry "$lxc_id" -- test -d "$lxc_shared_path"; then
+    if ! pct_exec_with_retry "$lxc_id" test -d "$lxc_shared_path"; then
         log_error "discover_and_build_images: Shared Docker images directory '$lxc_shared_path' not found inside LXC $lxc_id. Check mount configuration."
     fi
 
@@ -426,11 +507,19 @@ discover_and_build_images() {
     find '$lxc_shared_path' -mindepth 1 -maxdepth 1 -type d -not -name '.*' -print0 2>/dev/null || { echo '[WARN] find command produced no results or errors'; exit 0; }
     "
     local image_dirs_output
-    image_dirs_output=$(pct_exec_with_retry "$lxc_id" -- bash -c "$find_cmd" 2>&1) || {
-        log_error "discover_and_build_images: Failed to scan for image directories inside LXC $lxc_id. Output: $image_dirs_output"
+    # Capture output correctly for processing
+    image_dirs_output=$(pct_exec_with_retry "$lxc_id" bash -c "$find_cmd") || {
+        log_error "discover_and_build_images: Failed to scan for image directories inside LXC $lxc_id. Output might be in error log."
     }
 
+    # Check if any directories were found
+    if [[ -z "$image_dirs_output" ]]; then
+        log_warn "discover_and_build_images: No image build contexts found in '$lxc_shared_path' inside LXC $lxc_id."
+        return 0 # Not an error, just nothing to do
+    fi
+
     # Process the output from inside the container
+    # Use process substitution to handle null-delimited input safely
     while IFS= read -r -d '' image_dir_internal; do
         # Get the basename of the directory (e.g., 'vllm-base' from '/mnt/phoenix_docker_images/vllm-base')
         local image_name
@@ -447,7 +536,7 @@ discover_and_build_images() {
             exit 1
         fi
         "
-        if pct_exec_with_retry "$lxc_id" -- bash -c "$validate_cmd"; then
+        if pct_exec_with_retry "$lxc_id" bash -c "$validate_cmd"; then
             log_info "discover_and_build_images: Found valid build context for image '$image_name' at '$image_dir_internal' inside LXC $lxc_id."
             ((found_images++))
 
@@ -455,7 +544,7 @@ discover_and_build_images() {
             log_info "discover_and_build_images: Building image '$image_name:latest' inside LXC $lxc_id from '$image_dir_internal'..."
             local build_cmd="
             set -e
-            # --- CORRECTED: cd to the path INSIDE LXC 999 (the mounted path) ---
+            # Change to the path INSIDE LXC 999 (the mounted path)
             cd '$image_dir_internal' || { echo '[ERROR] Failed to change directory to $image_dir_internal inside LXC $lxc_id'; exit 1; }
             echo '[INFO] Inside LXC $lxc_id, building image $image_name:latest from context $image_dir_internal...'
             # Build the image using the Dockerfile in the current directory (context)
@@ -468,7 +557,7 @@ discover_and_build_images() {
             "
 
             # Execute the build/tag/push sequence inside LXC 999
-            if pct_exec_with_retry "$lxc_id" -- bash -c "$build_cmd"; then
+            if pct_exec_with_retry "$lxc_id" bash -c "$build_cmd"; then
                 log_info "discover_and_build_images: Successfully processed image '$image_name'."
                 ((built_images++))
             else
@@ -482,9 +571,8 @@ discover_and_build_images() {
             log_warn "discover_and_build_images: Skipping '$image_dir_internal'. It's either not a directory or missing a Dockerfile inside LXC $lxc_id."
         fi
 
-    # Use null delimiter for safety with filenames containing spaces
-    # Pass the captured output from the container's find command
-    done < <(echo "$image_dirs_output" | tr '\0' '\n')
+    # Use process substitution to read the null-delimited output from find
+    done < <(printf '%s' "$image_dirs_output" | tr '\0' '\n' | while IFS= read -r line; do echo "$line"; done | tr '\n' '\0')
 
     if [[ $found_images -eq 0 ]]; then
         log_warn "discover_and_build_images: No valid image build contexts (directories with Dockerfile) found in '$lxc_shared_path' inside LXC $lxc_id."
@@ -507,10 +595,13 @@ validate_final_setup() {
         echo '[SUCCESS] Docker service is active.'
     else
         echo '[ERROR] Docker service is not active.'
+        journalctl -u docker.service -n 20 > /tmp/docker-service-check.log 2>&1 || echo '[WARN] Could not get docker service logs.'
+        cat /tmp/docker-service-check.log
         exit 1
     fi
     "
-    if ! pct_exec_with_retry "$lxc_id" -- bash -c "$docker_active_check"; then
+    # Use pct_exec_with_retry for robustness
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$docker_active_check"; then
         log_error "validate_final_setup: Docker service validation failed for container $lxc_id."
     fi
 
@@ -525,7 +616,8 @@ validate_final_setup() {
         exit 1
     fi
     "
-    if ! pct_exec_with_retry "$lxc_id" -- bash -c "$swarm_active_check"; then
+    # Use pct_exec_with_retry for robustness
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$swarm_active_check"; then
         log_error "validate_final_setup: Docker Swarm validation failed for container $lxc_id."
     fi
 
@@ -537,10 +629,14 @@ validate_final_setup() {
         echo '[INFO] Registry should be accessible at http://\${registry_ip}:5000'
     else
         echo '[ERROR] Local Docker registry container is not running.'
+        # Try to get logs if it failed
+        docker logs registry > /tmp/registry-check-logs.log 2>&1 || echo '[WARN] Could not get registry logs.'
+        cat /tmp/registry-check-logs.log
         exit 1
     fi
     "
-    if ! pct_exec_with_retry "$lxc_id" -- bash -c "$registry_running_check"; then
+    # Use pct_exec_with_retry for robustness
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$registry_running_check"; then
         log_error "validate_final_setup: Local registry validation failed for container $lxc_id."
     fi
 
@@ -606,13 +702,12 @@ main() {
     # 2. Validate Container Configuration
     validate_container_config "$lxc_id"
 
-    # === ORDER CORRECTED HERE ===
     # 3. Make Container Privileged AND Mount Shared Directory
     make_container_privileged_and_mount "$lxc_id"
 
-    # 4. Install Docker CE (NOW BEFORE NVIDIA Setup)
+    # 4. Install Docker CE
     log_info "Installing Docker CE in container $lxc_id..."
-    if ! install_docker_ce_in_container "$lxc_id"; then
+    if ! install_docker_in_swarm_manager "$lxc_id"; then
         log_error "Failed to install Docker CE in container $lxc_id."
     fi
 
@@ -642,4 +737,4 @@ main() {
 }
 
 # Run main function with the provided container ID
-main "$CONTAINER_ID"
+main "$1"

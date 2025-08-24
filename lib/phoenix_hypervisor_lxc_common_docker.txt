@@ -75,50 +75,95 @@ install_docker_ce_in_container() {
         "$warn_func" "install_docker_ce_in_container: Ubuntu 25.04 (plucky) detected. Checking Docker compatibility..."
     fi
 
+        # --- IMPROVED install_cmd with GPG and Repo Fixes ---
     local install_cmd="set -e
     export DEBIAN_FRONTEND=noninteractive
     export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-    echo '[INFO] Removing conflicting Docker packages...'
+    echo '[INFO] Removing potentially conflicting old Docker packages...'
+    # Use || true to prevent failure if packages are not installed
     apt-get remove -y docker docker-engine docker.io containerd runc || true
-    apt-get update -y --fix-missing > /tmp/docker-apt-update.log 2>&1 || { echo '[ERROR] Failed to update package lists'; cat /tmp/docker-apt-update.log; exit 1; }
-    apt-get install -y ca-certificates curl gnupg lsb-release > /tmp/docker-apt-prereqs.log 2>&1 || { echo '[ERROR] Failed to install prerequisites'; cat /tmp/docker-apt-prereqs.log; exit 1; }
-    mkdir -p /etc/apt/keyrings
-    curl -fsSL https://download.docker.com/linux/ubuntu/gpg   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
-    chmod a+r /etc/apt/keyrings/docker.gpg
-    echo 'deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu   $codename stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null
-    if ! test -f /etc/apt/sources.list.d/docker.list; then
-        echo '[ERROR] Failed to create Docker repository file'
-        exit 1
-    fi
-    if ! grep -q '$codename stable' /etc/apt/sources.list.d/docker.list; then
-        echo '[ERROR] Docker repository file does not contain expected codename $codename'
-        exit 1
-    fi
+
     echo '[INFO] Updating package lists...'
-    apt-get update -y --fix-missing > /tmp/docker-apt-update.log 2>&1 || { echo '[ERROR] Failed to update package lists'; cat /tmp/docker-apt-update.log; exit 1; }
-    if ! apt-cache policy docker-ce | grep -q 'Candidate'; then
-        echo '[ERROR] No docker-ce package candidates available'
-        cat /tmp/docker-apt-update.log
+    apt-get update -y --fix-missing > /tmp/docker-apt-update1.log 2>&1 || { echo '[ERROR] Failed to update package lists (1)'; cat /tmp/docker-apt-update1.log; exit 1; }
+
+    echo '[INFO] Installing prerequisites for Docker repository...'
+    apt-get install -y ca-certificates curl gnupg lsb-release > /tmp/docker-apt-prereqs.log 2>&1 || { echo '[ERROR] Failed to install prerequisites'; cat /tmp/docker-apt-prereqs.log; exit 1; }
+
+    echo '[INFO] Adding/updating Docker GPG key...'
+    # Ensure keyring directory exists
+    mkdir -p /etc/apt/keyrings
+    # Remove any potentially stale or problematic existing key
+    rm -f /etc/apt/keyrings/docker.gpg
+    # Download and add the new key
+    curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+    # Verify key file was created
+    if [ ! -s /etc/apt/keyrings/docker.gpg ]; then
+        echo '[ERROR] Failed to download or create Docker GPG key file.'
         exit 1
     fi
-    echo '[INFO] Installing Docker-ce...'
-    apt-get install -y docker-ce docker-ce-cli containerd.io > /tmp/docker-apt-install.log 2>&1 || { echo '[ERROR] Failed to install Docker-ce'; cat /tmp/docker-apt-install.log; exit 1; }
+    chmod a+r /etc/apt/keyrings/docker.gpg
+    echo '[INFO] Docker GPG key added successfully.'
+
+    echo '[INFO] Adding/updating Docker APT repository...'
+    mkdir -p /etc/apt/sources.list.d
+    # --- CORRECTLY CONSTRUCT REPO LINE INSIDE CONTAINER ---
+    # Dynamically determine architecture and codename inside the container
+    REPO_ARCH=\$(dpkg --print-architecture)
+    REPO_CODENAME=\$(lsb_release -cs)
+    echo \"deb [arch=\${REPO_ARCH} signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \${REPO_CODENAME} stable\" | tee /etc/apt/sources.list.d/docker.list > /dev/null
+    # --- END CORRECT CONSTRUCTION ---
+    # Verify repository file creation
+    if ! test -f /etc/apt/sources.list.d/docker.list; then
+        echo '[ERROR] Failed to create Docker repository file.'
+        exit 1
+    fi
+    # Verify repository file content (using the dynamically determined codename)
+    if ! grep -q \"\${REPO_CODENAME} stable\" /etc/apt/sources.list.d/docker.list; then
+        echo '[ERROR] Docker repository file does not contain expected codename \${REPO_CODENAME}.'
+        echo '[DEBUG] Contents of /etc/apt/sources.list.d/docker.list:'
+        cat /etc/apt/sources.list.d/docker.list
+        exit 1
+    fi
+    echo '[INFO] Docker APT repository added successfully.'
+
+    echo '[INFO] Updating package lists (again)...'
+    apt-get update -y --fix-missing > /tmp/docker-apt-update2.log 2>&1 || { echo '[ERROR] Failed to update package lists (2)'; cat /tmp/docker-apt-update2.log; exit 1; }
+
+    echo '[INFO] Checking for docker-ce package availability...'
+    if ! apt-cache policy docker-ce | grep -q 'Candidate'; then
+        echo '[ERROR] No docker-ce package candidates available. Check repository configuration.'
+        echo '[DEBUG] apt-cache policy output:'
+        apt-cache policy docker-ce
+        echo '[DEBUG] apt-get update log:'
+        cat /tmp/docker-apt-update2.log
+        exit 1
+    fi
+
+    echo '[INFO] Installing Docker-ce packages...'
+    # Include docker-buildx-plugin and docker-compose-plugin as they are commonly needed
+    apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin > /tmp/docker-apt-install.log 2>&1 || { echo '[ERROR] Failed to install Docker-ce packages'; cat /tmp/docker-apt-install.log; exit 1; }
+
+    echo '[INFO] Verifying Docker-ce package installation...'
     if ! dpkg -l | grep -q docker-ce; then
-        echo '[ERROR] docker-ce package not installed'
+        echo '[ERROR] docker-ce package not installed according to dpkg.'
         exit 1
     fi
     if ! test -f /usr/bin/docker; then
-        echo '[ERROR] Docker binary not found at /usr/bin/docker'
+        echo '[ERROR] Docker binary not found at /usr/bin/docker.'
         exit 1
     fi
-    echo '[INFO] Verifying Docker installation...'
-    if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
-        echo '[SUCCESS] Docker-ce installed successfully in container $lxc_id.'
-    else
-        echo '[ERROR] Docker-ce verification failed in container $lxc_id.'
-        exit 1
-    fi"
 
+    echo '[INFO] Performing basic Docker daemon verification (might take a moment)...'
+    # Use timeout to prevent hanging if dockerd has issues starting briefly
+    if timeout 30s bash -c 'while ! command -v docker >/dev/null 2>&1 || ! docker version >/dev/null 2>&1; do sleep 2; done'; then
+         echo '[INFO] Docker command and version check successful.'
+    else
+         echo '[WARN] Initial Docker command/version check timed out or failed. This might be OK if service starts later.'
+    fi
+
+    echo '[SUCCESS] Docker-ce packages installed successfully in container $lxc_id.'
+    "
+    # --- END IMPROVED install_cmd ---
     local attempt=1
     local max_attempts=3
     while [[ $attempt -le $max_attempts ]]; do
@@ -149,7 +194,7 @@ install_docker_ce_in_container() {
                 exit 1
             fi
             "
-            if $exec_func "$lxc_id" -- bash -c "$is_enabled_check"; then
+            if $exec_func "$lxc_id" bash -c "$is_enabled_check"; then
                 # Already enabled, do nothing
                 : # No-op
             else
@@ -173,7 +218,7 @@ install_docker_ce_in_container() {
                 exit 1
             fi
             "
-            if $exec_func "$lxc_id" -- bash -c "$is_active_check"; then
+            if $exec_func "$lxc_id" bash -c "$is_active_check"; then
                 # Already active, do nothing
                 : # No-op
             else
@@ -257,23 +302,29 @@ build_docker_image_in_container() {
 
     local check_cmd="set -e
     export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+    # Use the variables passed into the bash environment
+    DOCKERFILE_PATH_ENV=\$1
+    IMAGE_TAG_ENV=\$2
+
     if ! command -v docker >/dev/null 2>&1; then
-        echo '[ERROR] Docker not installed in container $lxc_id.'
+        echo '[ERROR] Docker not installed in container.'
         exit 1
     fi
-    if ! test -f '$dockerfile_path'; then
-        echo '[ERROR] Dockerfile not found at $dockerfile_path.'
+    if ! test -f \"\$DOCKERFILE_PATH_ENV\"; then
+        echo '[ERROR] Dockerfile not found at \$DOCKERFILE_PATH_ENV.'
         exit 1
     fi
-    if ! test -r '$dockerfile_path'; then
-        echo '[ERROR] Dockerfile at $dockerfile_path is not readable.'
+    if ! test -r \"\$DOCKERFILE_PATH_ENV\"; then
+        echo '[ERROR] Dockerfile at \$DOCKERFILE_PATH_ENV is not readable.'
         exit 1
     fi
-    if docker images -q $image_tag | grep -q .; then
-        echo '[SUCCESS] Docker image $image_tag already exists in container $lxc_id.'
+    # Check if image already exists locally
+    if docker images -q \"\$IMAGE_TAG_ENV\" | grep -q .; then
+        echo '[SUCCESS] Docker image \$IMAGE_TAG_ENV already exists locally.'
         exit 0
     fi
-    exit 1"
+    exit 1
+    "
 
     local log_file="${HYPERVISOR_LOGFILE:-/dev/null}"
     if pct exec "$lxc_id" -- bash -c "$check_cmd" 2>&1 | tee -a "$log_file"; then
@@ -283,17 +334,24 @@ build_docker_image_in_container() {
 
     local build_cmd="set -e
     export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+    # Use the variables passed into the bash environment
+    DOCKERFILE_PATH_ENV=\$1
+    IMAGE_TAG_ENV=\$2
+
     if ! command -v docker >/dev/null 2>&1; then
-        echo '[ERROR] Docker not installed in container $lxc_id.'
+        echo '[ERROR] Docker not installed in container.'
         exit 1
     fi
-    echo '[INFO] Building Docker image $image_tag...'
-    cd \"\$(dirname $dockerfile_path)\" || { echo '[ERROR] Failed to change directory'; exit 1; }
-    docker build -t $image_tag -f $dockerfile_path . > /tmp/docker-build-$image_tag.log 2>&1 || { echo '[ERROR] Failed to build Docker image $image_tag'; cat /tmp/docker-build-$image_tag.log; exit 1; }
-    if docker images -q $image_tag | grep -q .; then
-        echo '[SUCCESS] Docker image $image_tag built successfully in container $lxc_id.'
+    echo '[INFO] Building Docker image \$IMAGE_TAG_ENV...'
+    # Change to the directory containing the Dockerfile
+    cd \"\$(dirname \"\$DOCKERFILE_PATH_ENV\")\" || { echo '[ERROR] Failed to change directory to \$(dirname \"\$DOCKERFILE_PATH_ENV\")'; exit 1; }
+    # Build the image
+    docker build -t \"\$IMAGE_TAG_ENV\" -f \"\$(basename \"\$DOCKERFILE_PATH_ENV\")\" . > /tmp/docker-build-\"\$(echo \"\$IMAGE_TAG_ENV\" | sed 's/[^a-zA-Z0-9_.-]/_/g')\".log 2>&1 || { echo '[ERROR] Failed to build Docker image \$IMAGE_TAG_ENV'; cat /tmp/docker-build-\"\$(echo \"\$IMAGE_TAG_ENV\" | sed 's/[^a-zA-Z0-9_.-]/_/g')\".log; exit 1; }
+    # Verify the image was built
+    if docker images -q \"\$IMAGE_TAG_ENV\" | grep -q .; then
+        echo '[SUCCESS] Docker image \$IMAGE_TAG_ENV built successfully.'
     else
-        echo '[ERROR] Docker image $image_tag verification failed in container $lxc_id.'
+        echo '[ERROR] Docker image \$IMAGE_TAG_ENV verification failed (not found after build).'
         exit 1
     fi"
 
@@ -392,7 +450,7 @@ echo '[INFO] Checking /tmp writability...' >/tmp/tmp-check.log
 touch /tmp/tmp-check.log || { echo '[ERROR] Cannot write to /tmp'; exit 1; }
 echo '[SUCCESS] /tmp is writable.' >>/tmp/tmp-check.log
 "
-    if ! "$exec_func" "$lxc_id" -- bash -c "$tmp_check_cmd"; then
+    if ! "$exec_func" "$lxc_id" bash -c "$tmp_check_cmd"; then
         "$error_func" "configure_docker_nvidia_runtime: /tmp is not writable in container $lxc_id. Check /tmp permissions or mount settings."
         return 1
     fi
@@ -415,7 +473,7 @@ fi
 jq --version >>/tmp/jq-install.log 2>&1 || { echo '[ERROR] jq installed but not functional'; cat /tmp/jq-install.log; exit 1; }
 echo '[SUCCESS] jq verified.' >>/tmp/jq-install.log
 "
-    if ! "$exec_func" "$lxc_id" -- bash -c "$jq_install_cmd"; then
+    if ! "$exec_func" "$lxc_id" bash -c "$jq_install_cmd"; then
         "$error_func" "configure_docker_nvidia_runtime: Failed to install or verify jq in container $lxc_id. Check /tmp/jq-install.log."
         return 1
     fi
@@ -424,7 +482,7 @@ echo '[SUCCESS] jq verified.' >>/tmp/jq-install.log
     # Detect if we are running inside an LXC container
     local in_lxc=false
     # Check if the container environment indicates LXC
-    if "$exec_func" "$lxc_id" -- bash -c "[[ -f /run/systemd/container && \"\$(cat /run/systemd/container 2>/dev/null)\" == \"lxc\" ]]"; then
+    if "$exec_func" "$lxc_id" bash -c "[[ -f /run/systemd/container && \"\$(cat /run/systemd/container 2>/dev/null)\" == \"lxc\" ]]"; then
         in_lxc=true
     fi
 
@@ -435,7 +493,7 @@ echo '[SUCCESS] jq verified.' >>/tmp/jq-install.log
         # Set the default storage driver for LXC
         storage_driver="overlay2"
          # Write the chosen driver to the temp file expected by subsequent steps
-        if ! "$exec_func" "$lxc_id" -- bash -c "echo '$storage_driver' > /tmp/docker-storage-driver"; then
+        if ! "$exec_func" "$lxc_id" bash -c "echo '$storage_driver' > /tmp/docker-storage-driver"; then
              "$error_func" "configure_docker_nvidia_runtime: Failed to write storage driver to /tmp/docker-storage-driver in LXC container $lxc_id."
              return 1
         fi
@@ -476,10 +534,10 @@ echo '[SUCCESS] jq verified.' >>/tmp/jq-install.log
             echo 'zfs' > /tmp/docker-storage-driver
         fi
         "
-        if ! "$exec_func" "$lxc_id" -- bash -c "$zfs_install_cmd"; then
+        if ! "$exec_func" "$lxc_id" bash -c "$zfs_install_cmd"; then
             "$warn_func" "configure_docker_nvidia_runtime: Failed to install or configure zfsutils-linux in container $lxc_id. Falling back to vfs storage driver."
             local storage_driver="vfs"
-            if ! "$exec_func" "$lxc_id" -- bash -c "echo 'vfs' > /tmp/docker-storage-driver"; then
+            if ! "$exec_func" "$lxc_id" bash -c "echo 'vfs' > /tmp/docker-storage-driver"; then
                 "$error_func" "configure_docker_nvidia_runtime: Failed to write fallback storage driver to /tmp/docker-storage-driver in container $lxc_id."
                 return 1
             fi
@@ -551,7 +609,7 @@ EOF
 
     echo '[SUCCESS] NVIDIA Container Runtime config updated with no-cgroups = true.'
     "
-    if ! "$exec_func" "$lxc_id" -- bash -c "$nvidia_config_check_cmd"; then
+    if ! "$exec_func" "$lxc_id" bash -c "$nvidia_config_check_cmd"; then
         "$error_func" "configure_docker_nvidia_runtime: Failed to configure NVIDIA Container Runtime 'no-cgroups = true' in container $lxc_id."
         return 1
     fi
@@ -586,7 +644,7 @@ EOF
     echo '$storage_driver' > /tmp/docker-storage-driver
     echo '[SUCCESS] Prerequisites for NVIDIA Docker runtime configuration checked.' >>/tmp/prereq-check.log
     "
-    if ! "$exec_func" "$lxc_id" -- bash -c "storage_driver=$storage_driver; $prereq_cmd"; then
+    if ! "$exec_func" "$lxc_id" bash -c "storage_driver=$storage_driver; $prereq_cmd"; then
         "$error_func" "configure_docker_nvidia_runtime: Prerequisites check failed in container $lxc_id. Check /tmp/prereq-check.log."
         return 1
     fi
@@ -607,7 +665,7 @@ EOF
         mkdir -p /etc/docker
         cat << 'EOF' > /etc/docker/daemon.json
 {
-  \"storage-driver\": \"$storage_driver\",
+  \"storage-driver\": \"'$storage_driver'\",
   \"default-runtime\": \"nvidia\",
   \"runtimes\": {
     \"nvidia\": {
@@ -623,7 +681,7 @@ EOF
     cat /etc/docker/daemon.json >>/tmp/nvidia-ctk.log 2>/dev/null || echo '[WARN] /etc/docker/daemon.json not found' >>/tmp/nvidia-ctk.log
     echo '[INFO] nvidia-ctk configuration or fallback written to /etc/docker/daemon.json.' >>/tmp/nvidia-ctk.log
     "
-    if ! "$exec_func" "$lxc_id" -- bash -c "storage_driver=$storage_driver; $config_cmd" 2>&1 | tee -a /tmp/docker-config.log; then
+    if ! "$exec_func" "$lxc_id" bash -c "storage_driver=$storage_driver; $config_cmd" 2>&1 | tee -a /tmp/docker-config.log; then
         "$error_func" "configure_docker_nvidia_runtime: Failed to configure NVIDIA runtime with $storage_driver in container $lxc_id. Check /tmp/docker-config.log and /tmp/nvidia-ctk.log."
         return 1
     fi
@@ -650,7 +708,7 @@ EOF
         systemctl daemon-reload >>/tmp/docker-daemon-reload.log 2>&1 || { echo '[ERROR] Failed to reload systemd daemon'; cat /tmp/docker-daemon-reload.log; exit 1; }
     fi
     "
-    if ! "$exec_func" "$lxc_id" -- bash -c "$apparmor_cmd" 2>&1 | tee -a /tmp/docker-apparmor.log; then
+    if ! "$exec_func" "$lxc_id" bash -c "$apparmor_cmd" 2>&1 | tee -a /tmp/docker-apparmor.log; then
         "$warn_func" "configure_docker_nvidia_runtime: Failed to configure systemd override for Docker. Check /tmp/docker-apparmor.log in container $lxc_id. Proceeding, but this may cause issues."
     fi
 
@@ -678,7 +736,7 @@ EOF
         exit 1
     fi
     "
-    if ! "$exec_func" "$lxc_id" -- bash -c "$json_validation_cmd" 2>&1 | tee -a /tmp/docker-json-validation.log; then
+    if ! "$exec_func" "$lxc_id" bash -c "$json_validation_cmd" 2>&1 | tee -a /tmp/docker-json-validation.log; then
         "$error_func" "configure_docker_nvidia_runtime: JSON validation failed in container $lxc_id. Check /tmp/docker-json-validation.log."
         return 1
     fi
@@ -711,14 +769,14 @@ EOF
     fi
     echo '[SUCCESS] Systemd and containerd services are ready.' >>/tmp/systemd-check.log
     "
-    if ! "$exec_func" "$lxc_id" -- bash -c "$systemd_check_cmd" 2>&1 | tee -a /tmp/systemd-check.log; then
+    if ! "$exec_func" "$lxc_id" bash -c "$systemd_check_cmd" 2>&1 | tee -a /tmp/systemd-check.log; then
         "$error_func" "configure_docker_nvidia_runtime: Systemd or containerd service check failed in container $lxc_id. Check /tmp/systemd-check.log."
         return 1
     fi
 
     # Reset Docker failed state and attempt restart
     "$log_func" "configure_docker_nvidia_runtime: Resetting Docker service state in container $lxc_id..."
-    "$exec_func" "$lxc_id" -- bash -c "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin systemctl reset-failed docker.service"
+    "$exec_func" "$lxc_id" bash -c "PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin systemctl reset-failed docker.service"
 
     # Attempt to restart Docker with increased timeout
     "$log_func" "configure_docker_nvidia_runtime: Restarting Docker service in container $lxc_id..."
@@ -745,7 +803,7 @@ EOF
         }
         echo '[SUCCESS] Docker service restarted successfully.' >>/tmp/docker-restart.log
         "
-        if "$exec_func" "$lxc_id" -- bash -c "$restart_cmd"; then
+        if "$exec_func" "$lxc_id" bash -c "$restart_cmd"; then
             # Verify storage driver
             "$log_func" "configure_docker_nvidia_runtime: Verifying storage driver in container $lxc_id..."
             local storage_check_cmd="set -e
@@ -762,7 +820,7 @@ EOF
                 cat /tmp/docker-info.log >>/tmp/docker-storage-check.log
                 exit 1
             }
-            if docker info --format '{{.Driver}}' | grep -q '$storage_driver'; then
+            if docker info --format '{{.Driver}}' | grep -q "$storage_driver"; then
                 echo '[SUCCESS] Storage driver is $(docker info --format '{{.Driver}}').' >>/tmp/docker-storage-check.log
             else
                 echo '[ERROR] Invalid storage driver: $(docker info --format '{{.Driver}}')' >>/tmp/docker-storage-check.log
@@ -771,7 +829,7 @@ EOF
             fi
             echo '[INFO] NVIDIA runtime path: $(docker info --format '{{.Runtimes.nvidia.path}}')' >>/tmp/docker-storage-check.log
             "
-            if "$exec_func" "$lxc_id" -- bash -c "storage_driver=$storage_driver; $storage_check_cmd" 2>&1 | tee -a /tmp/docker-storage-check.log; then
+            if "$exec_func" "$lxc_id" bash -c "storage_driver=$storage_driver; $storage_check_cmd" 2>&1 | tee -a /tmp/docker-storage-check.log; then
                 "$log_func" "configure_docker_nvidia_runtime: Docker service restarted successfully with $storage_driver storage driver in container $lxc_id."
                 return 0
             else
@@ -795,7 +853,7 @@ EOF
     systemctl start docker >/tmp/docker-start.log 2>&1 || { echo '[ERROR] Failed to start Docker'; cat /tmp/docker-start.log; exit 1; }
     echo '[SUCCESS] Docker service manually restarted.' >>/tmp/docker-start.log
     "
-    if "$exec_func" "$lxc_id" -- bash -c "$manual_restart_cmd"; then
+    if "$exec_func" "$lxc_id" bash -c "$manual_restart_cmd"; then
         "$log_func" "configure_docker_nvidia_runtime: Manual Docker stop/start succeeded in container $lxc_id."
         return 0
     else

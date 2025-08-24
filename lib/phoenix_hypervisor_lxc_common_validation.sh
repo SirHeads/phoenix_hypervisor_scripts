@@ -342,4 +342,4 @@ validate_json_schema() {
 }
 
 
-echo "[INFO] phoenix_hypervisor_lxc_common_validation.sh: Library loaded successfully."
+#echo "[INFO] phoenix_hypervisor_lxc_common_validation.sh: Library loaded successfully."

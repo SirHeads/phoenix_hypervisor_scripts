@@ -1,6 +1,6 @@
 #!/bin/bash
 # Common functions for Phoenix Hypervisor scripts
-# Version: 1.7.13 (Fixed Premature CUDA Validation, Added static_ip and mac_address support)
+# Version: 1.7.15 (Fixed net0 and hwaddr format issues in create_lxc_container)
 # Author: Assistant
 
 # --- Signal successful loading ---
@@ -320,6 +320,7 @@ validate_gpu_assignment() {
 create_lxc_container() {
     local lxc_id="$1"
     local container_config="$2"
+    local is_core_container="$3"
 
     # Validate required inputs
     if [[ -z "$lxc_id" || -z "$container_config" ]]; then
@@ -347,74 +348,17 @@ create_lxc_container() {
     local storage_size_gb
     storage_size_gb=$(echo "$container_config" | jq -r '.storage_size_gb')
     local network_config
-    network_config=$(echo "$container_config" | jq -r '.network_config')
+    network_config=$(echo "$container_config" | jq -c '.network_config')
     local features
-    features=$(echo "$container_config" | jq -r '.features // empty') # Handle optional features
+    features=$(echo "$container_config" | jq -r '.features // "nesting=1"')
     local gpu_assignment
     gpu_assignment=$(echo "$container_config" | jq -r '.gpu_assignment // "none"')
-    # --- NEW: Extract optional parameters ---
     local static_ip
-    static_ip=$(echo "$container_config" | jq -r '.static_ip // empty') # Use 'empty' to signify not present
+    static_ip=$(echo "$container_config" | jq -r '.static_ip // empty')
     local mac_address
-    mac_address=$(echo "$container_config" | jq -r '.mac_address // empty') # Use 'empty' to signify not present
-    # --- END NEW: Extract optional parameters ---
-    # --- End Extract Parameters ---
+    mac_address=$(echo "$container_config" | jq -r '.mac_address // empty')
 
-    # --- Parse Network Configuration ---
-    # Initialize variables for net0 construction
-    local net0_args="name=eth0,bridge=vmbr0"
-
-    # Handle MAC Address
-    if [[ -n "$mac_address" && "$mac_address" != "null" ]]; then
-        # Validate MAC address format (basic regex check)
-        if [[ ! "$mac_address" =~ ^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$ ]]; then
-            log_error "Invalid MAC address format for container $lxc_id: '$mac_address'"
-            return 1
-        fi
-        net0_args+=",hwaddr=$mac_address"
-        log_info "Using custom MAC address for container $lxc_id: $mac_address"
-    fi
-
-    # Determine IP configuration for net0
-    if [[ -n "$static_ip" && "$static_ip" != "null" ]]; then
-        # If static_ip is provided, use it. network_config should contain gw,dns.
-        # Validate static_ip format (basic regex)
-        if [[ ! "$static_ip" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-            log_error "Invalid static_ip format for container $lxc_id: '$static_ip'"
-            return 1
-        fi
-        net0_args+=",ip=$static_ip"
-        log_info "Using static IP for container $lxc_id: $static_ip"
-    else
-        # If no static_ip, fall back to parsing the old network_config format for IP/CIDR
-        local ip_cidr
-        IFS=',' read -r ip_cidr _ <<< "$network_config" # Read only the first part (IP/CIDR)
-        # Validate IP/CIDR format (basic regex)
-        if [[ ! "$ip_cidr" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+$ ]]; then
-            log_error "Invalid IP/CIDR format in network_config (fallback) for container $lxc_id: $ip_cidr"
-            return 1
-        fi
-        net0_args+=",ip=$ip_cidr"
-        log_info "Using IP/CIDR from network_config for container $lxc_id: $ip_cidr"
-    fi
-
-    # Parse Gateway and DNS from network_config (always used if present)
-    local gateway dns
-    IFS=',' read -r _ gateway dns <<< "$network_config" # Skip IP part, read gw and dns
-    # Validate Gateway format (basic regex)
-    if [[ -n "$gateway" && "$gateway" != "null" ]]; then
-        if [[ ! "$gateway" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-            log_error "Invalid Gateway format in network_config for container $lxc_id: $gateway"
-            return 1
-        fi
-        net0_args+=",gw=$gateway"
-    fi
-    # Nameserver is handled separately by pct create
-
-    # --- End Parse Network ---
-
-    # --- Validate Required Fields (Double-check after jq parsing) ---
-    # Although validate_container_config checks 'name', checking again here is defensive.
+    # --- Validate Required Fields ---
     if [[ -z "$name" || "$name" == "null" ]]; then
         log_error "create_lxc_container: Missing 'name' for container $lxc_id"
         return 1
@@ -443,73 +387,151 @@ create_lxc_container() {
         log_error "create_lxc_container: Missing 'network_config' for container $lxc_id"
         return 1
     fi
-    # features is now optional, so no check for it here
-    # --- End Validate Fields ---
 
-    # Prepare storage size argument for pct (just the number, unit assumed GB)
-    local storage_size="${storage_size_gb}"
+    # --- Parse Network Configuration ---
+    local net_name net_bridge net_ip net_gw net_dns
+    if [[ "$(echo "$network_config" | jq -r 'type')" == "object" ]]; then
+        net_name=$(echo "$network_config" | jq -r '.name')
+        net_bridge=$(echo "$network_config" | jq -r '.bridge')
+        net_ip=$(echo "$network_config" | jq -r '.ip')
+        net_gw=$(echo "$network_config" | jq -r '.gw')
+    else
+        # Fallback for legacy string-based network_config
+        log_warn "create_lxc_container: Legacy string-based network_config detected for container $lxc_id, attempting to parse..."
+        local net_config_str=$(echo "$container_config" | jq -r '.network_config')
+        if [[ -z "$net_config_str" || "$net_config_str" == "null" ]]; then
+            log_error "create_lxc_container: Invalid or missing network_config for container $lxc_id"
+            return 1
+        fi
+        net_name="eth0" # Default
+        net_bridge="vmbr0" # Default
+        IFS=',' read -r net_ip net_gw net_dns <<< "$net_config_str"
+    fi
+
+    # --- Enhanced Network Validation ---
+    # Validate network parameters for invalid characters
+    if [[ -z "$net_name" || "$net_name" == "null" || ! "$net_name" =~ ^[a-zA-Z0-9]+$ ]]; then
+        log_error "create_lxc_container: Invalid or missing network name for container $lxc_id: '$net_name'. Must be alphanumeric."
+        return 1
+    fi
+    if [[ -z "$net_bridge" || "$net_bridge" == "null" || ! "$net_bridge" =~ ^[a-zA-Z0-9]+$ ]]; then
+        log_error "create_lxc_container: Invalid or missing bridge name for container $lxc_id: '$net_bridge'. Must be alphanumeric."
+        return 1
+    fi
+    if [[ -z "$net_ip" || "$net_ip" == "null" || ! "$net_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+        log_error "create_lxc_container: Invalid or missing IP for container $lxc_id: '$net_ip'. Expected format: x.x.x.x/yy"
+        return 1
+    fi
+    if [[ -z "$net_gw" || "$net_gw" == "null" || ! "$net_gw" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        log_error "create_lxc_container: Invalid or missing gateway for container $lxc_id: '$net_gw'. Expected format: x.x.x.x"
+        return 1
+    fi
+
+    # Handle static_ip (if provided, override net_ip)
+    if [[ -n "$static_ip" && "$static_ip" != "null" && "$static_ip" != "empty" ]]; then
+        if [[ ! "$static_ip" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}/[0-9]{1,2}$ ]]; then
+            log_error "create_lxc_container: Invalid static_ip format for container $lxc_id: '$static_ip'. Expected format: x.x.x.x/yy"
+            return 1
+        fi
+        net_ip="$static_ip"
+        log_info "create_lxc_container: Using static_ip for container $lxc_id: $net_ip"
+    fi
+
+    # Validate and sanitize MAC address if provided
+    local net0="name=$net_name,bridge=$net_bridge,ip=$net_ip,gw=$net_gw"
+    if [[ -n "$mac_address" && "$mac_address" != "null" && "$mac_address" != "empty" ]]; then
+        if [[ ! "$mac_address" =~ ^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$ ]]; then
+            log_error "create_lxc_container: Invalid MAC address format for container $lxc_id: '$mac_address'. Expected format: xx:xx:xx:xx:xx:xx"
+            return 1
+        fi
+        # Check for unicast (first octet's least significant bit = 0)
+        local first_octet=$(echo "$mac_address" | cut -d':' -f1)
+        if [[ $((16#${first_octet} & 1)) -eq 1 ]]; then
+            log_error "create_lxc_container: MAC address $mac_address is not unicast for container $lxc_id (first octet: $first_octet)"
+            return 1
+        fi
+        net0="$net0,hwaddr=$mac_address"
+        log_info "create_lxc_container: Using custom MAC address for container $lxc_id: $mac_address"
+    fi
+    log_info "create_lxc_container: Constructed net0 string: $net0"
+
+    # Handle nameserver (DNS)
+    local nameserver="${net_dns:-8.8.8.8}" # Default to Google DNS if not provided
+    if [[ -n "$nameserver" && "$nameserver" != "null" && ! "$nameserver" =~ ^[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}\.[0-9]{1,3}$ ]]; then
+        log_error "create_lxc_container: Invalid nameserver for container $lxc_id: '$nameserver'. Expected format: x.x.x.x"
+        return 1
+    fi
 
     # --- Create the LXC Container ---
     log_info "Creating container $lxc_id ($name)..."
-    # Prepare the base command
     local pct_create_cmd=(pct create "$lxc_id" "$template"
         --hostname "$name"
         --memory "$memory_mb"
         --cores "$cores"
         --storage "$storage_pool"
-        --rootfs "$storage_size"
-        --net0 "$net0_args"
-        --nameserver "$dns"
+        --rootfs "$storage_size_gb"
+        --net0 "$net0"
+        --nameserver "$nameserver"
     )
 
     # Add features if present and not null
-    if [[ -n "$features" && "$features" != "null" ]]; then
-         pct_create_cmd+=(--features "$features")
+    if [[ -n "$features" && "$features" != "null" && "$features" != "empty" ]]; then
+        pct_create_cmd+=(--features "$features")
     fi
 
     # Use retry_command to attempt container creation
     if ! retry_command 3 10 "${pct_create_cmd[@]}"; then
-        log_error "Failed to create LXC container $lxc_id"
+        log_error "create_lxc_container: Failed to create LXC container $lxc_id"
         return 1
     fi
-    # --- End Create Container ---
+
+    # --- Start the Container ---
+    log_info "Starting container $lxc_id..."
+    if ! retry_command 5 5 pct start "$lxc_id"; then
+        log_error "create_lxc_container: Failed to start container $lxc_id"
+        return 1
+    fi
+
+    # --- Verify Container is Running ---
+    local max_attempts=5
+    local attempt=1
+    local status=""
+    while [[ $attempt -le $max_attempts ]]; do
+        log_info "Checking container $lxc_id status (attempt $attempt/$max_attempts)..."
+        status=$(pct status "$lxc_id" 2>/dev/null)
+        if [[ "$status" == "status: running" ]]; then
+            log_info "Container $lxc_id is running."
+            break
+        else
+            log_warn "Container $lxc_id not yet running (status: $status). Retrying in 5 seconds..."
+            sleep 5
+            ((attempt++))
+        fi
+    done
+    if [[ "$status" != "status: running" ]]; then
+        log_error "Container $lxc_id failed to start after $max_attempts attempts (status: $status)."
+        return 1
+    fi
 
     # --- Configure GPU Passthrough (if assigned) ---
-    # Check if a GPU assignment exists and is not "none"
     if [[ -n "$gpu_assignment" && "$gpu_assignment" != "none" ]]; then
         log_info "Configuring GPU passthrough for container $lxc_id (GPUs: $gpu_assignment)..."
-        # Check if the NVIDIA configuration function is available
         if declare -f configure_lxc_gpu_passthrough >/dev/null 2>&1; then
-            # Call the function to configure GPU passthrough
             if ! configure_lxc_gpu_passthrough "$lxc_id" "$gpu_assignment"; then
-                # Log a warning but don't fail the entire container creation
-                log_warn "Failed to configure GPU passthrough for container $lxc_id. Continuing with container creation."
+                log_warn "create_lxc_container: Failed to configure GPU passthrough for container $lxc_id. Continuing with container creation."
             else
-                log_info "GPU passthrough configured successfully for container $lxc_id"
+                log_info "create_lxc_container: GPU passthrough configured successfully for container $lxc_id"
             fi
         else
-            # Warn if the function isn't found (e.g., NVIDIA lib not sourced)
-            log_warn "GPU passthrough function 'configure_lxc_gpu_passthrough' not found. Skipping GPU setup."
+            log_warn "create_lxc_container: GPU passthrough function 'configure_lxc_gpu_passthrough' not found. Skipping GPU setup."
         fi
     else
-        log_info "No GPU assignment for container $lxc_id, skipping GPU passthrough configuration."
+        log_info "create_lxc_container: No GPU assignment for container $lxc_id, skipping GPU passthrough configuration."
     fi
-    # --- End GPU Configuration ---
-
-    # --- CRITICAL FIX APPLIED HERE ---
-    # The call to validate_cuda_version has been REMOVED from this point.
-    # CUDA validation should happen in the specific container setup scripts
-    # (e.g., phoenix_hypervisor_setup_drdevstral.sh, phoenix_hypervisor_setup_drcuda.sh)
-    # AFTER the NVIDIA driver and CUDA toolkit have been installed inside the container.
-    # ---
-    # validate_cuda_version "$lxc_id" # <-- THIS LINE WAS REMOVED
-    # ---
-    # --- End Critical Fix ---
 
     # --- Finalize ---
-    log_info "Container $lxc_id ($name) created successfully."
+    log_info "create_lxc_container: Container $lxc_id ($name) created and started successfully."
     return 0
-    # --- End Finalize ---
 }
 
 # Initialize logging

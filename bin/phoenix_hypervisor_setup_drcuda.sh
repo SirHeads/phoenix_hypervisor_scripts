@@ -320,7 +320,7 @@ else
     echo '[ERROR] Docker is not installed or not running'
     exit 1
 fi"
-    if pct_exec_with_retry "$lxc_id" -- bash -c "$docker_check_cmd"; then
+    if pct_exec_with_retry "$lxc_id" bash -c "$docker_check_cmd"; then
         log_info "validate_final_setup: Docker is installed and running in container $lxc_id"
         ((checks_passed++)) || true
     else
@@ -347,7 +347,7 @@ else
     echo '[ERROR] PyTorch image pytorch-cuda:12.8 not found locally'
     exit 1
 fi"
-    if pct_exec_with_retry "$lxc_id" -- bash -c "$image_check_cmd"; then
+    if pct_exec_with_retry "$lxc_id"  bash -c "$image_check_cmd"; then
         log_info "validate_final_setup: PyTorch image found locally in container $lxc_id"
         ((checks_passed++)) || true
     else

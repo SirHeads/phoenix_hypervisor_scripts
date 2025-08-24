@@ -113,47 +113,92 @@ fi
 # --- Call the central creation function ---
 if declare -f create_lxc_container > /dev/null; then
     if create_lxc_container "$container_id" "$container_config"; then
-        log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id created and configured successfully."
+        log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id created successfully."
 
-        # Try to get container codename for informational purposes, but don't fail if it's not available
-        container_codename=$(pct exec "$container_id" -- bash -c "lsb_release -cs 2>/dev/null || echo 'unknown'")
-        if [[ "$container_codename" != "unknown" ]]; then
-            log_info "phoenix_hypervisor_create_lxc.sh: Container codename detected: $container_codename (template: $(echo "$container_config" | jq -r '.template'))"
-        else
-            log_info "phoenix_hypervisor_create_lxc.sh: Container codename not immediately available, continuing with setup"
+        # --- REMOVED REDUNDANT START ---
+        # The create_lxc_container function already starts the container.
+        # The following block is therefore redundant and causes failure if the container is already running.
+        # ---
+        # Start the container and verify it's running
+        # log_info "phoenix_hypervisor_create_lxc.sh: Starting container $container_id..."
+        # if ! retry_command 3 10 pct start "$container_id"; then
+        #     log_error "phoenix_hypervisor_create_lxc.sh: Failed to start container $container_id."
+        #     exit 1
+        # fi
+        # ---
+
+        # --- RETAINED: Verification logic (This is still useful) ---
+        # Verify container is running with retry
+        max_attempts=5
+        attempt=1
+        status=""
+        while [[ $attempt -le $max_attempts ]]; do
+            log_info "phoenix_hypervisor_create_lxc.sh: Checking container $container_id status (attempt $attempt/$max_attempts)..."
+            status=$(pct status "$container_id" 2>/dev/null)
+            if [[ "$status" == "status: running" ]]; then
+                log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id is running."
+                break
+            else
+                log_warn "phoenix_hypervisor_create_lxc.sh: Container $container_id not yet running (status: $status). Retrying in 5 seconds..."
+                sleep 5
+                ((attempt++))
+            fi
+        done
+        if [[ "$status" != "status: running" ]]; then
+            log_error "phoenix_hypervisor_create_lxc.sh: Container $container_id failed to start after $max_attempts attempts (status: $status)."
+            exit 1
         fi
 
-        # Validate init system
-        init_system=$(pct exec "$container_id" -- bash -c "ps -p 1 -o comm=" 2>/dev/null)
-        if [[ $? -ne 0 || -z "$init_system" ]]; then
-            log_error "phoenix_hypervisor_create_lxc.sh: Failed to retrieve init system for container $container_id."
+        # --- FIXED: Moved and scoped init system check correctly ---
+        # Validate init system with retry (using the max_attempts defined above)
+        init_system=""
+        attempt=1 # Reset attempt counter for this check
+        while [[ $attempt -le $max_attempts ]]; do
+            log_info "phoenix_hypervisor_create_lxc.sh: Validating init system for container $container_id (attempt $attempt/$max_attempts)..."
+            # Use a subshell to capture both output and exit code robustly
+            init_system=$(pct exec "$container_id" -- bash -c "ps -p 1 -o comm=" 2>/dev/null) || init_system=""
+            if [[ -n "$init_system" ]]; then
+                log_info "phoenix_hypervisor_create_lxc.sh: Container init system: $init_system"
+                break
+            else
+                log_warn "phoenix_hypervisor_create_lxc.sh: Failed to retrieve init system for container $container_id. Retrying in 5 seconds..."
+                sleep 5
+                ((attempt++))
+            fi
+        done
+        if [[ -z "$init_system" ]]; then
+            log_error "phoenix_hypervisor_create_lxc.sh: Failed to retrieve init system for container $container_id after $max_attempts attempts."
             exit 1
         fi
         if [[ "$init_system" != "systemd" ]]; then
             log_error "phoenix_hypervisor_create_lxc.sh: Non-systemd init detected: $init_system. Docker requires systemd."
             exit 1
         fi
-        log_info "phoenix_hypervisor_create_lxc.sh: Container init system: $init_system"
 
-        log_info "phoenix_hypervisor_create_lxc.sh: Starting container $container_id..."
-        if ! retry_command 3 10 pct start "$container_id"; then
-            log_error "phoenix_hypervisor_create_lxc.sh: Failed to start container $container_id."
-            exit 1
+        # Try to get container codename for informational purposes, but don't fail if it's not available
+        # Also scoped correctly within the main success block
+        container_codename=$(pct exec "$container_id" -- bash -c "lsb_release -cs 2>/dev/null || echo 'unknown'")
+        if [[ "$container_codename" != "unknown" ]]; then
+            log_info "phoenix_hypervisor_create_lxc.sh: Container codename detected: $container_codename (template: $(echo "$container_config" | jq -r '.template'))"
+        else
+            log_info "phoenix_hypervisor_create_lxc.sh: Container codename not immediately available, continuing with setup"
         fi
-        log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id started successfully."
+        # --- END FIXED ---
 
         # --- NEW: Post-Creation Hook for Core Containers (Specifically ID 999) ---
         # If this is the DrSwarm container (ID 999), call the post-create setup script
+        # --- FIXED: Call the correct intermediate script ---
         if [[ "$container_id" == "999" ]]; then
             log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id is DrSwarm (ID 999). Initiating post-create setup..."
-            local postcreate_script="/usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drswarm_swarm_manager.sh"
+            # Call the intermediate setup script, which should then call the swarm_manager script
+            postcreate_script="/usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drswarm.sh"
             if [[ -x "$postcreate_script" ]]; then
                 log_info "phoenix_hypervisor_create_lxc.sh: Executing post-create setup script: $postcreate_script $container_id"
                 if "$postcreate_script" "$container_id"; then
                     log_info "phoenix_hypervisor_create_lxc.sh: Post-create setup for DrSwarm container $container_id completed successfully."
                 else
                     # Capture the exit code
-                    local postcreate_exit_code=$?
+                    postcreate_exit_code=$?
                     log_error "phoenix_hypervisor_create_lxc.sh: Post-create setup script '$postcreate_script $container_id' failed with exit code $postcreate_exit_code. Check logs for details."
                     # Decide whether failure of the post-create script should fail the entire creation.
                     # For now, we'll log the error and exit, treating it as critical for DrSwarm.
@@ -166,13 +211,14 @@ if declare -f create_lxc_container > /dev/null; then
         fi
         # --- END NEW ---
 
+        log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id created and configured successfully."
         exit 0
     else
         # --- MODIFIED: Improved Error Message for Premature CUDA Validation ---
         # The error might come from the premature CUDA validation in create_lxc_container.
         # We expect it to fail here, so we check if the container was actually created and started.
-        if validate_container_exists "$container_id"; then
-            if validate_container_running "$container_id"; then
+        if declare -f validate_container_exists > /dev/null && validate_container_exists "$container_id"; then
+            if declare -f validate_container_running > /dev/null && validate_container_running "$container_id"; then
                 log_warn "phoenix_hypervisor_create_lxc.sh: Reported failure, but container $container_id seems to be created and running. This might be due to premature CUDA validation. Proceeding."
                 # Even if it reports failure, if it's running, we consider it a success for creation.
                 # The calling script (e.g., phoenix_establish_hypervisor.sh) will handle specific setup steps.

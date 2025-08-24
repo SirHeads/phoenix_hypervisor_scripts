@@ -173,6 +173,7 @@ create_containers() {
             # Specific setup for core container ID 999 (DrSwarm)
             if [[ "$id" == "999" ]]; then
                 log_info "create_containers: Setting up DrSwarm container $id..."
+                # --- CORRECT CALL: Passes ID as argument, does not pass '--' ---
                 if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drswarm.sh "$id"; then
                     log_error "create_containers: Failed to set up DrSwarm container $id."
                     if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
@@ -222,6 +223,7 @@ create_containers() {
             # Specific setup for standard container ID 901 (drdevstral)
             if [[ "$id" == "901" ]]; then
                 log_info "create_containers: Setting up drdevstral container $id..."
+                # --- CORRECT CALL: Passes ID as argument, does not pass '--' ---
                 if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drdevstral.sh "$id"; then
                     log_error "create_containers: Failed to set up drdevstral container $id."
                     if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
@@ -233,6 +235,7 @@ create_containers() {
             # Specific setup for standard container ID 900 (DrCuda)
             elif [[ "$id" == "900" ]]; then
                 log_info "create_containers: Setting up DrCuda container $id..."
+                # --- CORRECT CALL: Passes ID as argument, does not pass '--' ---
                 if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drcuda.sh "$id"; then
                     log_error "create_containers: Failed to set up DrCuda container $id."
                     if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
@@ -244,6 +247,7 @@ create_containers() {
             # --- NEW: Specific setup for standard container ID 902 (llamacpp) ---
             elif [[ "$id" == "902" ]]; then
                 log_info "create_containers: Setting up llamacpp container $id..."
+                # --- CORRECT CALL: Passes ID as argument, does not pass '--' ---
                 if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_llamacpp.sh "$id"; then
                     log_error "create_containers: Failed to set up llamacpp container $id."
                     if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
