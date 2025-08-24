@@ -267,7 +267,6 @@ validate_container_config() {
     log_info "validate_container_config: Container $lxc_id configuration is valid for $EXPECTED_CONTAINER_NAME."
 }
 
-
 # 3. Make Container Privileged and Mount Shared Directory (IMPROVED)
 make_container_privileged_and_mount() {
     local lxc_id="$1"
@@ -301,27 +300,28 @@ make_container_privileged_and_mount() {
         log_info "make_container_privileged_and_mount: Added lxc.apparmor.profile: unconfined to $config_file."
     fi
 
-    # 3. Fix/Ensure Mount Point Format (mp=bind)
-    # Check if mp0 line exists and if it's correctly formatted
+    # 3. Fix/Ensure Mount Point Format (mp=bind) - Robust Handling
+    # Check if ANY mp0 line exists (correct or incorrect format)
     if grep -q "^mp0:" "$config_file" 2>/dev/null; then
-        # Check if it already contains mp=bind
-        if ! grep -q "^mp0:.*mp=bind" "$config_file" 2>/dev/null; then
-            # Line exists but lacks mp=bind. Attempt to correct it.
-            # This is a bit fragile but handles the common case seen.
-            # It assumes the format is roughly "mp0: source,dest" and adds ",mp=bind"
-            # A more robust solution would parse the line, but this is a common quick fix.
-            # Example: mp0: /source,/dest -> mp0: /source,/dest,mp=bind
-            # This sed adds ',mp=bind' before the end of the line if 'mp=' is not found.
-            sed -i 's/^\(mp0:.*\)$/\1,mp=bind/' "$config_file"
-            log_info "make_container_privileged_and_mount: Corrected mp0 line format in $config_file to include 'mp=bind'."
+        # mp0 line exists. Remove ALL existing mp0 lines to prevent duplicates/conflicts.
+        # This handles cases with malformed lines, duplicates, or old formats.
+        log_info "make_container_privileged_and_mount: Found existing mp0 line(s) in $config_file. Removing them."
+        # Use grep -v to invert the match and print lines that DON'T match ^mp0:, then redirect to a temp file
+        grep -v "^mp0:" "$config_file" > "${config_file}.tmp" && mv "${config_file}.tmp" "$config_file"
+        if [[ $? -eq 0 ]]; then
+            log_info "make_container_privileged_and_mount: Existing mp0 line(s) removed from $config_file."
         else
-             log_info "make_container_privileged_and_mount: mp0 line in $config_file already correctly formatted with 'mp=bind'."
+            log_error "make_container_privileged_and_mount: Failed to remove existing mp0 line(s) from $config_file."
         fi
+    fi
+    # At this point, no mp0 line should exist. Add the correct one.
+    log_info "make_container_privileged_and_mount: Adding correct mount point for '$SHARED_DOCKER_IMAGES_DIR' at '$LXC_MOUNT_POINT' in $config_file..."
+    # Add the correctly formatted mp0 line with mp=bind
+    echo "mp0: $SHARED_DOCKER_IMAGES_DIR,$LXC_MOUNT_POINT,mp=bind" >> "$config_file"
+    if [[ $? -eq 0 ]]; then
+        log_info "make_container_privileged_and_mount: Correct mount point added to $config_file."
     else
-        # mp0 line doesn't exist, add it correctly
-        log_info "make_container_privileged_and_mount: Adding mount point for '$SHARED_DOCKER_IMAGES_DIR' at '$LXC_MOUNT_POINT' in $config_file..."
-        echo "mp0: $SHARED_DOCKER_IMAGES_DIR,$LXC_MOUNT_POINT,mp=bind" >> "$config_file"
-        log_info "make_container_privileged_and_mount: Mount point added to $config_file."
+        log_error "make_container_privileged_and_mount: Failed to add mount point to $config_file."
     fi
     # --- END IMPROVED: Fix LXC Configuration File ---
 
