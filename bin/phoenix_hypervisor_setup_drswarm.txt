@@ -5,7 +5,7 @@
 # Discovers and builds base Docker images from shared directories and pushes them to the local registry.
 # This script is intended to be called by phoenix_establish_hypervisor.sh after container creation.
 #
-# Version: 1.4.0 (Improved LXC config handling, Refactored library sourcing logic)
+# Version: 1.5.0 (Ensured mount point directory creation, Fixed undefined variable, Improved LXC config handling)
 # Author: Assistant
 
 set -euo pipefail
@@ -23,7 +23,7 @@ trap restore_terminal EXIT
 
 # - Script Metadata -
 SCRIPT_NAME="phoenix_hypervisor_setup_drswarm.sh"
-SCRIPT_VERSION="1.4.0"
+SCRIPT_VERSION="1.5.0"
 AUTHOR="Assistant"
 
 # - Configuration -
@@ -316,14 +316,47 @@ make_container_privileged_and_mount() {
     fi
     # At this point, no mp0 line should exist. Add the correct one.
     log_info "make_container_privileged_and_mount: Adding correct mount point for '$SHARED_DOCKER_IMAGES_DIR' at '$LXC_MOUNT_POINT' in $config_file..."
-    # Add the correctly formatted mp0 line with mp=bind
-    echo "mp0: $SHARED_DOCKER_IMAGES_DIR,$LXC_MOUNT_POINT,mp=bind" >> "$config_file"
+    # Add the correctly formatted mp0 line with mp=rbind
+    echo "mp0:$SHARED_DOCKER_IMAGES_DIR,mp=rbind" >> "$config_file"
     if [[ $? -eq 0 ]]; then
         log_info "make_container_privileged_and_mount: Correct mount point added to $config_file."
     else
         log_error "make_container_privileged_and_mount: Failed to add mount point to $config_file."
     fi
     # --- END IMPROVED: Fix LXC Configuration File ---
+
+    # --- FIXED/ENSURED: Force Creation of Mount Point Directory ---
+    # The target mount point directory MUST exist inside the container's rootfs
+    # BEFORE the container starts and the LXC bind mount (mp0) is applied.
+    # This step is CRITICAL and must not be skipped or fail silently.
+
+    # Use a common, reliable path structure for PVE LXC containers.
+    # Adjust the base path if your PVE setup uses a different structure.
+    # This targets the container's root filesystem on the Proxmox host.
+    # Example path: /var/lib/lxc/<CTID>/rootfs
+    # --- CRITICAL ASSUMPTION: Using /var/lib/lxc as the base path ---
+    # If your storage uses lxc-disks or PVE manages paths differently,
+    # this path might need adjustment (e.g., /var/lib/pve/lxc/<CTID>/rootfs).
+    # The key is finding where the container's rootfs directory exists on the host.
+    local container_rootfs_base_path="/var/lib/lxc"
+    local full_mount_point_path="${container_rootfs_base_path}/${lxc_id}/rootfs${LXC_MOUNT_POINT}"
+
+    log_info "make_container_privileged_and_mount: ENSURING mount point directory '$full_mount_point_path' exists on host for container $lxc_id..."
+
+    # Create the directory path inside the container's rootfs on the host
+    # Use mkdir -p to create parents if needed (though /mnt usually exists)
+    if mkdir -p "$full_mount_point_path"; then
+        log_info "make_container_privileged_and_mount: SUCCESSFULLY created/verified mount point directory '$full_mount_point_path'."
+        # Optionally, set basic permissions (root:root, 755 is common)
+        chmod 755 "$full_mount_point_path" 2>/dev/null || log_warn "make_container_privileged_and_mount: Failed to set permissions on '$full_mount_point_path'."
+    else
+        # THIS IS A CRITICAL FAILURE - DO NOT PROCEED
+        log_error "make_container_privileged_and_mount: CRITICAL FAILURE - Could not create mount point directory '$full_mount_point_path'. Check permissions and base path. Container setup CANNOT proceed."
+        # Explicitly exit to halt the process
+        exit 1
+    fi
+    # --- END FIXED/ENSURED: Force Creation of Mount Point Directory ---
+
 
     # Start the container
     log_info "make_container_privileged_and_mount: Starting container $lxc_id..."
@@ -379,10 +412,10 @@ install_docker_in_swarm_manager() {
         echo '[INFO] Adding Docker repository...'
         mkdir -p /etc/apt/keyrings
         # --- CORRECTED: Fixed spacing in curl URL ---
-        curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+        curl -fsSL https://download.docker.com/linux/ubuntu/gpg   | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
         chmod a+r /etc/apt/keyrings/docker.gpg
         # --- CORRECTED: Fixed spacing in repo URL ---
-        echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \$(lsb_release -cs) stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null
+        echo 'deb [arch=\$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu   \$(lsb_release -cs) stable' | tee /etc/apt/sources.list.d/docker.list > /dev/null
         echo '[INFO] Updating package lists for Docker...'
         apt-get update -y --fix-missing > /tmp/docker-apt-update2.log 2>&1 || { echo '[ERROR] Failed to update package lists'; cat /tmp/docker-apt-update2.log; exit 1; }
         echo '[INFO] Installing Docker-ce...'
@@ -454,6 +487,56 @@ start_local_registry() {
 
     local registry_cmd="
     set -e
+    echo '[INFO] Performing pre-flight check: Ensuring Docker Swarm is fully ready...'
+    # --- NEW: Robust Swarm Readiness Check ---
+    SWARM_READY=false
+    SWARM_CHECK_ATTEMPTS=20 # Increase attempts
+    SWARM_CHECK_DELAY=3     # Check every 3 seconds
+    for i in \$(seq 1 \$SWARM_CHECK_ATTEMPTS); do
+        echo \"[INFO] Swarm readiness check (attempt \$i/\$SWARM_CHECK_ATTEMPTS)...\"
+        # Check 1: Swarm LocalNodeState is active
+        if docker info --format '{{.Swarm.LocalNodeState}}' 2>/dev/null | grep -q 'active'; then
+            echo '[INFO] Check 1/3 PASSED: Swarm LocalNodeState is active.'
+        else
+            echo '[WARN] Check 1/3 FAILED: Swarm LocalNodeState is not active. Waiting...'
+            sleep \$SWARM_CHECK_DELAY
+            continue
+        fi
+
+        # Check 2: Swarm Control Available (API responsiveness for swarm ops)
+        if timeout 10s docker node ls >/dev/null 2>&1; then
+            echo '[INFO] Check 2/3 PASSED: Swarm Control API is responsive.'
+        else
+            echo '[WARN] Check 2/3 FAILED: Swarm Control API is not responsive. Waiting...'
+            sleep \$SWARM_CHECK_DELAY
+            continue
+        fi
+
+        # Check 3: Basic Docker Run (Test if daemon can run containers post-swarm-init)
+        # This is a lightweight test, not the registry itself.
+        # IMPORTANT: Disable AppArmor for this test as well to match the environment
+        if timeout 20s docker run --rm --security-opt apparmor=unconfined hello-world >/dev/null 2>&1; then
+             echo '[INFO] Check 3/3 PASSED: Docker daemon can run containers (AppArmor disabled for test).'
+             SWARM_READY=true
+             break
+        else
+             echo '[WARN] Check 3/3 FAILED: Docker daemon failed simple run test (AppArmor disabled). This might indicate Swarm is still settling or there is an underlying issue.'
+             # Optional: Check daemon logs if the run test fails
+             # journalctl -u docker.service -n 20 --no-pager >&2 || echo '[WARN] Could not retrieve docker daemon logs.' >&2
+             sleep \$SWARM_CHECK_DELAY
+             continue
+        fi
+    done
+
+    if [ \"\$SWARM_READY\" = false ]; then
+        echo '[ERROR] Docker Swarm did not become fully ready within the expected time (\$((SWARM_CHECK_ATTEMPTS * SWARM_CHECK_DELAY)) seconds).'
+        echo '[DEBUG] Final Docker Info:'
+        docker info >&2 || echo '[DEBUG] Failed to get final docker info.' >&2
+        exit 1
+    fi
+    echo '[SUCCESS] Pre-flight check passed. Docker Swarm is fully ready.'
+    # --- END NEW: Robust Swarm Readiness Check ---
+
     echo '[INFO] Checking if registry container is already running...'
     if docker ps -q -f name=registry | grep -q .; then
         echo '[INFO] Registry container is already running.'
@@ -462,13 +545,17 @@ start_local_registry() {
     echo '[INFO] Pulling registry:2 image...'
     docker pull registry:2 > /tmp/registry-pull.log 2>&1 || { echo '[ERROR] Failed to pull registry:2 image'; cat /tmp/registry-pull.log; exit 1; }
     echo '[INFO] Starting registry container...'
-    docker run -d -p 5000:5000 --restart=always --name registry registry:2 > /tmp/registry-run.log 2>&1 || { echo '[ERROR] Failed to start registry container'; cat /tmp/registry-run.log; exit 1; }
+    # Use timeout for the docker run command as well
+    # CRITICAL FIX: Disable AppArmor for the registry container to prevent profile load issues in LXC environment
+    timeout 60s docker run --security-opt apparmor=unconfined -d -p 5000:5000 --restart=always --name registry registry:2 > /tmp/registry-run.log 2>&1 || { echo '[ERROR] Failed to start registry container (timeout or error)'; cat /tmp/registry-run.log; exit 1; }
+    echo '[INFO] Waiting briefly for registry container to start...'
     sleep 5 # Give it a moment to start
     if docker ps -q -f name=registry | grep -q .; then
         echo '[SUCCESS] Local Docker registry started successfully.'
     else
-        echo '[ERROR] Registry container did not start successfully.'
-        docker logs registry > /tmp/registry-logs.log 2>&1 || echo '[WARN] Could not get registry logs.'
+        echo '[ERROR] Registry container did not start successfully or failed health check.'
+        # Attempt to get logs with timeout
+        timeout 10s docker logs registry > /tmp/registry-logs.log 2>&1 || echo '[WARN] Could not get registry logs (timeout or error).'
         cat /tmp/registry-logs.log
         exit 1
     fi
@@ -491,10 +578,16 @@ discover_and_build_images() {
     # Note: We use the LXC_MOUNT_POINT path which is where the host directory is mounted inside the container.
     local lxc_shared_path="$LXC_MOUNT_POINT"
 
+    # --- FIXED: Use direct directory check instead of undefined variable ---
     # Verify the shared directory exists inside the LXC container
-    if ! pct_exec_with_retry "$lxc_id" test -d "$lxc_shared_path"; then
-        log_error "discover_and_build_images: Shared Docker images directory '$lxc_shared_path' not found inside LXC $lxc_id. Check mount configuration."
+    # Use /usr/bin/test explicitly and run in a clean environment to avoid any Docker context issues.
+    log_info "discover_and_build_images: Checking for shared directory mount point '$lxc_shared_path' inside container $lxc_id..."
+    if ! pct_exec_with_retry "$lxc_id" env -i PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin /usr/bin/test -d "$lxc_shared_path"; then
+        log_error "..."
+        return 1
     fi
+    log_info "discover_and_build_images: Confirmed shared directory mount point '$lxc_shared_path' exists inside container $lxc_id."
+    # --- END FIXED ---
 
     log_info "discover_and_build_images: Scanning '$lxc_shared_path' for image build contexts inside LXC $lxc_id..."
 

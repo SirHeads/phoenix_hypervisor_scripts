@@ -398,7 +398,7 @@ main() {
     log_info "PHOENIX HYPERTORVISOR INITIAL SETUP COMPLETED SUCCESSFULLY"
     log_info "==============================================="
     log_info "Directories checked/created:"
-    local lib_dir="${PHOENIX_HYPERVISOR_LIB_DIR:-/usr/local/lib/phoenix_hypervisor}"
+    lib_dir="${PHOENIX_HYPERVISOR_LIB_DIR:-/usr/local/lib/phoenix_hypervisor}"
     log_info " - $lib_dir"
     log_info " - /usr/local/bin/phoenix_hypervisor"
     log_info " - /var/lib/phoenix_hypervisor"

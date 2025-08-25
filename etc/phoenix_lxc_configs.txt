@@ -81,11 +81,11 @@
         },
         "999": {
             "name": "DrSwarm",
-            "memory_mb": 4096,
-            "cores": 2,
+            "memory_mb": 90096,
+            "cores": 6,
             "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
             "storage_pool": "lxc-disks",
-            "storage_size_gb": 16,
+            "storage_size_gb": 216,
             "network_config": {
                 "name": "eth0",
                 "bridge": "vmbr0",
