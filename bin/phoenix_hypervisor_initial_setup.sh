@@ -1,7 +1,7 @@
 #!/bin/bash
 # Initial setup script for Phoenix Hypervisor
 # Performs one-time environment preparation tasks
-# Version: 1.7.7 (Added Debugging for 'local' Error, Enhanced Sourcing Safety, Full Feature Preservation)
+# Version: 1.7.8 (Added PHOENIX_DOCKER_TOKEN_FILE validation, added validate_connectivity for Docker Hub, Hugging Face, and Portainer)
 # Author: Assistant
 
 set -euo pipefail
@@ -58,7 +58,6 @@ trap '
 # Source configuration with validation
 log_info "DEBUG: Attempting to source /usr/local/etc/phoenix_hypervisor_config.sh..."
 if [[ -f "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
-    # Validate script for 'local' declarations in global scope
     if grep -n "^[[:space:]]*local " "/usr/local/etc/phoenix_hypervisor_config.sh" >/dev/null; then
         log_error "Invalid 'local' declaration found in global scope of /usr/local/etc/phoenix_hypervisor_config.sh"
         exit 1
@@ -146,6 +145,101 @@ validate_apt_sources() {
     log_info "APT sources validated successfully"
 }
 
+# --- NEW: Validate connectivity for Docker Hub, Hugging Face, and Portainer ---
+validate_connectivity() {
+    log_info "DEBUG: Entering validate_connectivity..."
+    log_info "Validating connectivity for Docker Hub, Hugging Face, and Portainer..."
+
+    # Ensure Docker is installed for connectivity tests
+    if ! command -v docker >/dev/null 2>&1; then
+        log_info "Installing Docker CE for connectivity tests..."
+        if ! apt-get install -y docker.io; then
+            log_error "Failed to install Docker CE for connectivity tests."
+            exit 1
+        fi
+        systemctl enable --now docker || log_warn "Failed to enable/start Docker service."
+    fi
+
+    # Validate Docker Hub connectivity
+    if [[ -f "$PHOENIX_DOCKER_TOKEN_FILE" ]]; then
+        local username token
+        username=$(grep '^DOCKER_HUB_USERNAME=' "$PHOENIX_DOCKER_TOKEN_FILE" | cut -d'=' -f2-)
+        token=$(grep '^DOCKER_HUB_TOKEN=' "$PHOENIX_DOCKER_TOKEN_FILE" | cut -d'=' -f2-)
+        if [[ -z "$username" || -z "$token" ]]; then
+            log_error "Missing DOCKER_HUB_USERNAME or DOCKER_HUB_TOKEN in $PHOENIX_DOCKER_TOKEN_FILE"
+            exit 1
+        fi
+        if ! docker login -u "$username" -p "$token" "$EXTERNAL_REGISTRY_URL" 2>&1 | tee -a "$PHOENIX_INITIAL_SETUP_LOG_FILE"; then
+            log_error "Failed to authenticate with Docker Hub ($EXTERNAL_REGISTRY_URL). Check credentials in $PHOENIX_DOCKER_TOKEN_FILE."
+            exit 1
+        fi
+        log_info "Successfully authenticated with Docker Hub ($EXTERNAL_REGISTRY_URL)"
+        docker logout "$EXTERNAL_REGISTRY_URL" || log_warn "Failed to logout from Docker Hub, continuing..."
+    else
+        log_error "Docker Hub token file missing: $PHOENIX_DOCKER_TOKEN_FILE"
+        exit 1
+    fi
+
+    # Validate Hugging Face connectivity
+    if [[ "$COMMON_SOURCED" == true ]] && declare -f authenticate_huggingface >/dev/null 2>&1; then
+        # Create a temporary container for Hugging Face authentication test
+        local temp_container_id="9999"
+        local temp_container_config='{
+            "name": "temp-hf-test",
+            "memory_mb": 512,
+            "cores": 1,
+            "template": "local:ubuntu-24.04",
+            "storage_pool": "local-lvm",
+            "storage_size_gb": 2,
+            "network_config": {"name": "eth0", "bridge": "vmbr0", "ip": "10.0.0.200/24", "gw": "10.0.0.1"},
+            "features": "nesting=1"
+        }'
+        if ! declare -f create_lxc_container >/dev/null 2>&1; then
+            log_error "create_lxc_container function not found for Hugging Face connectivity test."
+            exit 1
+        fi
+        if ! create_lxc_container "$temp_container_id" "$temp_container_config" "false"; then
+            log_error "Failed to create temporary container $temp_container_id for Hugging Face connectivity test."
+            exit 1
+        fi
+        if ! authenticate_huggingface "$temp_container_id"; then
+            log_error "Failed to authenticate with Hugging Face in temporary container $temp_container_id."
+            pct destroy "$temp_container_id" || log_warn "Failed to cleanup temporary container $temp_container_id."
+            exit 1
+        fi
+        log_info "Successfully authenticated with Hugging Face"
+        # Cleanup temporary container
+        pct destroy "$temp_container_id" || log_warn "Failed to cleanup temporary container $temp_container_id."
+    else
+        log_error "authenticate_huggingface function not found or common functions not sourced."
+        exit 1
+    fi
+
+    # Validate Portainer ports
+    if ! command -v nc >/dev/null 2>&1; then
+        log_info "Installing netcat for Portainer port checks..."
+        if ! apt install -y netcat-openbsd; then
+            log_warn "Failed to install netcat-openbsd. Skipping Portainer port validation."
+        fi
+    fi
+    if command -v nc >/dev/null 2>&1; then
+        if ! nc -z "$PORTAINER_SERVER_IP" "$PORTAINER_SERVER_PORT" 2>/dev/null; then
+            log_warn "Portainer server port $PORTAINER_SERVER_PORT on $PORTAINER_SERVER_IP is not reachable. Ensure Portainer server is running."
+        else
+            log_info "Portainer server port $PORTAINER_SERVER_PORT on $PORTAINER_SERVER_IP is reachable."
+        fi
+        if ! nc -z "$PORTAINER_SERVER_IP" "$PORTAINER_AGENT_PORT" 2>/dev/null; then
+            log_warn "Portainer agent port $PORTAINER_AGENT_PORT on $PORTAINER_SERVER_IP is not reachable. Ensure Portainer agents are configured."
+        else
+            log_info "Portainer agent port $PORTAINER_AGENT_PORT on $PORTAINER_SERVER_IP is reachable."
+        fi
+    else
+        log_warn "netcat not installed, skipping Portainer port validation."
+    fi
+
+    log_info "Connectivity validation completed successfully."
+}
+
 setup_system_requirements() {
     log_info "DEBUG: Entering setup_system_requirements..."
     log_info "Checking and installing system requirements..."
@@ -228,10 +322,9 @@ setup_configuration() {
     local critical_files=(
         "$PHOENIX_LXC_CONFIG_FILE"
         "$PHOENIX_LXC_CONFIG_SCHEMA_FILE"
+        "$PHOENIX_HF_TOKEN_FILE"
+        "$PHOENIX_DOCKER_TOKEN_FILE"  # NEW: Added Docker Hub token file
     )
-    if [[ -n "${PHOENIX_HF_TOKEN_FILE:-}" ]]; then
-        critical_files+=("$PHOENIX_HF_TOKEN_FILE")
-    fi
 
     for file in "${critical_files[@]}"; do
         if [[ ! -f "$file" ]]; then
@@ -272,7 +365,12 @@ EOF
                     log_info "Created default schema file: $file"
                     ;;
                 "$PHOENIX_HF_TOKEN_FILE")
-                    log_warn "Hugging Face token file missing. Skipping creation as it's optional."
+                    log_error "Hugging Face token file missing: $file. Please create it with HF_TOKEN."
+                    exit 1
+                    ;;
+                "$PHOENIX_DOCKER_TOKEN_FILE")
+                    log_error "Docker Hub token file missing: $file. Please create it with DOCKER_HUB_USERNAME and DOCKER_HUB_TOKEN."
+                    exit 1
                     ;;
             esac
         fi
@@ -328,7 +426,7 @@ validate_setup() {
         "$HYPERVISOR_MARKER_DIR"
     )
     log_info "Checking required directories..."
-    for dir in "${dirs[@]}"; do
+    for dir in "${required_dirs[@]}"; do  # Fixed variable name from 'dirs' to 'required_dirs'
         if [[ -d "$dir" ]]; then
             log_info "Found required directory: $dir"
             ((checks_passed++)) || true
@@ -341,6 +439,8 @@ validate_setup() {
     local critical_files=(
         "$PHOENIX_LXC_CONFIG_FILE"
         "$PHOENIX_LXC_CONFIG_SCHEMA_FILE"
+        "$PHOENIX_HF_TOKEN_FILE"
+        "$PHOENIX_DOCKER_TOKEN_FILE"  # NEW: Added Docker Hub token file
     )
     log_info "Checking critical configuration files..."
     for file in "${critical_files[@]}"; do
@@ -366,7 +466,7 @@ validate_setup() {
 main() {
     log_info "DEBUG: Entering main function..."
     log_info "==============================================="
-    log_info "PHOENIX HYPERTORVISOR INITIAL SETUP STARTING"
+    log_info "PHOENIX HYPERVISOR INITIAL SETUP STARTING"
     log_info "==============================================="
     log_info "Log file: $PHOENIX_INITIAL_SETUP_LOG_FILE"
 
@@ -375,6 +475,7 @@ main() {
     setup_configuration
     setup_nvidia_support
     setup_services
+    validate_connectivity  # NEW: Added connectivity validation
 
     if ! validate_setup; then
         log_warn "Setup validation encountered issues, but continuing to attempt marker creation."
@@ -395,7 +496,7 @@ main() {
     fi
 
     log_info "==============================================="
-    log_info "PHOENIX HYPERTORVISOR INITIAL SETUP COMPLETED SUCCESSFULLY"
+    log_info "PHOENIX HYPERVISOR INITIAL SETUP COMPLETED SUCCESSFULLY"
     log_info "==============================================="
     log_info "Directories checked/created:"
     lib_dir="${PHOENIX_HYPERVISOR_LIB_DIR:-/usr/local/lib/phoenix_hypervisor}"
@@ -409,11 +510,11 @@ main() {
     log_info "Configuration files checked/created:"
     log_info " - $PHOENIX_LXC_CONFIG_FILE"
     log_info " - $PHOENIX_LXC_CONFIG_SCHEMA_FILE"
-    if [[ -n "${PHOENIX_HF_TOKEN_FILE:-}" ]]; then
-        log_info " - $PHOENIX_HF_TOKEN_FILE (optional)"
-    fi
+    log_info " - $PHOENIX_HF_TOKEN_FILE"
+    log_info " - $PHOENIX_DOCKER_TOKEN_FILE"  # NEW: Added Docker Hub token file
     log_info ""
     log_info "NVIDIA GPU support checked and verified."
+    log_info "Docker Hub, Hugging Face, and Portainer connectivity validated."
     log_info "==============================================="
     log_info "Phoenix Hypervisor initial setup completed successfully. Marker file: $HYPERVISOR_MARKER"
     return 0

@@ -79,33 +79,35 @@
                             "ip",
                             "gw"
                         ],
-                        "description": "Network configuration for the container's primary interface."
+                        "additionalProperties": false,
+                        "description": "The network configuration for the container."
                     },
                     "features": {
                         "type": "string",
-                        "minLength": 1,
-                        "description": "Optional LXC features (e.g., nesting=1,keyctl=1)."
+                        "pattern": "^nesting=[0-1](,keyctl=[0-1])?$",
+                        "description": "LXC features (e.g., nesting=1,keyctl=1)."
                     },
                     "static_ip": {
                         "type": "string",
                         "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$",
-                        "description": "Optional static IP address in CIDR notation (e.g., 10.0.0.99/24) for the container's primary network interface. Used for consistent addressing, especially for core services like DrSwarm."
+                        "description": "Static IP in CIDR notation (redundant with network_config.ip, for backward compatibility)."
                     },
                     "mac_address": {
                         "type": "string",
-                        "pattern": "^([0-9A-Fa-f]{2}:){5}([0-9A-Fa-f]{2})$",
-                        "description": "Optional static MAC address for the container's primary network interface (e.g., 52:54:00:12:34:56). Useful for DHCP reservations."
+                        "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$",
+                        "description": "The MAC address for the container's network interface."
                     },
                     "gpu_assignment": {
                         "type": "string",
-                        "pattern": "^([0-9]+(,[0-9]+)*|none)$",
+                        "pattern": "^([0-9]+(,[0-9]+)*|none|all)$",
                         "default": "none",
-                        "description": "Comma-separated list of GPU indices to assign to the container (e.g., '0', '1', '0,1'). Use 'none' or omit for no GPU assignment."
+                        "description": "GPU assignment: comma-separated indices (e.g., '0,1'), 'all', or 'none'."
                     },
                     "vllm_model": {
                         "type": "string",
                         "minLength": 1,
-                        "description": "The path to the vLLM model directory inside the container."
+                        "default": "none",
+                        "description": "The path to the vLLM model (e.g., '/models/Qwen/Qwen2.5-Coder-7B-Instruct')."
                     },
                     "vllm_tensor_parallel_size": {
                         "type": "integer",
@@ -180,6 +182,21 @@
                         "minLength": 1,
                         "default": "/root/.config/vllm/nccl/cu13/libnccl.so",
                         "description": "The path to the NCCL shared library inside the container."
+                    },
+                    "portainer_role": {
+                        "type": "string",
+                        "enum": [
+                            "server",
+                            "agent",
+                            "none"
+                        ],
+                        "default": "none",
+                        "description": "The role for Portainer: 'server' for the main Portainer instance, 'agent' for Portainer agents, 'none' for no Portainer role."
+                    },
+                    "unprivileged": {
+                        "type": "boolean",
+                        "default": true,
+                        "description": "Whether the container should run in unprivileged mode."
                     }
                 },
                 "required": [
@@ -190,7 +207,8 @@
                     "storage_pool",
                     "storage_size_gb",
                     "network_config"
-                ]
+                ],
+                "additionalProperties": false
             }
         }
     },
@@ -198,5 +216,6 @@
         "nvidia_driver_version",
         "nvidia_repo_url",
         "lxc_configs"
-    ]
+    ],
+    "additionalProperties": false
 }

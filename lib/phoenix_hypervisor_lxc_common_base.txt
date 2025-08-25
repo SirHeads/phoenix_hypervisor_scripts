@@ -1,10 +1,21 @@
 #!/usr/bin/env bash
 # Common Base Functions for Phoenix Hypervisor LXC Scripts
-# Version: 1.1.3 (Added container stabilization in pct_exec_with_retry, enhanced status debugging)
+# Version: 1.1.4 (Enhanced network check for Portainer endpoints, added logging to phoenix_hypervisor_lxc_common_base.log, aligned with Portainer setup)
 # Author: Assistant
 
 # --- Signal successful loading ---
 export PHOENIX_HYPERVISOR_LXC_COMMON_BASE_LOADED=1
+
+# --- Logging Setup ---
+PHOENIX_BASE_LOG_DIR="/var/log/phoenix_hypervisor"
+PHOENIX_BASE_LOG_FILE="$PHOENIX_BASE_LOG_DIR/phoenix_hypervisor_lxc_common_base.log"
+
+mkdir -p "$PHOENIX_BASE_LOG_DIR" 2>/dev/null || {
+    PHOENIX_BASE_LOG_DIR="/tmp"
+    PHOENIX_BASE_LOG_FILE="$PHOENIX_BASE_LOG_DIR/phoenix_hypervisor_lxc_common_base.log"
+}
+touch "$PHOENIX_BASE_LOG_FILE" 2>/dev/null || true
+chmod 644 "$PHOENIX_BASE_LOG_FILE" 2>/dev/null || true
 
 # --- Source Common Functions ---
 if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
@@ -15,12 +26,14 @@ elif [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
     log_info "phoenix_hypervisor_lxc_common_base.sh: Sourced common functions from /usr/local/bin/."
 else
     echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] phoenix_hypervisor_lxc_common_base.sh: Cannot find phoenix_hypervisor_common.sh" >&2
+    tee -a "$PHOENIX_BASE_LOG_FILE" >&2
     exit 1
 fi
 
 # --- Check if sourced correctly ---
 if [[ -z "$PHOENIX_HYPERVISOR_COMMON_LOADED" ]]; then
     echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] phoenix_hypervisor_lxc_common_base.sh: Failed to load phoenix_hypervisor_common.sh" >&2
+    tee -a "$PHOENIX_BASE_LOG_FILE" >&2
     exit 1
 fi
 
@@ -31,25 +44,24 @@ pct_exec_with_retry() {
     local cmd=("$@")
     local max_attempts=3
     local delay=10
-    local attempt=1
     local stabilization_delay=10
 
     # Use log_info if available, otherwise fallback
     local log_func="log_info"
     if ! declare -F log_info >/dev/null 2>&1; then
-        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*"; }
+        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*" | tee -a "$PHOENIX_BASE_LOG_FILE"; }
     fi
 
     # Use log_warn if available, otherwise fallback
     local warn_func="log_warn"
     if ! declare -F log_warn >/dev/null 2>&1; then
-        warn_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $*" >&2; }
+        warn_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $*" | tee -a "$PHOENIX_BASE_LOG_FILE" >&2; }
     fi
 
     # Use log_error if available, otherwise fallback
     local error_func="log_error"
     if ! declare -F log_error >/dev/null 2>&1; then
-        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
+        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" | tee -a "$PHOENIX_BASE_LOG_FILE" >&2; exit 1; }
     fi
 
     # Validate input
@@ -84,9 +96,10 @@ pct_exec_with_retry() {
     fi
 
     # Retry loop for command execution
+    local attempt=1
     while [[ $attempt -le $max_attempts ]]; do
         "$log_func" "pct_exec_with_retry: Executing command in container $lxc_id (attempt $attempt/$max_attempts): ${cmd[*]}"
-        if pct exec "$lxc_id" -- "${cmd[@]}" >/dev/null 2>&4; then
+        if pct exec "$lxc_id" -- "${cmd[@]}" >/dev/null 2>>"$PHOENIX_BASE_LOG_FILE"; then
             "$log_func" "pct_exec_with_retry: Command executed successfully in container $lxc_id"
             return 0
         else
@@ -124,13 +137,19 @@ make_container_privileged() {
     # Use log_info if available, otherwise fallback
     local log_func="log_info"
     if ! declare -F log_info >/dev/null 2>&1; then
-        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*"; }
+        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*" | tee -a "$PHOENIX_BASE_LOG_FILE"; }
     fi
 
     # Use log_error if available, otherwise fallback
     local error_func="log_error"
     if ! declare -F log_error >/dev/null 2>&1; then
-        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
+        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" | tee -a "$PHOENIX_BASE_LOG_FILE" >&2; exit 1; }
+    fi
+
+    # Use log_warn if available, otherwise fallback
+    local warn_func="log_warn"
+    if ! declare -F log_warn >/dev/null 2>&1; then
+        warn_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $*" | tee -a "$PHOENIX_BASE_LOG_FILE" >&2; }
     fi
 
     if [[ -z "$lxc_id" ]]; then
@@ -139,6 +158,21 @@ make_container_privileged() {
     fi
 
     "$log_func" "make_container_privileged: Configuring container $lxc_id to be privileged..."
+
+    # --- NEW: Warn if GPU access might be needed for containers 900-902 ---
+    if [[ "$lxc_id" -ge 900 && "$lxc_id" -le 902 ]]; then
+        "$warn_func" "make_container_privileged: Container $lxc_id (Portainer agent) may require GPU access. Ensure GPU passthrough is configured if needed."
+    fi
+
+    # --- NEW: Skip privilege escalation for container 999 unless specified ---
+    if [[ "$lxc_id" == "999" ]]; then
+        "$log_func" "make_container_privileged: Container $lxc_id (Portainer server) typically does not require privileged mode. Skipping unless explicitly required."
+        if [[ -n "${FORCE_PRIVILEGED_999:-}" && "$FORCE_PRIVILEGED_999" == "true" ]]; then
+            "$log_func" "make_container_privileged: FORCE_PRIVILEGED_999 is set, proceeding with privileged configuration for container $lxc_id."
+        else
+            return 0
+        fi
+    fi
 
     # Stop the container
     "$log_func" "make_container_privileged: Stopping container $lxc_id..."
@@ -191,16 +225,16 @@ make_container_privileged() {
 container_exists() {
     local lxc_id="$1"
     if [[ -z "$lxc_id" ]]; then
-         if declare -F log_error >/dev/null 2>&1; then
+        if declare -F log_error >/dev/null 2>&1; then
             log_error "container_exists: Container ID is required."
         else
-            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] container_exists: Container ID is required." >&2
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] container_exists: Container ID is required." | tee -a "$PHOENIX_BASE_LOG_FILE" >&2
             exit 1
         fi
         return 2 # Invalid argument
     fi
 
-    if pct config "$lxc_id" >/dev/null 2>&1; then
+    if pct config "$lxc_id" >/dev/null 2>>"$PHOENIX_BASE_LOG_FILE"; then
         return 0 # Exists
     else
         return 1 # Does not exist
@@ -214,13 +248,13 @@ ensure_container_running() {
     # Use log_info if available, otherwise fallback
     local log_func="log_info"
     if ! declare -F log_info >/dev/null 2>&1; then
-        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*"; }
+        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*" | tee -a "$PHOENIX_BASE_LOG_FILE"; }
     fi
 
     # Use log_error if available, otherwise fallback
     local error_func="log_error"
     if ! declare -F log_error >/dev/null 2>&1; then
-        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
+        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" | tee -a "$PHOENIX_BASE_LOG_FILE" >&2; exit 1; }
     fi
 
     if [[ -z "$lxc_id" ]]; then
@@ -229,7 +263,7 @@ ensure_container_running() {
     fi
 
     local status
-    status=$(pct status "$lxc_id" 2>/dev/null | grep 'status' | awk '{print $2}')
+    status=$(pct status "$lxc_id" 2>>"$PHOENIX_BASE_LOG_FILE" | grep 'status' | awk '{print $2}')
 
     if [[ "$status" == "running" ]]; then
         "$log_func" "ensure_container_running: Container $lxc_id is already running."
@@ -266,19 +300,19 @@ check_container_network() {
     # Use log_info if available, otherwise fallback
     local log_func="log_info"
     if ! declare -F log_info >/dev/null 2>&1; then
-        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*"; }
+        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*" | tee -a "$PHOENIX_BASE_LOG_FILE"; }
     fi
 
     # Use log_warn if available, otherwise fallback
     local warn_func="log_warn"
     if ! declare -F log_warn >/dev/null 2>&1; then
-        warn_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $*" >&2; }
+        warn_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [WARN] $*" | tee -a "$PHOENIX_BASE_LOG_FILE" >&2; }
     fi
 
     # Use log_error if available, otherwise fallback
     local error_func="log_error"
     if ! declare -F log_error >/dev/null 2>&1; then
-        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
+        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" | tee -a "$PHOENIX_BASE_LOG_FILE" >&2; exit 1; }
     fi
 
     if [[ -z "$lxc_id" ]]; then
@@ -288,15 +322,36 @@ check_container_network() {
 
     "$log_func" "check_container_network: Performing basic network check in container $lxc_id..."
 
+    # Basic ping test to 8.8.8.8
     local network_check_cmd="set -e; timeout 10s ping -c 1 8.8.8.8 >/dev/null 2>&1 && echo '[SUCCESS] Network ping successful' || { echo '[ERROR] Network ping failed'; exit 1; }"
 
     if pct_exec_with_retry "$lxc_id" bash -c "$network_check_cmd"; then
         "$log_func" "check_container_network: Basic network connectivity verified for container $lxc_id."
-        return 0
     else
         "$warn_func" "check_container_network: Basic network check failed in container $lxc_id."
         return 1
     fi
+
+    # --- NEW: Portainer-specific port check ---
+    if [[ "$lxc_id" == "999" || "$lxc_id" -ge 900 && "$lxc_id" -le 902 ]]; then
+        local port_check_ip="10.0.0.99"
+        local port_check_port
+        if [[ "$lxc_id" == "999" ]]; then
+            port_check_port="9443"
+        else
+            port_check_port="9001"
+        fi
+        "$log_func" "check_container_network: Checking Portainer endpoint $port_check_ip:$port_check_port in container $lxc_id..."
+        local port_check_cmd="set -e; if command -v nc >/dev/null 2>&1; then timeout 5s nc -z $port_check_ip $port_check_port >/dev/null 2>&1 && echo '[SUCCESS] Portainer port check successful' || { echo '[ERROR] Portainer port check failed'; exit 1; }; else echo '[WARN] netcat not installed, skipping port check'; exit 0; fi"
+        if pct_exec_with_retry "$lxc_id" bash -c "$port_check_cmd"; then
+            "$log_func" "check_container_network: Portainer endpoint $port_check_ip:$port_check_port verified for container $lxc_id."
+        else
+            "$warn_func" "check_container_network: Portainer endpoint $port_check_ip:$port_check_port check failed in container $lxc_id."
+            return 1
+        fi
+    fi
+
+    return 0
 }
 
 # --- Set temporary DNS inside the container ---
@@ -307,13 +362,13 @@ set_temporary_dns() {
     # Use log_info if available, otherwise fallback
     local log_func="log_info"
     if ! declare -F log_info >/dev/null 2>&1; then
-        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*"; }
+        log_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] $*" | tee -a "$PHOENIX_BASE_LOG_FILE"; }
     fi
 
     # Use log_error if available, otherwise fallback
     local error_func="log_error"
     if ! declare -F log_error >/dev/null 2>&1; then
-        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" >&2; exit 1; }
+        error_func() { echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] $*" | tee -a "$PHOENIX_BASE_LOG_FILE" >&2; exit 1; }
     fi
 
     if [[ -z "$lxc_id" ]]; then
@@ -343,5 +398,5 @@ fi
 if declare -F log_info >/dev/null 2>&1; then
     log_info "phoenix_hypervisor_lxc_common_base.sh: Library loaded successfully."
 else
-    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] phoenix_hypervisor_lxc_common_base.sh: Library loaded successfully."
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] phoenix_hypervisor_lxc_common_base.sh: Library loaded successfully." | tee -a "$PHOENIX_BASE_LOG_FILE"
 fi

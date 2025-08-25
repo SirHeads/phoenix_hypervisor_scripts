@@ -1,4 +1,8 @@
 #!/bin/bash
+# Script to create an LXC container for Phoenix Hypervisor
+# Version: 1.7.8 (Updated post-creation hook for Portainer server, added registry authentication for containers 900-902, 999)
+# Author: Assistant
+
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
 # --- Argument Parsing ---
@@ -87,13 +91,10 @@ else
     log_warn "phoenix_hypervisor_create_lxc.sh: Common functions file not found in standard locations. Using minimal logging."
 fi
 
-# --- NEW: Check for Core Container Priority ---
+# --- Check for Core Container Priority ---
 # Determine if this container is a core container (ID 990-999)
-# This check is primarily informational for logging, as the actual prioritization
-# happens in phoenix_establish_hypervisor.sh. However, it's good to know.
 is_core_container() {
     local id="$1"
-    # Check if ID is numeric and within the core range (990-999)
     if [[ "$id" =~ ^[0-9]+$ ]] && [[ "$id" -ge 990 ]] && [[ "$id" -le 999 ]]; then
         return 0 # True, it's a core container
     else
@@ -108,27 +109,14 @@ else
     log_info "phoenix_hypervisor_create_lxc.sh: Identified container $container_id as a STANDARD workload container."
     log_info "phoenix_hypervisor_create_lxc.sh: Creation of standard containers follows core container setup."
 fi
-# --- END NEW ---
+# --- END Check for Core Container Priority ---
 
 # --- Call the central creation function ---
 if declare -f create_lxc_container > /dev/null; then
     if create_lxc_container "$container_id" "$container_config"; then
         log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id created successfully."
 
-        # --- REMOVED REDUNDANT START ---
-        # The create_lxc_container function already starts the container.
-        # The following block is therefore redundant and causes failure if the container is already running.
-        # ---
-        # Start the container and verify it's running
-        # log_info "phoenix_hypervisor_create_lxc.sh: Starting container $container_id..."
-        # if ! retry_command 3 10 pct start "$container_id"; then
-        #     log_error "phoenix_hypervisor_create_lxc.sh: Failed to start container $container_id."
-        #     exit 1
-        # fi
-        # ---
-
-        # --- RETAINED: Verification logic (This is still useful) ---
-        # Verify container is running with retry
+        # --- Verification logic ---
         max_attempts=5
         attempt=1
         status=""
@@ -149,13 +137,11 @@ if declare -f create_lxc_container > /dev/null; then
             exit 1
         fi
 
-        # --- FIXED: Moved and scoped init system check correctly ---
-        # Validate init system with retry (using the max_attempts defined above)
+        # --- Validate init system ---
         init_system=""
-        attempt=1 # Reset attempt counter for this check
+        attempt=1
         while [[ $attempt -le $max_attempts ]]; do
             log_info "phoenix_hypervisor_create_lxc.sh: Validating init system for container $container_id (attempt $attempt/$max_attempts)..."
-            # Use a subshell to capture both output and exit code robustly
             init_system=$(pct exec "$container_id" -- bash -c "ps -p 1 -o comm=" 2>/dev/null) || init_system=""
             if [[ -n "$init_system" ]]; then
                 log_info "phoenix_hypervisor_create_lxc.sh: Container init system: $init_system"
@@ -175,53 +161,91 @@ if declare -f create_lxc_container > /dev/null; then
             exit 1
         fi
 
-        # Try to get container codename for informational purposes, but don't fail if it's not available
-        # Also scoped correctly within the main success block
+        # --- Container codename ---
         container_codename=$(pct exec "$container_id" -- bash -c "lsb_release -cs 2>/dev/null || echo 'unknown'")
         if [[ "$container_codename" != "unknown" ]]; then
             log_info "phoenix_hypervisor_create_lxc.sh: Container codename detected: $container_codename (template: $(echo "$container_config" | jq -r '.template'))"
         else
             log_info "phoenix_hypervisor_create_lxc.sh: Container codename not immediately available, continuing with setup"
         fi
-        # --- END FIXED ---
 
-        # --- NEW: Post-Creation Hook for Core Containers (Specifically ID 999) ---
-        # If this is the DrSwarm container (ID 999), call the post-create setup script
-        # --- FIXED: Call the correct intermediate script ---
-        if [[ "$container_id" == "999" ]]; then
-            log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id is DrSwarm (ID 999). Initiating post-create setup..."
-            # Call the intermediate setup script, which should then call the swarm_manager script
-            postcreate_script="/usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drswarm.sh"
-            if [[ -x "$postcreate_script" ]]; then
-                log_info "phoenix_hypervisor_create_lxc.sh: Executing post-create setup script: $postcreate_script $container_id"
-                if "$postcreate_script" "$container_id"; then
-                    log_info "phoenix_hypervisor_create_lxc.sh: Post-create setup for DrSwarm container $container_id completed successfully."
-                else
-                    # Capture the exit code
-                    postcreate_exit_code=$?
-                    log_error "phoenix_hypervisor_create_lxc.sh: Post-create setup script '$postcreate_script $container_id' failed with exit code $postcreate_exit_code. Check logs for details."
-                    # Decide whether failure of the post-create script should fail the entire creation.
-                    # For now, we'll log the error and exit, treating it as critical for DrSwarm.
-                    exit $postcreate_exit_code
+        # --- NEW: Registry Authentication for Containers 900-902, 999 ---
+        if [[ "$container_id" -ge 900 && "$container_id" -le 902 ]] || [[ "$container_id" == "999" ]]; then
+            log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id requires registry authentication (Portainer agent or server)."
+            
+            # Install Docker if not already installed
+            if declare -f install_docker_ce_in_container > /dev/null 2>&1; then
+                if ! install_docker_ce_in_container "$container_id"; then
+                    log_error "phoenix_hypervisor_create_lxc.sh: Failed to install Docker in container $container_id."
+                    exit 1
                 fi
             else
-                log_error "phoenix_hypervisor_create_lxc.sh: Post-create setup script '$postcreate_script' not found or not executable. Cannot complete DrSwarm setup."
+                log_error "phoenix_hypervisor_create_lxc.sh: Required function 'install_docker_ce_in_container' not found."
+                exit 1
+            fi
+
+            # Authenticate with Docker Hub
+            if declare -f authenticate_registry > /dev/null 2>&1; then
+                if ! authenticate_registry "$container_id"; then
+                    log_error "phoenix_hypervisor_create_lxc.sh: Failed to authenticate with Docker Hub for container $container_id."
+                    exit 1
+                fi
+            else
+                log_error "phoenix_hypervisor_create_lxc.sh: Required function 'authenticate_registry' not found."
+                exit 1
+            fi
+
+            # Authenticate with Hugging Face
+            if declare -f authenticate_huggingface > /dev/null 2>&1; then
+                if ! authenticate_huggingface "$container_id"; then
+                    log_error "phoenix_hypervisor_create_lxc.sh: Failed to authenticate with Hugging Face for container $container_id."
+                    exit 1
+                fi
+            else
+                log_error "phoenix_hypervisor_create_lxc.sh: Required function 'authenticate_huggingface' not found."
                 exit 1
             fi
         fi
         # --- END NEW ---
 
+        # --- UPDATED: Post-Creation Hook for Portainer Containers ---
+        if [[ "$container_id" -ge 900 && "$container_id" -le 902 ]]; then
+            log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id is a Portainer agent. Installing agent..."
+            if declare -f install_portainer_agent > /dev/null 2>&1; then
+                if ! install_portainer_agent "$container_id"; then
+                    log_error "phoenix_hypervisor_create_lxc.sh: Failed to install Portainer agent in container $container_id."
+                    exit 1
+                fi
+                log_info "phoenix_hypervisor_create_lxc.sh: Portainer agent installed successfully in container $container_id."
+            else
+                log_error "phoenix_hypervisor_create_lxc.sh: Required function 'install_portainer_agent' not found."
+                exit 1
+            fi
+        elif [[ "$container_id" == "999" ]]; then
+            log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id is Portainer server. Initiating setup..."
+            postcreate_script="/usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_portainer.sh"
+            if [[ -x "$postcreate_script" ]]; then
+                log_info "phoenix_hypervisor_create_lxc.sh: Executing Portainer server setup script: $postcreate_script $container_id"
+                if "$postcreate_script" "$container_id"; then
+                    log_info "phoenix_hypervisor_create_lxc.sh: Portainer server setup for container $container_id completed successfully."
+                else
+                    postcreate_exit_code=$?
+                    log_error "phoenix_hypervisor_create_lxc.sh: Portainer server setup script '$postcreate_script $container_id' failed with exit code $postcreate_exit_code."
+                    exit $postcreate_exit_code
+                fi
+            else
+                log_error "phoenix_hypervisor_create_lxc.sh: Portainer server setup script '$postcreate_script' not found or not executable."
+                exit 1
+            fi
+        fi
+        # --- END UPDATED ---
+
         log_info "phoenix_hypervisor_create_lxc.sh: Container $container_id created and configured successfully."
         exit 0
     else
-        # --- MODIFIED: Improved Error Message for Premature CUDA Validation ---
-        # The error might come from the premature CUDA validation in create_lxc_container.
-        # We expect it to fail here, so we check if the container was actually created and started.
         if declare -f validate_container_exists > /dev/null && validate_container_exists "$container_id"; then
             if declare -f validate_container_running > /dev/null && validate_container_running "$container_id"; then
                 log_warn "phoenix_hypervisor_create_lxc.sh: Reported failure, but container $container_id seems to be created and running. This might be due to premature CUDA validation. Proceeding."
-                # Even if it reports failure, if it's running, we consider it a success for creation.
-                # The calling script (e.g., phoenix_establish_hypervisor.sh) will handle specific setup steps.
                 exit 0
             else
                 log_error "phoenix_hypervisor_create_lxc.sh: Failed to create or configure container $container_id. Container exists but is not running."
@@ -231,7 +255,6 @@ if declare -f create_lxc_container > /dev/null; then
             log_error "phoenix_hypervisor_create_lxc.sh: Failed to create or configure container $container_id."
             exit 1
         fi
-        # --- END MODIFIED ---
     fi
 else
     if declare -f log_error > /dev/null 2>&1; then

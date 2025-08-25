@@ -1,7 +1,7 @@
 #!/bin/bash
 # Configuration file for Phoenix Hypervisor
 # Defines essential file paths and default settings
-# Version: 1.8.1 (Updated for Driver 580.76.05 and CUDA 12.8)
+# Version: 1.8.4 (Added PHOENIX_DOCKER_TOKEN_FILE, updated PORTAINER_SERVER_IP, set EXTERNAL_REGISTRY_URL to docker.io/SirHeads)
 # Author: Assistant
 
 # --- Core Paths ---
@@ -12,7 +12,12 @@ export PHOENIX_LXC_CONFIG_FILE="${PHOENIX_LXC_CONFIG_FILE:-/usr/local/etc/phoeni
 export PHOENIX_LXC_CONFIG_SCHEMA_FILE="${PHOENIX_LXC_CONFIG_SCHEMA_FILE:-/usr/local/etc/phoenix_lxc_configs.schema.json}"
 
 # Path to the Hugging Face token file
+# --- UPDATED: Clarified that this is for Hugging Face credentials only ---
 export PHOENIX_HF_TOKEN_FILE="${PHOENIX_HF_TOKEN_FILE:-/usr/local/etc/phoenix_hf_token.conf}"
+
+# Path to the Docker Hub token file
+# --- NEW: Added for Docker Hub credentials ---
+export PHOENIX_DOCKER_TOKEN_FILE="${PHOENIX_DOCKER_TOKEN_FILE:-/usr/local/etc/phoenix_docker_token.conf}"
 
 # Directory for Phoenix Hypervisor marker files (to track setup state)
 export HYPERVISOR_MARKER_DIR="${HYPERVISOR_MARKER_DIR:-/var/lib/phoenix_hypervisor/markers}"
@@ -25,6 +30,11 @@ export HYPERVISOR_LOGFILE="${HYPERVISOR_LOGFILE:-/var/log/phoenix_hypervisor/pho
 
 # Library directory for Phoenix Hypervisor scripts and modules
 export PHOENIX_HYPERVISOR_LIB_DIR="${PHOENIX_HYPERVISOR_LIB_DIR:-/usr/local/lib/phoenix_hypervisor}"
+
+# --- External Docker Registry Configuration ---
+# URL for the external Docker registry (Docker Hub with username SirHeads)
+# --- UPDATED: Changed from docker.io/<username> to docker.io/SirHeads ---
+export EXTERNAL_REGISTRY_URL="${EXTERNAL_REGISTRY_URL:-docker.io/SirHeads}"
 
 # --- ZFS Pool Configuration ---
 # ZFS pool for LXC container storage (if used)
@@ -45,33 +55,26 @@ export DEFAULT_LXC_FEATURES="${DEFAULT_LXC_FEATURES:-nesting=1}"
 
 # --- Default NVIDIA Configuration ---
 # NVIDIA driver version to use across all containers
-# --- PROJECT REQUIREMENT: Updated default driver version ---
 export NVIDIA_DRIVER_VERSION="${NVIDIA_DRIVER_VERSION:-580.76.05}"
 
 # CUDA toolkit version
-# --- PROJECT REQUIREMENT: Updated default CUDA version ---
 export CUDA_VERSION="${CUDA_VERSION:-12.8}"
 
 # CUDA compatibility package for forward compatibility
-# --- PROJECT REQUIREMENT: Updated CUDA compat package ---
 export CUDA_COMPAT_PACKAGE="${CUDA_COMPAT_PACKAGE:-cuda-compat-12-8}"
 
 # NVIDIA runfile URL for driver installation in containers
-# --- PROJECT REQUIREMENT: Updated default runfile URL ---
 export NVIDIA_RUNFILE_URL="${NVIDIA_RUNFILE_URL:-https://us.download.nvidia.com/XFree86/Linux-x86_64/580.76.05/NVIDIA-Linux-x86_64-580.76.05.run}"
 
 # Default GPU assignment for containers (empty = no GPUs, "0" = GPU 0, "0,1" = both GPUs)
-# This is a fallback, specific assignments should be in the JSON config or PHOENIX_GPU_ASSIGNMENTS
 export DEFAULT_GPU_ASSIGNMENT="${DEFAULT_GPU_ASSIGNMENT:-}"
 
 # Associative array defining GPU assignments for LXCs
-# Key: LXC ID, Value: Comma-separated GPU indices (e.g., "0", "1", "0,1")
-# Declaring it here ensures it exists. Initialization can happen dynamically or from JSON.
 declare -gA PHOENIX_GPU_ASSIGNMENTS
 
 # --- Default vLLM Configuration ---
 # Default vLLM Docker image tag
-export DEFAULT_VLLM_IMAGE="${DEFAULT_VLLM_IMAGE:-vllm/vllm-openai:cuda12}"
+export DEFAULT_VLLM_IMAGE="${DEFAULT_VLLM_IMAGE:-$EXTERNAL_REGISTRY_URL/vllm-image:cuda12}"
 
 # Default vLLM maximum model length
 export DEFAULT_VLLM_MAX_MODEL_LEN="${DEFAULT_VLLM_MAX_MODEL_LEN:-128}"
@@ -93,6 +96,17 @@ export DEFAULT_VLLM_NCCL_SO_PATH="${DEFAULT_VLLM_NCCL_SO_PATH:-/root/.config/vll
 
 # Default vLLM disable custom all-reduce
 export DEFAULT_VLLM_DISABLE_CUSTOM_ALL_REDUCE="${DEFAULT_VLLM_DISABLE_CUSTOM_ALL_REDUCE:-true}"
+
+# --- Portainer Configuration ---
+# IP address of the Portainer Server container
+# --- UPDATED: Changed from 10.0.0.98 to 10.0.0.99 for container 999 ---
+export PORTAINER_SERVER_IP="${PORTAINER_SERVER_IP:-10.0.0.99}"
+
+# Port for accessing the Portainer web UI
+export PORTAINER_SERVER_PORT="${PORTAINER_SERVER_PORT:-9443}"
+
+# Port for Portainer Agent communication
+export PORTAINER_AGENT_PORT="${PORTAINER_AGENT_PORT:-9001}"
 
 # --- Security and Debugging Flags ---
 # Rollback on failure flag (set to "true" to enable)

@@ -1,7 +1,7 @@
 #!/bin/bash
 # Main script to establish Phoenix Hypervisor
 # Creates and configures LXC containers based on phoenix_lxc_configs.json
-# Version: 1.7.12 (Prioritize core containers 990-999, Integrated DrSwarm Registry Workflow)
+# Version: 1.7.13 (Replaced DrSwarm with Portainer for container 999, updated 900-902 for Portainer agents, added token file validation)
 # Author: Assistant
 
 set -euo pipefail
@@ -57,16 +57,31 @@ validate_environment() {
         fi
     done
 
+    # --- NEW: Check Token Files ---
+    local critical_files=(
+        "$PHOENIX_HF_TOKEN_FILE"
+        "$PHOENIX_DOCKER_TOKEN_FILE"
+    )
+    for file in "${critical_files[@]}"; do
+        if [[ ! -f "$file" ]]; then
+            log_error "Critical token file missing: $file"
+        fi
+        if [[ ! -r "$file" ]]; then
+            log_error "Token file not readable: $file"
+        fi
+    done
+    # --- END NEW ---
+
     # --- CRITICAL CHECK: Initial Setup Marker ---
     if [[ ! -f "$HYPERVISOR_MARKER" ]]; then
         log_info "Marker file '$HYPERVISOR_MARKER' not found. Running initial setup script..."
-        if [[ -x "/usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_initial_setup.sh" ]]; then
-            /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_initial_setup.sh || {
+        if [[ -x "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_initial_setup.sh" ]]; then
+            /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_initial_setup.sh || {
                 log_error "Initial setup script failed. Check logs at /var/log/phoenix_hypervisor/phoenix_hypervisor_initial_setup.log."
                 exit 1
             }
         else
-            echo "[CRITICAL ERROR] Initial setup script not found at /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_initial_setup.sh." >&2
+            echo "[CRITICAL ERROR] Initial setup script not found at /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_initial_setup.sh." >&2
             log_error "Initial setup script not found."
             exit 1
         fi
@@ -99,7 +114,6 @@ validate_environment() {
     else
         log_warn "File descriptor 4 (debug log) not available during validation. jq errors will go to stderr."
     fi
-    # Use eval to safely construct the command with the redirection
     if ! eval "jq -e . \"\$PHOENIX_LXC_CONFIG_FILE\" >/dev/null $jq_stderr_redirect"; then
         log_error "Invalid JSON in $PHOENIX_LXC_CONFIG_FILE."
     fi
@@ -112,27 +126,20 @@ validate_environment() {
 create_containers() {
     log_info "Creating LXC containers from $PHOENIX_LXC_CONFIG_FILE with priority..."
 
-    # --- NEW: Load LXC Configurations ---
-    # Load all configurations into the global LXC_CONFIGS associative array
+    # --- Load LXC Configurations ---
     if ! load_hypervisor_config; then
         log_error "create_containers: Failed to load hypervisor configuration."
     fi
-    # --- END NEW ---
 
-    # --- NEW: Identify Core and Standard Containers ---
-    # Separate container IDs into core (990-999) and standard (others)
+    # --- Identify Core and Standard Containers ---
     local core_container_ids=()
     local standard_container_ids=()
 
-    # Iterate through the loaded container IDs from the config
     for id in "${!LXC_CONFIGS[@]}"; do
-        # Validate that the ID is numeric
         if ! [[ "$id" =~ ^[0-9]+$ ]]; then
             log_warn "create_containers: Skipping non-numeric container ID: $id"
             continue
         fi
-
-        # Check if ID is in the core range (990-999)
         if [[ "$id" -ge 990 && "$id" -le 999 ]]; then
             log_info "create_containers: Identified core container ID: $id"
             core_container_ids+=("$id")
@@ -141,18 +148,14 @@ create_containers() {
         fi
     done
 
-    # Sort the IDs numerically for consistent processing order
-    # Note: Requires bash 4+ for mapfile/readarray. Fallback to simple sort if needed.
     if command -v sort >/dev/null 2>&1; then
         mapfile -t core_container_ids < <(printf '%s\n' "${core_container_ids[@]}" | sort -n)
         mapfile -t standard_container_ids < <(printf '%s\n' "${standard_container_ids[@]}" | sort -n)
     else
-        # Fallback if sort is not available (unlikely)
         log_warn "'sort' command not found. Core/Standard container order might be inconsistent."
     fi
-    # --- END NEW ---
 
-    # --- NEW: Process Core Containers First ---
+    # --- Process Core Containers First ---
     if [[ ${#core_container_ids[@]} -gt 0 ]]; then
         log_info "create_containers: Starting creation of core containers: ${core_container_ids[*]}"
         for id in "${core_container_ids[@]}"; do
@@ -161,38 +164,25 @@ create_containers() {
                 log_info "create_containers: Core container $id already exists, skipping creation."
                 continue
             fi
-            # Delegate creation to the standard script
-            if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_create_lxc.sh "$id"; then
+            if ! /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_create_lxc.sh "$id"; then
                 log_error "create_containers: Failed to create core container $id."
                 if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
                     log_info "create_containers: Rolling back by destroying core container $id..."
-                    /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
+                    /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
                 fi
                 exit 1
             fi
-            # Specific setup for core container ID 999 (DrSwarm)
+            # --- UPDATED: Portainer Server Setup for ID 999 ---
             if [[ "$id" == "999" ]]; then
-                log_info "create_containers: Setting up DrSwarm container $id..."
-                # --- CORRECT CALL: Passes ID as argument, does not pass '--' ---
-                if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drswarm.sh "$id"; then
-                    log_error "create_containers: Failed to set up DrSwarm container $id."
+                log_info "create_containers: Setting up Portainer server container $id..."
+                if ! /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_setup_portainer.sh "$id"; then
+                    log_error "create_containers: Failed to set up Portainer server container $id."
                     if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-                        log_info "create_containers: Rolling back by destroying DrSwarm container $id..."
-                        /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
+                        log_info "create_containers: Rolling back by destroying Portainer server container $id..."
+                        /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
                     fi
                     exit 1
                 fi
-            # Add other core container setups here if needed (e.g., for IDs 990-998)
-            # elif [[ "$id" == "998" ]]; then
-            #     log_info "create_containers: Setting up core container $id..."
-            #     if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_core998.sh "$id"; then
-            #         log_error "create_containers: Failed to set up core container $id."
-            #         if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-            #             log_info "create_containers: Rolling back by destroying core container $id..."
-            #             /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
-            #         fi
-            #         exit 1
-            #     fi
             fi
             log_info "create_containers: Core container $id created and configured successfully."
         done
@@ -200,9 +190,9 @@ create_containers() {
     else
         log_info "create_containers: No core containers (IDs 990-999) found in configuration."
     fi
-    # --- END NEW: Process Core Containers First ---
+    # --- END Process Core Containers ---
 
-    # --- NEW: Process Standard Containers ---
+    # --- Process Standard Containers ---
     if [[ ${#standard_container_ids[@]} -gt 0 ]]; then
         log_info "create_containers: Starting creation of standard containers: ${standard_container_ids[*]}"
         for id in "${standard_container_ids[@]}"; do
@@ -211,53 +201,25 @@ create_containers() {
                 log_info "create_containers: Standard container $id already exists, skipping creation."
                 continue
             fi
-            # Delegate creation to the standard script
-            if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_create_lxc.sh "$id"; then
+            if ! /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_create_lxc.sh "$id"; then
                 log_error "create_containers: Failed to create standard container $id."
                 if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
                     log_info "create_containers: Rolling back by destroying standard container $id..."
-                    /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
+                    /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
                 fi
                 exit 1
             fi
-            # Specific setup for standard container ID 901 (drdevstral)
-            if [[ "$id" == "901" ]]; then
-                log_info "create_containers: Setting up drdevstral container $id..."
-                # --- CORRECT CALL: Passes ID as argument, does not pass '--' ---
-                if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drdevstral.sh "$id"; then
-                    log_error "create_containers: Failed to set up drdevstral container $id."
+            # --- UPDATED: Portainer Agent Setup for IDs 900-902 ---
+            if [[ "$id" -ge 900 && "$id" -le 902 ]]; then
+                log_info "create_containers: Setting up Portainer agent container $id..."
+                if ! install_portainer_agent "$id"; then
+                    log_error "create_containers: Failed to set up Portainer agent container $id."
                     if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-                        log_info "create_containers: Rolling back by destroying drdevstral container $id..."
-                        /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
+                        log_info "create_containers: Rolling back by destroying Portainer agent container $id..."
+                        /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
                     fi
                     exit 1
                 fi
-            # Specific setup for standard container ID 900 (DrCuda)
-            elif [[ "$id" == "900" ]]; then
-                log_info "create_containers: Setting up DrCuda container $id..."
-                # --- CORRECT CALL: Passes ID as argument, does not pass '--' ---
-                if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_drcuda.sh "$id"; then
-                    log_error "create_containers: Failed to set up DrCuda container $id."
-                    if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-                        log_info "create_containers: Rolling back by destroying DrCuda container $id..."
-                        /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
-                    fi
-                    exit 1
-                fi
-            # --- NEW: Specific setup for standard container ID 902 (llamacpp) ---
-            elif [[ "$id" == "902" ]]; then
-                log_info "create_containers: Setting up llamacpp container $id..."
-                # --- CORRECT CALL: Passes ID as argument, does not pass '--' ---
-                if ! /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_setup_llamacpp.sh "$id"; then
-                    log_error "create_containers: Failed to set up llamacpp container $id."
-                    if [[ "$ROLLBACK_ON_FAILURE" == "true" ]]; then
-                        log_info "create_containers: Rolling back by destroying llamacpp container $id..."
-                        /usr/local/bin/phoenix_hypervisor/phoenix_hypervisor_destroy.sh "$id"
-                    fi
-                    exit 1
-                fi
-            # --- END NEW ---
-            # Add other standard container setups here if needed
             fi
             log_info "create_containers: Standard container $id created and configured successfully."
         done
@@ -265,7 +227,7 @@ create_containers() {
     else
         log_info "create_containers: No standard containers found in configuration."
     fi
-    # --- END NEW: Process Standard Containers ---
+    # --- END Process Standard Containers ---
 }
 
 # --- Main Execution ---
@@ -283,9 +245,8 @@ main() {
     echo "==============================================="
     log_info "Phoenix Hypervisor setup completed successfully."
     echo "Check container status with: pct status <ID>"
-    echo "Access vLLM service at: http://10.0.0.111:8000/health" # This IP comes from the config for container 901
-    # Add other service access URLs as needed
-    echo "DrSwarm Registry is available at: http://10.0.0.99:5000/v2/_catalog" # Example registry endpoint
+    echo "Access Portainer server at: http://$PORTAINER_SERVER_IP:$PORTAINER_SERVER_PORT"
+    echo "Access Portainer agents at: http://$PORTAINER_SERVER_IP:$PORTAINER_AGENT_PORT"
 }
 
 main "$@"

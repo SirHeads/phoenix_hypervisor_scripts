@@ -6,7 +6,68 @@
 # This script is intended to be sourced by other Phoenix Hypervisor scripts.
 # Requires: pct, bash
 # Assumes: phoenix_hypervisor_common.sh is sourced for logging (fallbacks included)
-# Version: 1.1.0 (Enhanced for Ubuntu 25.04, non-systemd fallbacks, and improved error handling)
+# Version: 2.0.0 (Updated for Ubuntu 24.04, config sourcing, GPU assignment checks, and enhanced Docker fallbacks)
+
+# --- Source Phoenix Hypervisor Configuration ---
+if [[ -z "$PHOENIX_HYPERVISOR_CONFIG_LOADED" ]]; then
+    if [[ -f "/usr/local/etc/phoenix_hypervisor_config.txt" ]]; then
+        source /usr/local/etc/phoenix_hypervisor_config.txt
+        if declare -F log_info >/dev/null 2>&1; then
+            log_info "phoenix_hypervisor_lxc_common_systemd.sh: Sourced configuration from /usr/local/etc/phoenix_hypervisor_config.txt"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] phoenix_hypervisor_lxc_common_systemd.sh: Sourced configuration from /usr/local/etc/phoenix_hypervisor_config.txt"
+        fi
+    else
+        if declare -F log_error >/dev/null 2>&1; then
+            log_error "phoenix_hypervisor_lxc_common_systemd.sh: Configuration file /usr/local/etc/phoenix_hypervisor_config.txt not found."
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] phoenix_hypervisor_lxc_common_systemd.sh: Configuration file /usr/local/etc/phoenix_hypervisor_config.txt not found." >&2
+            exit 1
+        fi
+    fi
+fi
+
+# --- Helper Function: Check GPU Assignment ---
+check_gpu_assignment() {
+    local lxc_id="$1"
+    if [[ -z "$lxc_id" ]]; then
+        if declare -F log_error >/dev/null 2>&1; then
+            log_error "check_gpu_assignment: Missing lxc_id"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] check_gpu_assignment: Missing lxc_id" >&2
+        fi
+        return 1
+    fi
+
+    local config_file="${PHOENIX_LXC_CONFIG_FILE:-/usr/local/etc/phoenix_lxc_configs.json}"
+    if [[ ! -f "$config_file" ]]; then
+        if declare -F log_error >/dev/null 2>&1; then
+            log_error "check_gpu_assignment: Configuration file $config_file not found"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] check_gpu_assignment: Configuration file $config_file not found" >&2
+        fi
+        return 1
+    fi
+
+    local gpu_assignment
+    gpu_assignment=$(jq -r ".lxc_configs.\"$lxc_id\".gpu_assignment // \"none\"" "$config_file")
+    if [[ "$gpu_assignment" == "none" || -z "$gpu_assignment" ]]; then
+        if declare -F log_info >/dev/null 2>&1; then
+            log_info "check_gpu_assignment: No GPU assignment for container $lxc_id (gpu_assignment: $gpu_assignment)"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] check_gpu_assignment: No GPU assignment for container $lxc_id (gpu_assignment: $gpu_assignment)"
+        fi
+        return 1
+    else
+        if declare -F log_info >/dev/null 2>&1; then
+            log_info "check_gpu_assignment: GPU assignment found for container $lxc_id: $gpu_assignment"
+        else
+            echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] check_gpu_assignment: GPU assignment found for container $lxc_id: $gpu_assignment"
+        fi
+        echo "$gpu_assignment"
+        return 0
+    fi
+}
 
 # --- Systemd Service Management ---
 
@@ -46,7 +107,7 @@ create_systemd_service_in_container() {
     fi
 
     local create_cmd="set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 # Ensure systemd directory exists
 mkdir -p /etc/systemd/system
 # Write service content using cat and heredoc
@@ -114,6 +175,12 @@ enable_systemd_service_in_container() {
         return 1
     fi
 
+    # Skip Docker enablement for non-GPU containers
+    if [[ "$service_name" == "docker" ]] && ! check_gpu_assignment "$lxc_id"; then
+        "$log_func" "enable_systemd_service_in_container: Skipping Docker service enablement for container $lxc_id (no GPU assignment)"
+        return 0
+    fi
+
     "$log_func" "enable_systemd_service_in_container: Enabling systemd service '$service_name' in container $lxc_id..."
 
     # Use pct_exec_with_retry if available, otherwise direct exec
@@ -123,7 +190,7 @@ enable_systemd_service_in_container() {
     fi
 
     local enable_cmd="set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev/null 2>&1; then
     echo '[WARN] Systemd not available in container.'
     if [[ '$service_name' == 'docker' ]] && command -v dockerd >/dev/null 2>&1; then
@@ -148,6 +215,10 @@ if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev
         echo '[ERROR] Systemd not available and no fallback for service $service_name.'
         exit 1
     fi
+fi
+if systemctl is-enabled --quiet '$service_name' 2>/dev/null; then
+    echo '[INFO] Service $service_name already enabled.'
+    exit 0
 fi
 echo '[INFO] Enabling service...'
 systemctl enable '$service_name' > /tmp/systemd-$service_name.log 2>&1 || { echo '[ERROR] Failed to enable service'; cat /tmp/systemd-$service_name.log; exit 1; }
@@ -201,6 +272,12 @@ start_systemd_service_in_container() {
         return 1
     fi
 
+    # Skip Docker start for non-GPU containers
+    if [[ "$service_name" == "docker" ]] && ! check_gpu_assignment "$lxc_id"; then
+        "$log_func" "start_systemd_service_in_container: Skipping Docker service start for container $lxc_id (no GPU assignment)"
+        return 0
+    fi
+
     "$log_func" "start_systemd_service_in_container: Starting systemd service '$service_name' in container $lxc_id..."
 
     # Use pct_exec_with_retry if available, otherwise direct exec
@@ -210,7 +287,7 @@ start_systemd_service_in_container() {
     fi
 
     local start_cmd="set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev/null 2>&1; then
     echo '[WARN] Systemd not available in container.'
     if [[ '$service_name' == 'docker' ]] && command -v dockerd >/dev/null 2>&1; then
@@ -235,6 +312,10 @@ if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev
         echo '[ERROR] Systemd not available and no fallback for service $service_name.'
         exit 1
     fi
+fi
+if systemctl is-active --quiet '$service_name' 2>/dev/null; then
+    echo '[INFO] Service $service_name already running.'
+    exit 0
 fi
 echo '[INFO] Starting service...'
 systemctl start '$service_name' > /tmp/systemd-$service_name.log 2>&1 || { echo '[ERROR] Failed to start service'; cat /tmp/systemd-$service_name.log; exit 1; }
@@ -288,6 +369,12 @@ stop_systemd_service_in_container() {
         return 1
     fi
 
+    # Skip Docker stop for non-GPU containers
+    if [[ "$service_name" == "docker" ]] && ! check_gpu_assignment "$lxc_id"; then
+        "$log_func" "stop_systemd_service_in_container: Skipping Docker service stop for container $lxc_id (no GPU assignment)"
+        return 0
+    fi
+
     "$log_func" "stop_systemd_service_in_container: Stopping systemd service '$service_name' in container $lxc_id..."
 
     # Use pct_exec_with_retry if available, otherwise direct exec
@@ -297,7 +384,7 @@ stop_systemd_service_in_container() {
     fi
 
     local stop_cmd="set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev/null 2>&1; then
     echo '[WARN] Systemd not available in container.'
     if [[ '$service_name' == 'docker' ]] && command -v dockerd >/dev/null 2>&1; then
@@ -321,6 +408,10 @@ if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev
         echo '[ERROR] Systemd not available and no fallback for service $service_name.'
         exit 1
     fi
+fi
+if ! systemctl is-active --quiet '$service_name' 2>/dev/null; then
+    echo '[INFO] Service $service_name not running, considered stopped.'
+    exit 0
 fi
 echo '[INFO] Stopping service...'
 systemctl stop '$service_name' > /tmp/systemd-$service_name.log 2>&1 || { echo '[WARN] Failed to stop service (might not be running)'; cat /tmp/systemd-$service_name.log; exit 0; }
@@ -374,6 +465,12 @@ restart_systemd_service_in_container() {
         return 1
     fi
 
+    # Skip Docker restart for non-GPU containers
+    if [[ "$service_name" == "docker" ]] && ! check_gpu_assignment "$lxc_id"; then
+        "$log_func" "restart_systemd_service_in_container: Skipping Docker service restart for container $lxc_id (no GPU assignment)"
+        return 0
+    fi
+
     "$log_func" "restart_systemd_service_in_container: Restarting systemd service '$service_name' in container $lxc_id..."
 
     # Use pct_exec_with_retry if available, otherwise direct exec
@@ -383,7 +480,7 @@ restart_systemd_service_in_container() {
     fi
 
     local restart_cmd="set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev/null 2>&1; then
     echo '[WARN] Systemd not available in container.'
     if [[ '$service_name' == 'docker' ]] && command -v dockerd >/dev/null 2>&1; then
@@ -462,6 +559,13 @@ check_systemd_service_status_in_container() {
         return 2
     fi
 
+    # Skip Docker status check for non-GPU containers
+    if [[ "$service_name" == "docker" ]] && ! check_gpu_assignment "$lxc_id"; then
+        "$log_func" "check_systemd_service_status_in_container: Skipping Docker service status check for container $lxc_id (no GPU assignment)"
+        echo "not-found"
+        return 2
+    fi
+
     "$log_func" "check_systemd_service_status_in_container: Checking status of systemd service '$service_name' in container $lxc_id..."
 
     # Use pct_exec_with_retry if available, otherwise direct exec
@@ -471,7 +575,7 @@ check_systemd_service_status_in_container() {
     fi
 
     local status_cmd="set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev/null 2>&1; then
     echo '[WARN] Systemd not available in container.'
     if [[ '$service_name' == 'docker' ]] && command -v dockerd >/dev/null 2>&1; then
@@ -593,7 +697,7 @@ reload_systemd_daemon_in_container() {
     fi
 
     local reload_cmd="set -e
-export LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
+export LC_ALL=C.UTF-8 LANG=C.UTF-8
 if ! command -v systemctl >/dev/null 2>&1 || ! systemctl is-system-running >/dev/null 2>&1; then
     echo '[WARN] Systemd not available in container, skipping daemon-reload.'
     exit 0
@@ -621,4 +725,10 @@ echo '[SUCCESS] Systemd daemon reloaded successfully.'
     return 1
 }
 
-echo "[INFO] phoenix_hypervisor_lxc_common_systemd.sh: Library loaded successfully."
+# Signal that this library has been loaded
+export PHOENIX_HYPERVISOR_LXC_COMMON_SYSTEMD_LOADED=1
+if declare -F log_info >/dev/null 2>&1; then
+    log_info "phoenix_hypervisor_lxc_common_systemd.sh: Library loaded successfully."
+else
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [INFO] phoenix_hypervisor_lxc_common_systemd.sh: Library loaded successfully."
+fi
