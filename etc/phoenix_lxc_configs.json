@@ -3,8 +3,30 @@
     "nvidia_driver_version": "580.76.05",
     "nvidia_repo_url": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/",
     "lxc_configs": {
+        "900": {
+            "name": "vllmQwen25C-7B-GPU0",
+            "memory_mb": 32768,
+            "cores": 8,
+            "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
+            "storage_pool": "lxc-disks",
+            "storage_size_gb": 64,
+            "network_config": {
+                "name": "eth0",
+                "bridge": "vmbr0",
+                "ip": "10.0.0.110/24",
+                "gw": "10.0.0.1"
+            },
+            "features": "nesting=1,keyctl=1",
+            "static_ip": "10.0.0.110/24",
+            "mac_address": "52:54:00:67:89:A0",
+            "gpu_assignment": "0",
+            "portainer_role": "agent",
+            "unprivileged": false,
+            "vllm_model": "/models/Qwen/Qwen2.5-Coder-7B-Instruct",
+            "vllm_tensor_parallel_size": 1
+        },
         "901": {
-            "name": "vllmQwen25C-7B",
+            "name": "vllmQwen25C-7B-GPU1",
             "memory_mb": 32768,
             "cores": 8,
             "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
@@ -19,54 +41,14 @@
             "features": "nesting=1,keyctl=1",
             "static_ip": "10.0.0.111/24",
             "mac_address": "52:54:00:67:89:A1",
-            "gpu_assignment": "0,1",
+            "gpu_assignment": "1",
+            "portainer_role": "agent",
+            "unprivileged": false,
             "vllm_model": "/models/Qwen/Qwen2.5-Coder-7B-Instruct",
-            "vllm_tensor_parallel_size": 2,
-            "vllm_max_model_len": 2048,
-            "vllm_kv_cache_dtype": "fp8",
-            "vllm_shm_size": "8g",
-            "vllm_gpu_count": 2,
-            "vllm_api_port": 8000,
-            "vllm_gpu_memory_utilization": 0.8,
-            "vllm_dtype": "float16",
-            "vllm_attention_backend": "FLASHINFER",
-            "vllm_nccl_so_path": "/usr/lib/x86_64-linux-gnu/libnccl.so",
-            "portainer_role": "agent",
-            "unprivileged": false
-        },
-        "900": {
-            "name": "DrCuda",
-            "memory_mb": 32768,
-            "cores": 8,
-            "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
-            "storage_pool": "lxc-disks",
-            "storage_size_gb": 20,
-            "network_config": {
-                "name": "eth0",
-                "bridge": "vmbr0",
-                "ip": "10.0.0.110/24",
-                "gw": "10.0.0.1"
-            },
-            "features": "nesting=1,keyctl=1",
-            "static_ip": "10.0.0.110/24",
-            "mac_address": "52:54:00:67:89:A0",
-            "gpu_assignment": "0,1",
-            "vllm_model": "none",
-            "vllm_tensor_parallel_size": 2,
-            "vllm_max_model_len": 2048,
-            "vllm_kv_cache_dtype": "auto",
-            "vllm_shm_size": "4g",
-            "vllm_gpu_count": 2,
-            "vllm_api_port": 8003,
-            "vllm_gpu_memory_utilization": 0.7,
-            "vllm_dtype": "float16",
-            "vllm_attention_backend": "TORCH",
-            "vllm_nccl_so_path": "/usr/lib/x86_64-linux-gnu/libnccl.so",
-            "portainer_role": "agent",
-            "unprivileged": false
+            "vllm_tensor_parallel_size": 1
         },
         "902": {
-            "name": "llamacpp",
+            "name": "vllmQwen25C-7B-GPU0-1",
             "memory_mb": 32768,
             "cores": 8,
             "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
@@ -83,7 +65,9 @@
             "mac_address": "52:54:00:67:89:A2",
             "gpu_assignment": "0,1",
             "portainer_role": "agent",
-            "unprivileged": false
+            "unprivileged": false,
+            "vllm_model": "/models/Qwen/Qwen2.5-Coder-7B-Instruct",
+            "vllm_tensor_parallel_size": 2
         },
         "999": {
             "name": "Portainer",
@@ -103,7 +87,9 @@
             "mac_address": "52:54:00:67:89:99",
             "gpu_assignment": "none",
             "portainer_role": "server",
-            "unprivileged": true
+            "unprivileged": true,
+            "vllm_model": null,
+            "vllm_tensor_parallel_size": 1
         }
     }
 }

@@ -2,7 +2,24 @@
 # Common NVIDIA functions for LXC containers in Phoenix Hypervisor
 # Provides functions for installing/checking NVIDIA drivers, CUDA toolkit, and verifying GPU access INSIDE containers
 # Designed to be sourced by scripts that interact with containers (e.g., setup_drdevstral.sh, setup_drcuda.sh)
-# Version: 2.0.0 (Aligned with config driver/CUDA versions, GPU assignment checks, removed package-based driver install)
+# Version: 2.0.1 (Added QUIET_MODE, config backup, retry logic, .sh extension, aligned logging)
+# Author: Assistant
+# Integration: Supports GPU-enabled containers (900-902) for AI workloads (vLLM, LLaMA CPP, Ollama)
+
+# --- Signal Successful Loading ---
+export PHOENIX_HYPERVISOR_LXC_NVIDIA_LOADED=1
+
+# --- Logging Setup ---
+PHOENIX_NVIDIA_LOG_DIR="/var/log/phoenix_hypervisor"
+PHOENIX_NVIDIA_LOG_FILE="$PHOENIX_NVIDIA_LOG_DIR/phoenix_hypervisor_lxc_common_nvidia.log"
+
+mkdir -p "$PHOENIX_NVIDIA_LOG_DIR" 2>>"$PHOENIX_NVIDIA_LOG_DIR/phoenix_hypervisor_lxc_common_nvidia.log" || {
+    log_warn "Failed to create $PHOENIX_NVIDIA_LOG_DIR, falling back to /tmp"
+    PHOENIX_NVIDIA_LOG_DIR="/tmp"
+    PHOENIX_NVIDIA_LOG_FILE="$PHOENIX_NVIDIA_LOG_DIR/phoenix_hypervisor_lxc_common_nvidia.log"
+}
+touch "$PHOENIX_NVIDIA_LOG_FILE" 2>>"$PHOENIX_NVIDIA_LOG_FILE" || log_warn "Failed to create $PHOENIX_NVIDIA_LOG_FILE"
+chmod 644 "$PHOENIX_NVIDIA_LOG_FILE" 2>>"$PHOENIX_NVIDIA_LOG_FILE" || log_warn "Could not set permissions to 644 on $PHOENIX_NVIDIA_LOG_FILE"
 
 # --- Enhanced Sourcing of Dependencies ---
 if ! declare -f log_info >/dev/null 2>&1; then
@@ -12,20 +29,23 @@ if ! declare -f log_info >/dev/null 2>&1; then
         source /usr/local/bin/phoenix_hypervisor_common.sh
         log_warn "phoenix_hypervisor_lxc_common_nvidia.sh: Sourced common functions from /usr/local/bin/. Prefer /usr/local/lib/phoenix_hypervisor/."
     else
-        log_error "phoenix_hypervisor_lxc_common_nvidia.sh: Required function 'log_info' not found and common functions file could not be sourced."
-        log_error "phoenix_hypervisor_lxc_common_nvidia.sh: Ensure phoenix_hypervisor_common.sh is sourced before this file."
-        return 1
+        echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] phoenix_hypervisor_lxc_common_nvidia.sh: Cannot find phoenix_hypervisor_common.sh" >&2
+        exit 1
     fi
+fi
+if [[ -z "$PHOENIX_HYPERVISOR_COMMON_LOADED" ]]; then
+    echo "[$(date '+%Y-%m-%d %H:%M:%S %Z')] [ERROR] phoenix_hypervisor_lxc_common_nvidia.sh: Failed to load phoenix_hypervisor_common.sh" >&2
+    exit 1
 fi
 
 # --- Source Phoenix Hypervisor Configuration ---
 if [[ -z "$PHOENIX_HYPERVISOR_CONFIG_LOADED" ]]; then
-    if [[ -f "/usr/local/etc/phoenix_hypervisor_config.txt" ]]; then
-        source /usr/local/etc/phoenix_hypervisor_config.txt
-        log_info "phoenix_hypervisor_lxc_common_nvidia.sh: Sourced configuration from /usr/local/etc/phoenix_hypervisor_config.txt"
+    if [[ -f "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
+        source /usr/local/etc/phoenix_hypervisor_config.sh
+        log_info "phoenix_hypervisor_lxc_common_nvidia.sh: Sourced configuration from /usr/local/etc/phoenix_hypervisor_config.sh"
     else
-        log_error "phoenix_hypervisor_lxc_common_nvidia.sh: Configuration file /usr/local/etc/phoenix_hypervisor_config.txt not found."
-        return 1
+        log_error "phoenix_hypervisor_lxc_common_nvidia.sh: Configuration file /usr/local/etc/phoenix_hypervisor_config.sh not found."
+        exit 1
     fi
 fi
 
@@ -44,7 +64,10 @@ check_gpu_assignment() {
     fi
 
     local gpu_assignment
-    gpu_assignment=$(jq -r ".lxc_configs.\"$lxc_id\".gpu_assignment // \"none\"" "$config_file")
+    if ! gpu_assignment=$(retry_command 3 5 jq -r ".lxc_configs.\"$lxc_id\".gpu_assignment // \"none\"" "$config_file" 2>>"$PHOENIX_NVIDIA_LOG_FILE"); then
+        log_error "check_gpu_assignment: Failed to parse gpu_assignment for container $lxc_id"
+        return 1
+    fi
     if [[ "$gpu_assignment" == "none" || -z "$gpu_assignment" ]]; then
         log_info "check_gpu_assignment: No GPU assignment for container $lxc_id (gpu_assignment: $gpu_assignment)"
         return 1
@@ -58,9 +81,10 @@ check_gpu_assignment() {
 # --- Install NVIDIA Driver in Container via Runfile ---
 install_nvidia_driver_in_container_via_runfile() {
     local lxc_id="$1"
-    local driver_version="${NVIDIA_DRIVER_VERSION:-580.76.05}"
-    local runfile_url="${NVIDIA_RUNFILE_URL:-https://us.download.nvidia.com/XFree86/Linux-x86_64/580.76.05/NVIDIA-Linux-x86_64-580.76.05.run}"
-    local runfile_name="NVIDIA-Linux-x86_64-${driver_version}.run"
+    local config_file="${PHOENIX_LXC_CONFIG_FILE:-/usr/local/etc/phoenix_lxc_configs.json}"
+    local driver_version=$(jq -r ".lxc_configs.\"$lxc_id\".nvidia_driver_version // \"580.76.05\"" "$config_file" 2>>"$PHOENIX_NVIDIA_LOG_FILE")
+    local runfile_url="https://us.download.nvidia.com/XFree86/Linux-x86_64/$driver_version/NVIDIA-Linux-x86_64-$driver_version.run"
+    local runfile_name="NVIDIA-Linux-x86_64-$driver_version.run"
 
     if [[ -z "$lxc_id" ]]; then
         log_error "install_nvidia_driver_in_container_via_runfile: Missing lxc_id"
@@ -74,7 +98,9 @@ install_nvidia_driver_in_container_via_runfile() {
     fi
 
     log_info "install_nvidia_driver_in_container_via_runfile: Installing NVIDIA driver $driver_version in container $lxc_id using runfile..."
-    echo "Installing NVIDIA driver $driver_version in container $lxc_id... This may take a few minutes."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Installing NVIDIA driver $driver_version in container $lxc_id... This may take a few minutes." >&2
+    fi
 
     local check_installed_cmd="
 set -e
@@ -92,7 +118,7 @@ else
 fi
 exit 1
 "
-    if pct exec "$lxc_id" -- bash -c "$check_installed_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if pct_exec_with_retry "$lxc_id" bash -c "$check_installed_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_info "install_nvidia_driver_in_container_via_runfile: NVIDIA driver $driver_version already installed in container $lxc_id."
         return 0
     fi
@@ -105,7 +131,7 @@ export LC_ALL=C.UTF-8 LANG=C.UTF-8
 apt-get update -y --fix-missing
 apt-get install -y g++ freeglut3-dev build-essential libx11-dev libxmu-dev libxi-dev libglu1-mesa-dev libfreeimage-dev libglfw3-dev wget git pciutils cmake curl libcurl4-openssl-dev
 "
-    if ! pct exec "$lxc_id" -- bash -c "$install_prereqs_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$install_prereqs_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_error "install_nvidia_driver_in_container_via_runfile: Failed to install prerequisites in container $lxc_id."
         return 1
     fi
@@ -116,7 +142,7 @@ set -e
 export LC_ALL=C.UTF-8 LANG=C.UTF-8
 wget --quiet '$runfile_url' -O '$runfile_name' || { echo '[ERROR] Failed to download $runfile_name'; exit 1; }
 "
-    if ! pct exec "$lxc_id" -- bash -c "$download_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$download_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_error "install_nvidia_driver_in_container_via_runfile: Failed to download runfile in container $lxc_id."
         return 1
     fi
@@ -134,14 +160,14 @@ else
     exit 1
 fi
 "
-    if ! pct exec "$lxc_id" -- bash -c "$install_runfile_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$install_runfile_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_error "install_nvidia_driver_in_container_via_runfile: Failed to run installer in container $lxc_id."
-        pct exec "$lxc_id" -- bash -c "rm -f '$runfile_name'" 2>/dev/null || true
+        pct_exec_with_retry "$lxc_id" bash -c "rm -f '$runfile_name'" 2>>"$PHOENIX_NVIDIA_LOG_FILE" || log_warn "Failed to clean up runfile."
         return 1
     fi
 
     log_info "install_nvidia_driver_in_container_via_runfile: Cleaning up runfile in container $lxc_id..."
-    pct exec "$lxc_id" -- bash -c "rm -f '$runfile_name'" 2>/dev/null || log_warn "install_nvidia_driver_in_container_via_runfile: Failed to clean up runfile."
+    pct_exec_with_retry "$lxc_id" bash -c "rm -f '$runfile_name'" 2>>"$PHOENIX_NVIDIA_LOG_FILE" || log_warn "Failed to clean up runfile."
 
     log_info "install_nvidia_driver_in_container_via_runfile: Verifying driver installation in container $lxc_id..."
     local verify_cmd="
@@ -160,9 +186,11 @@ else
     exit 1
 fi
 "
-    if pct exec "$lxc_id" -- bash -c "$verify_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if pct_exec_with_retry "$lxc_id" bash -c "$verify_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_info "install_nvidia_driver_in_container_via_runfile: NVIDIA driver $driver_version installed and verified in container $lxc_id."
-        echo "NVIDIA driver $driver_version installation completed for container $lxc_id."
+        if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+            echo "NVIDIA driver $driver_version installation completed for container $lxc_id." >&2
+        fi
         return 0
     else
         log_error "install_nvidia_driver_in_container_via_runfile: Failed to verify driver installation in container $lxc_id."
@@ -173,20 +201,20 @@ fi
 # --- Install CUDA Toolkit 12.8 in Container ---
 install_cuda_toolkit_12_8_in_container() {
     local lxc_id="$1"
-
     if [[ -z "$lxc_id" ]]; then
         log_error "install_cuda_toolkit_12_8_in_container: Missing lxc_id"
         return 1
     fi
 
-    # Check if container has GPU assignment
     if ! check_gpu_assignment "$lxc_id"; then
         log_info "install_cuda_toolkit_12_8_in_container: Skipping CUDA Toolkit installation for container $lxc_id (no GPU assignment)"
         return 0
     fi
 
     log_info "install_cuda_toolkit_12_8_in_container: Installing CUDA Toolkit 12.8 in container $lxc_id..."
-    echo "Installing CUDA Toolkit 12.8 in container $lxc_id... This may take a few minutes."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Installing CUDA Toolkit 12.8 in container $lxc_id... This may take a few minutes." >&2
+    fi
 
     local check_installed_cmd="
 set -e
@@ -209,7 +237,7 @@ else
 fi
 exit 1
 "
-    if pct exec "$lxc_id" -- bash -c "$check_installed_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if pct_exec_with_retry "$lxc_id" bash -c "$check_installed_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_info "install_cuda_toolkit_12_8_in_container: CUDA Toolkit 12.8 already installed in container $lxc_id."
         return 0
     fi
@@ -224,7 +252,7 @@ apt-get install -y locales wget gnupg software-properties-common
 locale-gen en_US.UTF-8 C.UTF-8
 update-locale LC_ALL=C.UTF-8 LANG=C.UTF-8
 "
-    if ! pct exec "$lxc_id" -- bash -c "$install_prereqs_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$install_prereqs_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_error "install_cuda_toolkit_12_8_in_container: Failed to install prerequisites in container $lxc_id."
         return 1
     fi
@@ -250,7 +278,7 @@ EOF
 chmod +x /etc/profile.d/cuda.sh
 source /etc/profile.d/cuda.sh
 "
-    if ! pct exec "$lxc_id" -- bash -c "$cuda_install_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$cuda_install_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_error "install_cuda_toolkit_12_8_in_container: Failed to install CUDA Toolkit in container $lxc_id."
         return 1
     fi
@@ -279,9 +307,11 @@ else
     exit 1
 fi
 "
-    if pct exec "$lxc_id" -- bash -c "$verify_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if pct_exec_with_retry "$lxc_id" bash -c "$verify_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_info "install_cuda_toolkit_12_8_in_container: CUDA Toolkit 12.8 installed and verified in container $lxc_id."
-        echo "CUDA Toolkit 12.8 installation completed for container $lxc_id."
+        if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+            echo "CUDA Toolkit 12.8 installation completed for container $lxc_id." >&2
+        fi
         return 0
     else
         log_error "install_cuda_toolkit_12_8_in_container: Failed to verify CUDA Toolkit installation in container $lxc_id."
@@ -298,7 +328,9 @@ install_docker_ce_in_container() {
     fi
 
     log_info "install_docker_ce_in_container: Installing Docker-ce in container $lxc_id..."
-    echo "Installing Docker-ce in container $lxc_id... This may take a few minutes."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Installing Docker-ce in container $lxc_id... This may take a few minutes." >&2
+    fi
 
     local check_cmd="
 set -e
@@ -310,7 +342,7 @@ if command -v docker >/dev/null 2>&1 && dpkg -l | grep -q docker-ce; then
 fi
 exit 1
 "
-    if pct exec "$lxc_id" -- bash -c "$check_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if pct_exec_with_retry "$lxc_id" bash -c "$check_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_info "install_docker_ce_in_container: Docker-ce already installed in container $lxc_id."
         return 0
     fi
@@ -347,42 +379,35 @@ else
     exit 1
 fi
 "
-    local attempt=1
-    local max_attempts=3
-    while [[ $attempt -le $max_attempts ]]; do
-        log_info "install_docker_ce_in_container: Attempting Docker-ce installation (attempt $attempt/$max_attempts)..."
-        if pct exec "$lxc_id" -- bash -c "$install_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-            log_info "install_docker_ce_in_container: Docker-ce installed successfully in container $lxc_id."
-            echo "Docker-ce installation completed for container $lxc_id."
-            return 0
-        else
-            log_warn "install_docker_ce_in_container: Installation failed on attempt $attempt. Retrying in 10 seconds..."
-            sleep 10
-            ((attempt++))
-        fi
-    done
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$install_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
+        log_error "install_docker_ce_in_container: Failed to install Docker-ce in container $lxc_id after 3 attempts."
+        return 1
+    fi
 
-    log_error "install_docker_ce_in_container: Failed to install Docker-ce in container $lxc_id after $max_attempts attempts."
-    return 1
+    log_info "install_docker_ce_in_container: Docker-ce installed successfully in container $lxc_id."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Docker-ce installation completed for container $lxc_id." >&2
+    fi
+    return 0
 }
 
 # --- Install NVIDIA Container Toolkit in Container ---
 install_nvidia_toolkit_in_container() {
     local lxc_id="$1"
-
     if [[ -z "$lxc_id" ]]; then
         log_error "install_nvidia_toolkit_in_container: Missing lxc_id"
         return 1
     fi
 
-    # Check if container has GPU assignment
     if ! check_gpu_assignment "$lxc_id"; then
         log_info "install_nvidia_toolkit_in_container: Skipping NVIDIA Container Toolkit installation for container $lxc_id (no GPU assignment)"
         return 0
     fi
 
     log_info "install_nvidia_toolkit_in_container: Installing NVIDIA Container Toolkit in container $lxc_id..."
-    echo "Installing NVIDIA Container Toolkit in container $lxc_id... This may take a few minutes."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Installing NVIDIA Container Toolkit in container $lxc_id... This may take a few minutes." >&2
+    fi
 
     local check_installed_cmd="
 set -e
@@ -393,7 +418,7 @@ if command -v nvidia-ctk >/dev/null 2>&1 && dpkg -l | grep -q nvidia-container-t
 fi
 exit 1
 "
-    if pct exec "$lxc_id" -- bash -c "$check_installed_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if pct_exec_with_retry "$lxc_id" bash -c "$check_installed_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_info "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit already installed in container $lxc_id."
         return 0
     fi
@@ -420,42 +445,35 @@ else
     exit 1
 fi
 "
-    local attempt=1
-    local max_attempts=3
-    while [[ $attempt -le $max_attempts ]]; do
-        log_info "install_nvidia_toolkit_in_container: Attempting installation (attempt $attempt/$max_attempts)..."
-        if pct exec "$lxc_id" -- bash -c "$install_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-            log_info "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit installed successfully in container $lxc_id."
-            echo "NVIDIA Container Toolkit installation completed for container $lxc_id."
-            return 0
-        else
-            log_warn "install_nvidia_toolkit_in_container: Installation failed on attempt $attempt. Retrying in 10 seconds..."
-            sleep 10
-            ((attempt++))
-        fi
-    done
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$install_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
+        log_error "install_nvidia_toolkit_in_container: Failed to install NVIDIA Container Toolkit in container $lxc_id after 3 attempts."
+        return 1
+    fi
 
-    log_error "install_nvidia_toolkit_in_container: Failed to install NVIDIA Container Toolkit in container $lxc_id after $max_attempts attempts."
-    return 1
+    log_info "install_nvidia_toolkit_in_container: NVIDIA Container Toolkit installed successfully in container $lxc_id."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "NVIDIA Container Toolkit installation completed for container $lxc_id." >&2
+    fi
+    return 0
 }
 
 # --- Configure NVIDIA Runtime for Docker ---
 configure_docker_nvidia_runtime() {
     local lxc_id="$1"
-
     if [[ -z "$lxc_id" ]]; then
         log_error "configure_docker_nvidia_runtime: Missing lxc_id"
         return 1
     fi
 
-    # Check if container has GPU assignment
     if ! check_gpu_assignment "$lxc_id"; then
         log_info "configure_docker_nvidia_runtime: Skipping NVIDIA runtime configuration for container $lxc_id (no GPU assignment)"
         return 0
     fi
 
     log_info "configure_docker_nvidia_runtime: Configuring NVIDIA runtime for Docker in container $lxc_id..."
-    echo "Configuring NVIDIA runtime for Docker in container $lxc_id..."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Configuring NVIDIA runtime for Docker in container $lxc_id..." >&2
+    fi
 
     local config_cmd="
 set -e
@@ -528,23 +546,16 @@ else
     exit 1
 fi
 "
-    local attempt=1
-    local max_attempts=3
-    while [[ $attempt -le $max_attempts ]]; do
-        log_info "configure_docker_nvidia_runtime: Attempting NVIDIA runtime configuration (attempt $attempt/$max_attempts)..."
-        if pct exec "$lxc_id" -- bash -c "$config_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-            log_info "configure_docker_nvidia_runtime: NVIDIA runtime configured successfully in container $lxc_id."
-            echo "NVIDIA runtime configuration completed for container $lxc_id."
-            return 0
-        else
-            log_warn "configure_docker_nvidia_runtime: Configuration failed on attempt $attempt. Retrying in 10 seconds..."
-            sleep 10
-            ((attempt++))
-        fi
-    done
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$config_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
+        log_error "configure_docker_nvidia_runtime: Failed to configure NVIDIA runtime in container $lxc_id after 3 attempts."
+        return 1
+    fi
 
-    log_error "configure_docker_nvidia_runtime: Failed to configure NVIDIA runtime in container $lxc_id after $max_attempts attempts."
-    return 1
+    log_info "configure_docker_nvidia_runtime: NVIDIA runtime configured successfully in container $lxc_id."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "NVIDIA runtime configuration completed for container $lxc_id." >&2
+    fi
+    return 0
 }
 
 # --- Build Docker Image in Container ---
@@ -558,7 +569,9 @@ build_docker_image_in_container() {
     fi
 
     log_info "build_docker_image_in_container: Building Docker image $image_tag in container $lxc_id from $dockerfile_path..."
-    echo "Building Docker image $image_tag in container $lxc_id... This may take a few minutes."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Building Docker image $image_tag in container $lxc_id... This may take a few minutes." >&2
+    fi
 
     local check_cmd="
 set -e
@@ -569,7 +582,7 @@ if docker images -q $image_tag | grep -q .; then
 fi
 exit 1
 "
-    if pct exec "$lxc_id" -- bash -c "$check_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
+    if pct_exec_with_retry "$lxc_id" bash -c "$check_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
         log_info "build_docker_image_in_container: Docker image $image_tag already exists in container $lxc_id."
         return 0
     fi
@@ -590,23 +603,16 @@ else
     exit 1
 fi
 "
-    local attempt=1
-    local max_attempts=3
-    while [[ $attempt -le $max_attempts ]]; do
-        log_info "build_docker_image_in_container: Attempting Docker image build (attempt $attempt/$max_attempts)..."
-        if pct exec "$lxc_id" -- bash -c "$build_cmd" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-            log_info "build_docker_image_in_container: Docker image $image_tag built successfully in container $lxc_id."
-            echo "Docker image build completed for $image_tag in container $lxc_id."
-            return 0
-        else
-            log_warn "build_docker_image_in_container: Build failed on attempt $attempt. Retrying in 10 seconds..."
-            sleep 10
-            ((attempt++))
-        fi
-    done
+    if ! pct_exec_with_retry "$lxc_id" bash -c "$build_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
+        log_error "build_docker_image_in_container: Failed to build Docker image $image_tag in container $lxc_id after 3 attempts."
+        return 1
+    fi
 
-    log_error "build_docker_image_in_container: Failed to build Docker image $image_tag in container $lxc_id after $max_attempts attempts."
-    return 1
+    log_info "build_docker_image_in_container: Docker image $image_tag built successfully in container $lxc_id."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Docker image build completed for $image_tag in container $lxc_id." >&2
+    fi
+    return 0
 }
 
 # --- Detect GPUs Inside Container ---
@@ -617,20 +623,21 @@ detect_gpus_in_container() {
         return 1
     fi
 
-    # Check if container has GPU assignment
     if ! check_gpu_assignment "$lxc_id"; then
         log_info "detect_gpus_in_container: Skipping GPU detection for container $lxc_id (no GPU assignment)"
         return 0
     fi
 
     log_info "detect_gpus_in_container: Detecting GPUs in container $lxc_id..."
-    echo "Checking GPU access in container $lxc_id..."
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Checking GPU access in container $lxc_id..." >&2
+    fi
 
     local check_cmd="
 set -e
 export LC_ALL=C.UTF-8 LANG=C.UTF-8
 if command -v nvidia-smi >/dev/null 2>&1; then
-    if nvidia-smi >/dev/null  lubricants2>&1; then
+    if nvidia-smi >/dev/null 2>&1; then
         echo '[SUCCESS] GPUs detected in container $lxc_id.'
         nvidia-smi --query-gpu=count,driver_version --format=csv,noheader
     else
@@ -638,17 +645,18 @@ if command -v nvidia-smi >/dev/null 2>&1; then
         exit 1
     fi
 else
-    echoing '[ERROR] nvidia-smi not found.'
+    echo '[ERROR] nvidia-smi not found.'
     exit 1
 fi
 "
     local result
-    result=$(pct exec "$lxc_id" -- bash -c "$check_cmd" 2>&1)
-    local exit_code=$?
+    if ! result=$(pct_exec_with_retry "$lxc_id" bash -c "$check_cmd" 2>>"$PHOENIX_NVIDIA_LOG_FILE"); then
+        log_error "detect_gpus_in_container: GPU detection failed in container $lxc_id: $result"
+        return 1
+    fi
 
-    if [[ $exit_code -eq 0 ]]; then
-        log_info "detect_gpus_in_container: GPUs detected in container $lxc_id: $result"
-        local docker_check="
+    log_info "detect_gpus_in_container: GPUs detected in container $lxc_id: $result"
+    local docker_check="
 set -e
 export LC_ALL=C.UTF-8 LANG=C.UTF-8
 if ! command -v docker >/dev/null 2>&1; then
@@ -675,15 +683,11 @@ else
     exit 1
 fi
 "
-        if pct exec "$lxc_id" -- bash -c "$docker_check" 2>&1 | tee -a "${HYPERVISOR_LOGFILE:-/dev/null}"; then
-            log_info "detect_gpus_in_container: Docker GPU access verified in container $lxc_id."
-            return 0
-        else
-            log_error "detect_gpus_in_container: Docker GPU access verification failed in container $lxc_id."
-            return 1
-        fi
+    if pct_exec_with_retry "$lxc_id" bash -c "$docker_check" 2>>"$PHOENIX_NVIDIA_LOG_FILE"; then
+        log_info "detect_gpus_in_container: Docker GPU access verified in container $lxc_id."
+        return 0
     else
-        log_error "detect_gpus_in_container: GPU detection failed in container $lxc_id: $result"
+        log_error "detect_gpus_in_container: Docker GPU access verification failed in container $lxc_id."
         return 1
     fi
 }
@@ -728,7 +732,13 @@ configure_lxc_gpu_passthrough() {
         return 1
     fi
 
+    log_info "configure_lxc_gpu_passthrough: Backing up LXC config file $config_file..."
+    cp "$config_file" "$config_file.bak" 2>>"$PHOENIX_NVIDIA_LOG_FILE" || log_warn "Failed to backup $config_file"
+
     log_info "configure_lxc_gpu_passthrough: Configuring GPU passthrough for container $lxc_id (GPUs: $gpu_indices)"
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "Configuring GPU passthrough for container $lxc_id..." >&2
+    fi
 
     # Clear existing GPU-related configurations
     sed -i '/^lxc\.cgroup2\.devices\.allow:/d' "$config_file"
@@ -780,9 +790,11 @@ configure_lxc_gpu_passthrough() {
     fi
 
     log_info "configure_lxc_gpu_passthrough: GPU passthrough configuration updated for container $lxc_id (GPUs: $gpu_indices)"
+    if [[ "${QUIET_MODE:-false}" != "true" ]]; then
+        echo "GPU passthrough configuration completed for container $lxc_id." >&2
+    fi
     return 0
 }
 
-# Signal that this library has been loaded
-export PHOENIX_HYPERVISOR_LXC_NVIDIA_LOADED=1
+# --- Initialize Logging ---
 log_info "phoenix_hypervisor_lxc_common_nvidia.sh: Library loaded successfully."

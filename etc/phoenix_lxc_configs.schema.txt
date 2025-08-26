@@ -1,221 +1,137 @@
 {
-    "$schema": "http://json-schema.org/draft-07/schema#",
-    "type": "object",
-    "properties": {
-        "nvidia_driver_version": {
-            "type": "string",
-            "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-            "default": "580.76.05",
-            "description": "The NVIDIA driver version to be installed in GPU-enabled containers."
-        },
-        "nvidia_repo_url": {
-            "type": "string",
-            "format": "uri",
-            "default": "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/",
-            "description": "The base URL for the NVIDIA CUDA repository."
-        },
-        "lxc_configs": {
-            "type": "object",
-            "additionalProperties": {
-                "type": "object",
-                "properties": {
-                    "name": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "The human-readable name for the LXC container."
-                    },
-                    "memory_mb": {
-                        "type": "integer",
-                        "minimum": 512,
-                        "description": "The amount of RAM allocated to the container in megabytes."
-                    },
-                    "cores": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "description": "The number of CPU cores allocated to the container."
-                    },
-                    "template": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "The path to the LXC template tarball used to create the container."
-                    },
-                    "storage_pool": {
-                        "type": "string",
-                        "minLength": 1,
-                        "description": "The name of the Proxmox storage pool to use for the container's root filesystem."
-                    },
-                    "storage_size_gb": {
-                        "type": "integer",
-                        "minimum": 10,
-                        "description": "The size of the container's root filesystem in gigabytes."
-                    },
-                    "network_config": {
-                        "type": "object",
-                        "properties": {
-                            "name": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Network interface name (e.g., eth0)."
-                            },
-                            "bridge": {
-                                "type": "string",
-                                "minLength": 1,
-                                "description": "Proxmox network bridge (e.g., vmbr0)."
-                            },
-                            "ip": {
-                                "type": "string",
-                                "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$",
-                                "description": "Static IP in CIDR notation (e.g., 10.0.0.99/24)."
-                            },
-                            "gw": {
-                                "type": "string",
-                                "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}$",
-                                "description": "Gateway IP address (e.g., 10.0.0.1)."
-                            }
-                        },
-                        "required": [
-                            "name",
-                            "bridge",
-                            "ip",
-                            "gw"
-                        ],
-                        "additionalProperties": false,
-                        "description": "The network configuration for the container."
-                    },
-                    "features": {
-                        "type": "string",
-                        "pattern": "^nesting=[0-1](,keyctl=[0-1])?$",
-                        "description": "LXC features (e.g., nesting=1,keyctl=1)."
-                    },
-                    "static_ip": {
-                        "type": "string",
-                        "pattern": "^([0-9]{1,3}\\.){3}[0-9]{1,3}/[0-9]{1,2}$",
-                        "description": "Static IP in CIDR notation (redundant with network_config.ip, for backward compatibility)."
-                    },
-                    "mac_address": {
-                        "type": "string",
-                        "pattern": "^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$",
-                        "description": "The MAC address for the container's network interface."
-                    },
-                    "gpu_assignment": {
-                        "type": "string",
-                        "pattern": "^([0-9]+(,[0-9]+)*|none|all)$",
-                        "default": "none",
-                        "description": "GPU assignment: comma-separated indices (e.g., '0,1'), 'all', or 'none'."
-                    },
-                    "vllm_model": {
-                        "type": "string",
-                        "minLength": 1,
-                        "default": "none",
-                        "description": "The path to the vLLM model (e.g., '/models/Qwen/Qwen2.5-Coder-7B-Instruct')."
-                    },
-                    "vllm_tensor_parallel_size": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "default": 1,
-                        "description": "The number of GPUs to use for tensor parallelism in vLLM."
-                    },
-                    "vllm_max_model_len": {
-                        "type": "integer",
-                        "minimum": 64,
-                        "default": 128,
-                        "description": "The maximum length of the model context window in vLLM."
-                    },
-                    "vllm_kv_cache_dtype": {
-                        "type": "string",
-                        "enum": [
-                            "auto",
-                            "fp8",
-                            "fp16"
-                        ],
-                        "default": "auto",
-                        "description": "The data type for the key-value cache in vLLM."
-                    },
-                    "vllm_shm_size": {
-                        "type": "string",
-                        "pattern": "^[0-9]+[mg]$",
-                        "default": "8g",
-                        "description": "The size of the shared memory segment (/dev/shm) for vLLM (e.g., '8g', '16m')."
-                    },
-                    "vllm_gpu_count": {
-                        "type": "integer",
-                        "minimum": 1,
-                        "default": 1,
-                        "description": "The total number of GPUs allocated to the vLLM service."
-                    },
-                    "vllm_api_port": {
-                        "type": "integer",
-                        "minimum": 1024,
-                        "maximum": 65535,
-                        "default": 8000,
-                        "description": "The port on which the vLLM API server will listen."
-                    },
-                    "vllm_gpu_memory_utilization": {
-                        "type": "number",
-                        "minimum": 0.0,
-                        "maximum": 1.0,
-                        "default": 0.8,
-                        "description": "The fraction of GPU memory to use for the vLLM model weights and cache."
-                    },
-                    "vllm_dtype": {
-                        "type": "string",
-                        "enum": [
-                            "float16",
-                            "bfloat16",
-                            "float32"
-                        ],
-                        "default": "float16",
-                        "description": "The data type for the model weights in vLLM."
-                    },
-                    "vllm_attention_backend": {
-                        "type": "string",
-                        "enum": [
-                            "FLASHINFER",
-                            "XFORMERS",
-                            "TORCH"
-                        ],
-                        "default": "FLASHINFER",
-                        "description": "The backend to use for attention computation in vLLM."
-                    },
-                    "vllm_nccl_so_path": {
-                        "type": "string",
-                        "minLength": 1,
-                        "default": "/root/.config/vllm/nccl/cu13/libnccl.so",
-                        "description": "The path to the NCCL shared library inside the container."
-                    },
-                    "portainer_role": {
-                        "type": "string",
-                        "enum": [
-                            "server",
-                            "agent",
-                            "none"
-                        ],
-                        "default": "none",
-                        "description": "The role for Portainer: 'server' for the main Portainer instance, 'agent' for Portainer agents, 'none' for no Portainer role."
-                    },
-                    "unprivileged": {
-                        "type": "boolean",
-                        "default": true,
-                        "description": "Whether the container should run in unprivileged mode."
-                    }
-                },
-                "required": [
-                    "name",
-                    "memory_mb",
-                    "cores",
-                    "template",
-                    "storage_pool",
-                    "storage_size_gb",
-                    "network_config"
-                ],
-                "additionalProperties": false
-            }
-        }
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Phoenix Hypervisor LXC Configuration",
+  "description": "Schema for validating Phoenix Hypervisor LXC container configurations.",
+  "type": "object",
+  "properties": {
+    "$schema": {
+      "type": "string",
+      "description": "URI of the JSON Schema used to validate this document."
     },
-    "required": [
-        "nvidia_driver_version",
-        "nvidia_repo_url",
-        "lxc_configs"
-    ],
-    "additionalProperties": false
+    "nvidia_driver_version": {
+      "type": "string",
+      "description": "Expected NVIDIA driver version on the host."
+    },
+    "nvidia_repo_url": {
+      "type": "string",
+      "format": "uri",
+      "description": "URL for the NVIDIA CUDA repository."
+    },
+    "lxc_configs": {
+      "type": "object",
+      "description": "A map of LXC container configurations, keyed by container ID.",
+      "patternProperties": {
+        "^(900|901|902|999)$": {
+          "type": "object",
+          "properties": {
+            "name": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The human-readable name for the LXC container"
+            },
+            "memory_mb": {
+              "type": "integer",
+              "minimum": 512,
+              "maximum": 131072,
+              "description": "The amount of RAM allocated to the container in megabytes. For AI workloads, values typically range from 2048-32768 MB depending on model size"
+            },
+            "cores": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 32,
+              "description": "The number of CPU cores allocated to the container. For AI workloads, typically 2-8 cores are recommended"
+            },
+            "template": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The path to the LXC template tarball used to create the container"
+            },
+            "storage_pool": {
+              "type": "string",
+              "minLength": 1,
+              "description": "The name of the Proxmox storage pool to use for the container's root filesystem"
+            },
+            "storage_size_gb": {
+              "type": "integer",
+              "minimum": 10,
+              "maximum": 1024,
+              "description": "The size of the container's root filesystem in gigabytes. For AI workloads, typically 64-256 GB recommended"
+            },
+            "network_config": {
+              "type": "object",
+              "properties": {
+                "name": {
+                  "type": "string",
+                  "minLength": 1,
+                  "maxLength": 15,
+                  "description": "Name of the network interface inside the container"
+                },
+                "bridge": {
+                  "type": "string",
+                  "minLength": 1,
+                  "description": "Proxmox bridge the container connects to"
+                },
+                "ip": {
+                  "type": "string",
+                  "pattern": "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/([0-9]|[1-2][0-9]|3[0-2])$",
+                  "description": "Static IP address with CIDR notation for container"
+                },
+                "gw": {
+                  "type": "string",
+                  "pattern": "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])$",
+                  "description": "Gateway IP address for the container's network"
+                }
+              },
+              "required": [ "name", "bridge", "ip", "gw" ],
+              "additionalProperties": false
+            },
+            "features": {
+              "type": "string",
+              "pattern": "^[a-z]+=([0-1])(,[a-z]+=([0-1]))*$",
+              "description": "LXC features enabled for the container (e.g., 'nesting=1,keyctl=1')"
+            },
+            "static_ip": {
+              "type": "string",
+              "pattern": "^(([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])\\.){3}([0-9]|[1-9][0-9]|1[0-9]{2}|2[0-4][0-9]|25[0-5])/([0-9]|[1-2][0-9]|3[0-2])$",
+              "description": "Static IP address with CIDR notation for container (redundant with network_config.ip?)"
+            },
+            "mac_address": {
+              "type": "string",
+              "pattern": "^([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}$",
+              "description": "MAC address for the container interface"
+            },
+            "gpu_assignment": {
+              "type": "string",
+              "pattern": "^(none|[0-9]+(,[0-9]+)*)$",
+              "description": "GPU assignment for container. Use 'none' for no GPU access, or comma-separated indices (e.g., '0,1') for multiple GPUs"
+            },
+            "portainer_role": {
+              "type": "string",
+              "enum": [ "server", "agent", "none" ],
+              "description": "Role of the container within the Portainer management system"
+            },
+            "unprivileged": {
+              "type": "boolean",
+              "description": "Whether the container runs in unprivileged mode"
+            },
+            "vllm_model": {
+              "type": [ "string", "null" ],
+              "description": "Path to the specific AI model this container is configured to serve using vLLM"
+            },
+            "vllm_tensor_parallel_size": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 8,
+              "description": "Degree of tensor parallelism used by vLLM for the assigned model"
+            }
+          },
+          "required": [ "name", "memory_mb", "cores", "template", "storage_pool", "storage_size_gb", "network_config", "portainer_role", "unprivileged" ],
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "required": [ "$schema", "nvidia_driver_version", "nvidia_repo_url", "lxc_configs" ],
+  "additionalProperties": false
 }
