@@ -1,74 +1,104 @@
 #!/bin/bash
 # Script to create an LXC container for Phoenix Hypervisor
-# Version: 1.7.9 (Enhanced logging, token permissions, common validations, resource checks, quiet mode, Portainer validation)
+# Version: 1.8.2 (Ensured no local errors, added validation for sourced files)
 # Author: Assistant
-# Integration: Called by phoenix_establish_hypervisor.sh, uses phoenix_hypervisor_common.sh (v2.1.2) for core functions
+# Integration: Called by phoenix_establish_hypervisor.sh, uses phoenix_hypervisor_common.sh
 
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+# --- Check for Invalid 'local' Declarations in Sourced Files ---
+check_for_local_errors() {
+    local file="$1"
+    if grep -E "^\s*local\s+[a-zA-Z_][a-zA-Z0-9_]*\s*=" "$file" >/dev/null 2>&1; then
+        echo "ERROR: Invalid 'local' declaration found outside function in $file" >&2
+        exit 1
+    fi
+}
+
 # --- Argument Parsing ---
 if [[ $# -ne 1 ]]; then
-    log_error "Usage: $0 <container_id>"
+    echo "ERROR: Usage: $0 <container_id>" >&2
     exit 1
 fi
 container_id="$1"
 
 if ! [[ "$container_id" =~ ^[0-9]+$ ]]; then
-    log_error "Invalid container ID: $container_id"
+    echo "ERROR: Invalid container ID: $container_id" >&2
     exit 1
 fi
-# --- END Argument Parsing ---
-
-# --- Quiet Mode Check ---
-QUIET_MODE="${QUIET_MODE:-false}"
-log_debug "Script started. QUIET_MODE=$QUIET_MODE, container_id=$container_id"
+if command -v log_debug >/dev/null 2>&1; then
+    log_debug "Script started. QUIET_MODE=${QUIET_MODE:-false}, container_id=$container_id"
+fi
 
 # --- jq Check ---
 if ! command -v jq >/dev/null 2>&1; then
-    log_error "jq command not found. Install jq (apt install jq)."
+    echo "ERROR: jq command not found. Install jq (apt install jq)." >&2
     exit 1
 fi
-log_debug "jq command found."
+if command -v log_debug >/dev/null 2>&1; then
+    log_debug "jq command found."
+fi
 
 # --- Load Configuration ---
-container_config=$(jq -c ".lxc_configs.\"$container_id\"" "$PHOENIX_LXC_CONFIG_FILE" 2>>"$PHOENIX_LOG_FILE")
-if [[ -z "$container_config" || "$container_config" == "null" ]]; then
-    log_error "No configuration found for container ID $container_id in $PHOENIX_LXC_CONFIG_FILE"
+container_config=$(jq -c ".lxc_configs.\"$container_id\"" "$PHOENIX_LXC_CONFIG_FILE" 2>/dev/null)
+if [[ $? -ne 0 || -z "$container_config" || "$container_config" == "null" ]]; then
+    echo "ERROR: No configuration found for container ID $container_id in $PHOENIX_LXC_CONFIG_FILE" >&2
     exit 1
 fi
 
 template_path=$(echo "$container_config" | jq -r '.template')
 if [[ -z "$template_path" || "$template_path" == "null" ]]; then
-    log_error "No template specified in configuration for container $container_id"
+    echo "ERROR: No template specified in configuration for container $container_id" >&2
     exit 1
 fi
 if ! test -f "$template_path"; then
-    log_error "Template file not found: $template_path"
+    echo "ERROR: Template file not found: $template_path" >&2
     exit 1
 fi
-log_info "Using template: $template_path for container $container_id"
+if command -v log_info >/dev/null 2>&1; then
+    log_info "Using template: $template_path for container $container_id"
+fi
 
 # --- Source Dependencies ---
-if [[ -f "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
-    source /usr/local/etc/phoenix_hypervisor_config.sh
-elif [[ -f "./phoenix_hypervisor_config.sh" ]]; then
-    source ./phoenix_hypervisor_config.sh
-    log_warn "Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh"
-else
-    log_error "Configuration file not found: /usr/local/etc/phoenix_hypervisor_config.sh or ./phoenix_hypervisor_config.sh"
+for config_file in "/usr/local/etc/phoenix_hypervisor_config.sh" "./phoenix_hypervisor_config.sh"; do
+    if [[ -f "$config_file" ]]; then
+        if ! bash -n "$config_file"; then
+            echo "ERROR: Syntax error in $config_file" >&2
+            exit 1
+        fi
+        check_for_local_errors "$config_file"
+        source "$config_file"
+        if command -v log_info >/dev/null 2>&1; then
+            log_info "Sourced config from $config_file"
+        elif [[ "$config_file" != "/usr/local/etc/phoenix_hypervisor_config.sh" ]]; then
+            echo "WARNING: Sourced config from current directory. Prefer /usr/local/etc/phoenix_hypervisor_config.sh" >&2
+        fi
+        break
+    fi
+done
+if [[ -z "${PHOENIX_LXC_CONFIG_FILE:-}" ]]; then
+    echo "ERROR: Configuration file not found: /usr/local/etc/phoenix_hypervisor_config.sh or ./phoenix_hypervisor_config.sh" >&2
     exit 1
 fi
 
-if [[ -f "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
-    source /usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh
-elif [[ -f "/usr/local/bin/phoenix_hypervisor_common.sh" ]]; then
-    source /usr/local/bin/phoenix_hypervisor_common.sh
-    log_warn "Sourced common functions from /usr/local/bin/. Prefer /usr/local/lib/phoenix_hypervisor/."
-elif [[ -f "./phoenix_hypervisor_common.sh" ]]; then
-    source ./phoenix_hypervisor_common.sh
-    log_warn "Sourced common functions from current directory. Prefer standard locations."
-else
-    log_error "Common functions file not found in standard locations."
+for common_file in "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" "/usr/local/bin/phoenix_hypervisor_common.sh" "./phoenix_hypervisor_common.sh"; do
+    if [[ -f "$common_file" ]]; then
+        if ! bash -n "$common_file"; then
+            echo "ERROR: Syntax error in $common_file" >&2
+            exit 1
+        fi
+        check_for_local_errors "$common_file"
+        source "$common_file"
+        if command -v log_info >/dev/null 2>&1; then
+            log_info "Sourced common functions from $common_file"
+        elif [[ "$common_file" != "/usr/local/lib/phoenix_hypervisor/phoenix_hypervisor_common.sh" ]]; then
+            echo "WARNING: Sourced common functions from $common_file. Prefer /usr/local/lib/phoenix_hypervisor/" >&2
+        fi
+        break
+    fi
+done
+if ! command -v log_info >/dev/null 2>&1; then
+    echo "ERROR: Common functions file not found in standard locations." >&2
     exit 1
 fi
 
@@ -101,8 +131,8 @@ check_proxmox_resources() {
         return 0
     fi
 
-    local node=$(hostname)
-    local available_memory_mb available_cores available_storage_gb
+    local node available_memory_mb available_cores available_storage_gb
+    node=$(hostname)
     available_memory_mb=$(pvesh get /nodes/"$node"/hardware/memory --output-format=json | jq -r '.free / 1024 / 1024')
     available_cores=$(pvesh get /nodes/"$node"/hardware/cpuinfo --output-format=json | jq -r '.cores')
     available_storage_gb=$(pvesh get /nodes/"$node"/storage/"$PHOENIX_ZFS_LXC_POOL" --output-format=json | jq -r '.avail / 1024 / 1024 / 1024')
@@ -133,67 +163,107 @@ check_token_permissions() {
     local permissions
     permissions=$(stat -c "%a" "$token_file")
     if [[ "$permissions" != "600" ]]; then
-        log_warn "Insecure permissions on $token_file ($permissions). Setting to 600."
-        chmod 600 "$token_file" || log_error "Failed to set permissions on $token_file"
+        log_warn "Token file $token_file permissions are $permissions, setting to 600"
+        chmod 600 "$token_file" || {
+            log_error "Failed to set permissions to 600 for $token_file"
+            return 1
+        }
     fi
+    log_info "Token file $token_file has correct permissions (600)"
     return 0
 }
 
-# --- Temporary Functions (To be Replaced) ---
-install_docker_ce_in_container() {
-    local lxc_id="$1"
-    log_info "Installing Docker CE in container $lxc_id..."
-    if ! pct_exec_with_retry "$lxc_id" bash -c "apt update && apt install -y docker.io"; then
-        log_error "Failed to install Docker CE in container $lxc_id"
-        return 1
+# --- NVIDIA Setup for GPU Containers ---
+install_nvidia_in_container() {
+    local container_id="$1"
+    log_info "Installing NVIDIA driver, toolkit, and CUDA 12.8 in container $container_id..."
+
+    local has_gpu=false
+    if pct config "$container_id" | grep -q "nvidia"; then
+        has_gpu=true
+        log_info "GPU devices detected in container $container_id configuration"
+    else
+        log_info "No GPU devices assigned to container $container_id, skipping NVIDIA setup"
+        return 0
     fi
-    log_info "Docker CE installed in container $lxc_id"
+
+    pct exec "$container_id" -- bash -c "apt update && apt install -y curl gnupg ca-certificates build-essential" || {
+        log_error "Failed to install prerequisites in container $container_id"
+        return 1
+    }
+
+    local driver_version="${PHOENIX_NVIDIA_DRIVER_VERSION:-580.76.05}"
+    local runfile="NVIDIA-Linux-x86_64-${driver_version}.run"
+    local download_url="${PHOENIX_NVIDIA_RUNFILE_URL:-https://us.download.nvidia.com/XFree86/Linux-x86_64/580.76.05/NVIDIA-Linux-x86_64-580.76.05.run}"
+    pct exec "$container_id" -- bash -c "curl -fsSL '$download_url' -o '$runfile' && chmod +x '$runfile'" || {
+        log_error "Failed to download NVIDIA driver runfile in container $container_id"
+        return 1
+    }
+    pct exec "$container_id" -- bash -c "./$runfile --no-kernel-modules --silent --install-libglvnd && rm -f '$runfile'" || {
+        log_error "Failed to install NVIDIA driver $driver_version in container $container_id"
+        return 1
+    }
+    log_info "NVIDIA driver $driver_version installed in container $container_id"
+
+    pct exec "$container_id" -- bash -c "curl -fsSL https://nvidia.github.io/libnvidia-container/gpgkey | gpg --dearmor -o /usr/share/keyrings/nvidia-container-toolkit-keyring.gpg && curl -s -L https://nvidia.github.io/libnvidia-container/stable/deb/nvidia-container-toolkit.list | sed 's#deb https://#deb [signed-by=/usr/share/keyrings/nvidia-container-toolkit-keyring.gpg] https://#g' | tee /etc/apt/sources.list.d/nvidia-container-toolkit.list && apt update && apt install -y nvidia-container-toolkit && nvidia-ctk runtime configure --runtime=docker && systemctl restart docker" || {
+        log_error "Failed to install nvidia-container-toolkit in container $container_id"
+        return 1
+    }
+    log_info "nvidia-container-toolkit installed and configured in container $container_id"
+
+    pct exec "$container_id" -- bash -c "curl -fsSL https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/x86_64/cuda-keyring_1.1-1_all.deb -o cuda-keyring.deb && dpkg -i cuda-keyring.deb && apt update && apt install -y cuda-toolkit-12-8" || {
+        log_error "Failed to install CUDA 12.8 toolkit in container $container_id"
+        return 1
+    }
+    log_info "CUDA 12.8 toolkit installed in container $container_id"
+
+    local nvidia_smi_output
+    nvidia_smi_output=$(pct exec "$container_id" -- nvidia-smi 2>&1) || {
+        log_error "nvidia-smi failed in container $container_id"
+        return 1
+    }
+    local installed_version
+    installed_version=$(echo "$nvidia_smi_output" | grep "Driver Version" | awk '{print $3}')
+    if [[ "$installed_version" != "$driver_version" ]]; then
+        log_error "Driver version mismatch in container $container_id. Expected $driver_version, got $installed_version"
+        return 1
+    }
+    log_info "NVIDIA driver $driver_version verified in container $container_id"
+
+    local docker_test
+    docker_test=$(pct exec "$container_id" -- bash -c "docker run --rm --gpus all nvidia/cuda:12.8.0-base-ubuntu24.04 nvidia-smi 2>&1") || {
+        log_error "Docker GPU test failed in container $container_id: $docker_test"
+        return 1
+    }
+    log_info "Docker GPU test passed in container $container_id"
+
     return 0
 }
 
-authenticate_registry() {
-    local lxc_id="$1"
-    log_info "Authenticating with Docker Hub in container $lxc_id..."
-    local docker_token=$(grep '^DOCKER_TOKEN=' "$PHOENIX_DOCKER_TOKEN_FILE" | cut -d'=' -f2-)
-    if [[ -z "$docker_token" ]]; then
-        log_error "DOCKER_TOKEN not found in $PHOENIX_DOCKER_TOKEN_FILE"
-        return 1
-    fi
-    if ! pct_exec_with_retry "$lxc_id" bash -c "echo '$docker_token' | docker login -u phoenix --password-stdin"; then
-        log_error "Failed to authenticate with Docker Hub in container $lxc_id"
-        return 1
-    fi
-    log_info "Docker Hub authentication successful in container $lxc_id"
-    return 0
-}
-
-install_portainer_agent() {
-    local lxc_id="$1"
-    log_info "Installing Portainer agent in container $lxc_id..."
-    if ! pct_exec_with_retry "$lxc_id" bash -c "docker run -d -p 9001:9001 --name portainer_agent --restart=always -v /var/run/docker.sock:/var/run/docker.sock portainer/agent"; then
-        log_error "Failed to install Portainer agent in container $lxc_id"
-        return 1
-    fi
-    log_info "Portainer agent installed in container $lxc_id"
-    return 0
-}
-
-# --- Main Execution ---
 main() {
-    if [[ "$QUIET_MODE" != "true" ]]; then
+    local quiet_mode="${QUIET_MODE:-false}"
+    if [[ "$quiet_mode" != "true" ]]; then
         echo "==============================================="
-        echo "PHOENIX HYPERVISOR: CREATING CONTAINER $container_id"
+        echo "PHOENIX HYPERVISOR: CREATING LXC CONTAINER $container_id"
         echo "==============================================="
     fi
     log_info "Starting creation of container $container_id..."
 
-    # Check Proxmox resources
+    if [[ ! -d "/mnt/phoenix_docker_images" ]]; then
+        log_info "Creating /mnt/phoenix_docker_images..."
+        mkdir -p "/mnt/phoenix_docker_images" || {
+            log_error "Failed to create /mnt/phoenix_docker_images"
+            exit 1
+        }
+        chmod 755 "/mnt/phoenix_docker_images" || log_warn "Could not set permissions on /mnt/phoenix_docker_images"
+        log_info "Created /mnt/phoenix_docker_images"
+    fi
+
     if ! check_proxmox_resources; then
         log_error "Resource check failed for container $container_id"
         exit 1
     fi
 
-    # Check token permissions for 900-902, 999
     if [[ "$container_id" -ge 900 && "$container_id" -le 902 ]] || [[ "$container_id" == "999" ]]; then
         if ! check_token_permissions "$PHOENIX_HF_TOKEN_FILE" || ! check_token_permissions "$PHOENIX_DOCKER_TOKEN_FILE"; then
             log_error "Token permission check failed for container $container_id"
@@ -201,9 +271,8 @@ main() {
         fi
     fi
 
-    # Validate AI framework for 900-902
+    local ai_framework
     if [[ "$container_id" -ge 900 && "$container_id" -le 902 ]]; then
-        local ai_framework
         ai_framework=$(echo "$container_config" | jq -r '.ai_framework // "vllm"')
         if [[ ! "$ai_framework" =~ ^(vllm|llamacpp|ollama)$ ]]; then
             log_error "Invalid ai_framework '$ai_framework' for container $container_id. Must be vllm, llamacpp, or ollama."
@@ -216,19 +285,16 @@ main() {
         fi
     fi
 
-    # Create container
     if ! create_lxc_container "$container_id" "$container_config"; then
         log_error "Failed to create container $container_id"
         exit 1
     fi
 
-    # Validate container status
     if ! validate_container_status "$container_id"; then
         log_error "Container $container_id is not running or has network issues"
         exit 1
     fi
 
-    # Validate init system
     local init_system
     init_system=$(pct_exec_with_retry "$container_id" bash -c "ps -p 1 -o comm=")
     if [[ -z "$init_system" ]]; then
@@ -241,7 +307,6 @@ main() {
     fi
     log_info "Container init system: $init_system"
 
-    # Get container codename
     local container_codename
     container_codename=$(pct_exec_with_retry "$container_id" bash -c "lsb_release -cs 2>/dev/null || echo 'unknown'")
     if [[ "$container_codename" != "unknown" ]]; then
@@ -250,7 +315,6 @@ main() {
         log_info "Container codename not available, continuing with setup"
     fi
 
-    # Registry authentication for 900-902, 999
     if [[ "$container_id" -ge 900 && "$container_id" -le 902 ]] || [[ "$container_id" == "999" ]]; then
         log_info "Container $container_id requires registry authentication (Portainer agent or server)."
         if ! install_docker_ce_in_container "$container_id"; then
@@ -265,9 +329,12 @@ main() {
             log_error "Failed to authenticate with Hugging Face for container $container_id"
             exit 1
         fi
+        if ! install_nvidia_in_container "$container_id"; then
+            log_error "Failed to install NVIDIA driver/toolkit/CUDA in container $container_id"
+            exit 1
+        fi
     fi
 
-    # Post-creation hooks
     if [[ "$container_id" -ge 900 && "$container_id" -le 902 ]]; then
         log_info "Container $container_id is a Portainer agent. Installing agent..."
         if ! install_portainer_agent "$container_id"; then
@@ -297,7 +364,7 @@ main() {
         fi
     fi
 
-    if [[ "$QUIET_MODE" != "true" ]]; then
+    if [[ "$quiet_mode" != "true" ]]; then
         echo "==============================================="
         echo "PHOENIX HYPERVISOR: CONTAINER $container_id CREATED SUCCESSFULLY"
         echo "==============================================="

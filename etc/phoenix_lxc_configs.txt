@@ -71,7 +71,7 @@
         },
         "999": {
             "name": "Portainer",
-            "memory_mb": 90096,
+            "memory_mb": 32768,
             "cores": 6,
             "template": "/fastData/shared-iso/template/cache/ubuntu-24.04-standard_24.04-2_amd64.tar.zst",
             "storage_pool": "lxc-disks",
